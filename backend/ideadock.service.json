@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "runtime": "python",
+  "runtime_version": "3.12",
+  "entry": "app:app",
+  "start": "uvicorn app:app --host 0.0.0.0 --port $PORT",
+  "health_path": "/health",
+  "routes": [
+    { "path": "/health", "methods": ["GET"] },
+    { "path": "/api/status", "methods": ["GET"] },
+    { "path": "/api/sync", "methods": ["POST"] },
+    { "path": "/api/dashboard", "methods": ["GET"] }
+  ],
+  "resources": {
+    "cpu": "500m",
+    "memory": "512Mi"
+  },
+  "verification": {
+    "mysql_path": "/__ideadock/verify/mysql"
+  }
+}

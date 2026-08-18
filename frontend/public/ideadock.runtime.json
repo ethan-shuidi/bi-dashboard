@@ -1,0 +1,14 @@
+{
+  "schema": "ideadock.runtime.v1",
+  "project_id": 1400,
+  "project_slug": "shopify-bi-dashboard",
+  "namespace": "8uxh4y1ulu",
+  "backend_service_id": 24,
+  "service_name": "shopify-bi-api",
+  "route_code": "bs_52b3680c",
+  "backend_base_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_52b3680c",
+  "run_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_52b3680c/",
+  "active_deployment_id": 120,
+  "deployment_status": "healthy",
+  "generated_at": "2026-08-17T18:29:11"
+}

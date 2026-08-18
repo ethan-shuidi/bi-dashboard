@@ -1,0 +1,1 @@
+{"schema":"ideadock.verify.v1","ready_selector":"[data-ideadock-ready=true]","backend_probe":{"path":"/health"},"mysql_probe":{"path":"/__ideadock/verify/mysql"}}
