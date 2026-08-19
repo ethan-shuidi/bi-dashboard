@@ -549,10 +549,22 @@ def dashboard_payload(db: Session, start: date, end: date, store: str | None) ->
             func.coalesce(func.sum(OrderItem.effective_units), 0),
         )
         .join(Order, Order.id == OrderItem.order_id)
-        .where(*item_conditions, OrderItem.item_type.in_(["product", "final_payment"]))
+        .where(
+            *item_conditions,
+            OrderItem.item_type.in_(["product", "final_payment"]),
+            OrderItem.sku != "(无 SKU)",
+        )
         .group_by(OrderItem.sku, OrderItem.color)
         .order_by(func.sum(OrderItem.effective_units).desc())
         .limit(12)
+    ).all()
+
+    abnormal_order_rows = db.execute(
+        select(Order.order_name)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(*item_conditions, OrderItem.sku == "(无 SKU)")
+        .distinct()
+        .order_by(Order.order_date.desc(), Order.order_name.desc())
     ).all()
 
     fulfillment_rows = db.execute(
@@ -577,6 +589,7 @@ def dashboard_payload(db: Session, start: date, end: date, store: str | None) ->
         "sku_breakdown": [
             {"sku": row[0], "color": row[1], "units": int(row[2] or 0)} for row in sku_rows
         ],
+        "abnormal_orders": [row[0] for row in abnormal_order_rows],
         "fulfillment": [
             {"status": row[0] or "UNKNOWN", "orders": int(row[1])} for row in fulfillment_rows
         ],

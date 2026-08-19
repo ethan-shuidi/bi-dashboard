@@ -73,6 +73,7 @@ const fulfillmentRate = computed(() => fulfillmentTotal.value ? fulfilledOrders.
 const averageOrderValue = computed(() => dashboard.value?.totals?.orders ? dashboard.value.totals.net_sales / dashboard.value.totals.orders : 0)
 const refundRate = computed(() => dashboard.value?.totals?.sales ? dashboard.value.totals.refunds / dashboard.value.totals.sales * 100 : 0)
 const topSku = computed(() => dashboard.value?.sku_breakdown?.[0] || null)
+const abnormalOrders = computed(() => dashboard.value?.abnormal_orders || [])
 const commercePulse = computed(() => [
   { label: "平均客单价", value: money(averageOrderValue.value, 2), note: "每笔订单净销售", tone: "cyan" },
   { label: "退款率", value: percent(refundRate.value), note: "退款金额 / 销售额", tone: refundRate.value > 5 ? "gold" : "emerald" },
@@ -332,6 +333,11 @@ onBeforeUnmount(() => {
             <div class="panel-heading"><div><span class="section-label">商品表现</span><h2>商品销量排名</h2></div><span>按 SKU 与颜色汇总 · TOP {{ Math.min(dashboard.sku_breakdown.length, 10) }}</span></div>
             <div v-if="dashboard.sku_breakdown.length" ref="productChartElement" class="echart product-chart" role="img" aria-label="商品销量排名横向柱状图"></div>
             <div v-else class="empty-state">当前范围暂无商品销量</div>
+            <div v-if="abnormalOrders.length" class="abnormal-orders" aria-label="异常订单">
+              <div class="abnormal-orders-heading"><div><span class="section-label">数据提醒</span><h3>异常订单</h3></div><span>{{ abnormalOrders.length }} 笔</span></div>
+              <p>这些订单未提供 SKU，已从商品销量排名中剔除。</p>
+              <div class="abnormal-order-list"><span v-for="orderName in abnormalOrders" :key="orderName">{{ orderName }}</span></div>
+            </div>
           </article>
         </section>
 
