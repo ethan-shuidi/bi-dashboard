@@ -499,9 +499,8 @@ def totals_for(db: Session, start: date, end: date, store: str | None) -> dict[s
     }
 
 
-def dashboard_payload(db: Session, days: int, store: str | None) -> dict[str, Any]:
-    end = utcnow().date() + timedelta(days=1)
-    start = end - timedelta(days=days)
+def dashboard_payload(db: Session, start: date, end: date, store: str | None) -> dict[str, Any]:
+    days = (end - start).days
     previous_start = start - timedelta(days=days)
     current = totals_for(db, start, end, store)
     previous = totals_for(db, previous_start, start, store)
@@ -563,13 +562,6 @@ def dashboard_payload(db: Session, days: int, store: str | None) -> dict[str, An
         .order_by(func.count(Order.id).desc())
     ).all()
 
-    recent_rows = db.execute(
-        select(Order)
-        .where(*base_conditions)
-        .order_by(Order.shopify_created_at.desc())
-        .limit(12)
-    ).scalars().all()
-
     stores = db.execute(
         select(Order.store_domain, Order.store_name).distinct().order_by(Order.store_name)
     ).all()
@@ -587,19 +579,6 @@ def dashboard_payload(db: Session, days: int, store: str | None) -> dict[str, An
         ],
         "fulfillment": [
             {"status": row[0] or "UNKNOWN", "orders": int(row[1])} for row in fulfillment_rows
-        ],
-        "recent_orders": [
-            {
-                "name": order.order_name,
-                "store": order.store_name,
-                "date": order.order_date.isoformat(),
-                "sales": float(order.sales_amount),
-                "refunds": float(order.refund_amount),
-                "units": order.unit_count,
-                "risk": order.risk_level or "UNKNOWN",
-                "fulfillment": order.fulfillment_status or "UNKNOWN",
-            }
-            for order in recent_rows
         ],
         "stores": [{"domain": row[0], "name": row[1]} for row in stores],
         "last_sync": {
@@ -657,16 +636,33 @@ async def sync(trigger: str = Query(default="button", pattern="^(button|dashboar
 
 @app.get("/api/dashboard")
 async def dashboard(
-    days: int = Query(default=30, ge=7, le=180),
+    days: int = Query(default=30, ge=1, le=180),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
     store: str | None = Query(default=None, max_length=255),
     auto_sync: bool = Query(default=True),
 ):
     try:
+        if (start_date is None) != (end_date is None):
+            raise HTTPException(status_code=422, detail="自定义日期需要同时提供开始日期和结束日期")
+        if start_date is not None and end_date is not None:
+            if start_date > end_date:
+                raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
+            selected_days = (end_date - start_date).days + 1
+            if selected_days > 180:
+                raise HTTPException(status_code=422, detail="自定义日期范围不能超过 180 天")
+            period_start = start_date
+            period_end = end_date + timedelta(days=1)
+        else:
+            period_end = utcnow().date() + timedelta(days=1)
+            period_start = period_end - timedelta(days=days)
         factory = session_factory()
         if auto_sync:
             await run_sync("dashboard")
         with factory() as db:
-            return dashboard_payload(db, days, store)
+            return dashboard_payload(db, period_start, period_end, store)
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
