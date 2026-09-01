@@ -1,4 +1,4 @@
-# Shopify BI Dashboard
+# BI Dashboard
 
 IdeaDock 全栈 BI 看板。
 
