@@ -4,6 +4,8 @@ import { init, use } from "echarts/core"
 import { BarChart, LineChart } from "echarts/charts"
 import { AriaComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components"
 import { CanvasRenderer } from "echarts/renderers"
+import AmazonDashboard from "./AmazonDashboard.vue"
+import { fetchWithDashboardAuth } from "./dashboardAuth"
 
 use([LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, AriaComponent, CanvasRenderer])
 
@@ -17,6 +19,8 @@ const status = ref(null)
 const dashboard = ref(null)
 const period = ref("30")
 const store = ref("")
+const activeDashboard = ref("amazon")
+const sidebarCollapsed = ref(true)
 const salesChartElement = ref(null)
 const productChartElement = ref(null)
 
@@ -155,7 +159,7 @@ async function loadRuntime() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(`${apiBase.value}${path}`, { cache: "no-store", headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options })
+  const response = await fetchWithDashboardAuth(`${apiBase.value}${path}`, { headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options })
   const body = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(body.detail || `请求失败：HTTP ${response.status}`)
   return body
@@ -213,9 +217,8 @@ async function syncNow() {
   error.value = ""
   notice.value = ""
   try {
-    const result = await api("/api/sync?trigger=button", { method: "POST" })
-    notice.value = result.message || "同步完成"
     await loadDashboard({ autoSync: false })
+    notice.value = "已刷新当前数据"
   } catch (exception) {
     error.value = exception.message
   } finally {
@@ -236,7 +239,7 @@ onMounted(async () => {
     productChart?.resize()
   })
   await loadRuntime()
-  await loadDashboard({ autoSync: true })
+  await loadDashboard({ autoSync: false })
   await nextTick()
   if (salesChartElement.value) resizeObserver.observe(salesChartElement.value)
   if (productChartElement.value) resizeObserver.observe(productChartElement.value)
@@ -254,26 +257,37 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <div class="brand-copy"><strong>Commerce OS</strong><span>SHOPIFY 数据分析</span></div>
+        <div class="brand-copy"><strong>Commerce OS</strong><span>数据分析</span></div>
       </div>
-      <div class="topbar-center" aria-label="系统状态">
-        <span class="live-dot"></span><span>数据服务在线</span><i></i>
-        <span v-if="dashboard?.last_sync?.at">更新于 {{ new Date(dashboard.last_sync.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</span>
-      </div>
-      <button class="sync-button" :disabled="syncing || !status?.configured" @click="syncNow">
-        <svg :class="['sync-icon', { spinning: syncing }]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 9a7 7 0 0111.7-2L20 12M4 12l2.2 5a7 7 0 0011.7-2"/></svg>
-        <span>{{ syncing ? "同步中" : "立即同步" }}</span>
-      </button>
     </header>
 
-    <div class="content-shell">
+    <div class="workspace">
+      <aside :class="['dashboard-sidebar', { collapsed: sidebarCollapsed }]" aria-label="看板导航">
+        <div class="dashboard-sidebar-head"><span class="dashboard-sidebar-label">看板导航</span><button class="sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开看板导航' : '收起看板导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="sidebarCollapsed = !sidebarCollapsed"><span aria-hidden="true">{{ sidebarCollapsed ? '›' : '‹' }}</span></button></div>
+        <button :class="['dashboard-nav-item', { active: activeDashboard === 'commerce' }]" @click="activeDashboard = 'commerce'"><span class="dashboard-nav-icon">⌁</span><span>Shopify数据看板</span></button>
+        <button :class="['dashboard-nav-item', { active: activeDashboard === 'amazon' }]" @click="activeDashboard = 'amazon'"><span class="dashboard-nav-icon">▦</span><span>Amazon数据看板</span></button>
+      </aside>
+
+      <AmazonDashboard v-if="activeDashboard === 'amazon'" class="amazon-dashboard-frame" />
+
+      <div v-else class="content-shell">
       <section class="page-header">
         <div>
-          <div class="breadcrumb"><span>数据中心</span><i>/</i><strong>经营概览</strong></div>
-          <h1>经营数据看板</h1>
+          <div class="breadcrumb"><span>数据中心</span><i>/</i><strong>Shopify 经营概览</strong></div>
+          <h1>Shopify数据看板</h1>
           <p>集中查看销售、商品与履约表现，数据按需同步。</p>
         </div>
-        <span class="period-badge" v-if="dashboard">{{ periodLabel }}</span>
+        <div class="page-header-actions">
+          <div class="topbar-center" aria-label="Shopify 数据服务状态">
+            <span class="live-dot"></span><span>数据服务在线</span><i></i>
+            <span v-if="dashboard?.last_sync?.at">更新于 {{ new Date(dashboard.last_sync.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</span>
+          </div>
+          <span class="period-badge" v-if="dashboard">{{ periodLabel }}</span>
+          <button class="sync-button" :disabled="syncing || !status?.configured" @click="syncNow">
+            <svg :class="['sync-icon', { spinning: syncing }]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 9a7 7 0 0111.7-2L20 12M4 12l2.2 5a7 7 0 0011.7-2"/></svg>
+            <span>{{ syncing ? "同步中" : "立即同步" }}</span>
+          </button>
+        </div>
       </section>
 
       <section class="filter-bar" aria-label="看板筛选">
@@ -343,6 +357,7 @@ onBeforeUnmount(() => {
 
         <footer><div><span class="live-dot"></span>{{ dashboard.last_sync.message }}</div><span>{{ dashboard.timezone_note }}</span></footer>
       </template>
+      </div>
     </div>
   </main>
 </template>

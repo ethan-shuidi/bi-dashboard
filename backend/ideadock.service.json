@@ -1,5 +1,5 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "runtime": "python",
   "runtime_version": "3.12",
   "entry": "app:app",
@@ -9,7 +9,9 @@
     { "path": "/health", "methods": ["GET"] },
     { "path": "/api/status", "methods": ["GET"] },
     { "path": "/api/sync", "methods": ["POST"] },
-    { "path": "/api/dashboard", "methods": ["GET"] }
+    { "path": "/api/dashboard", "methods": ["GET"] },
+    { "path": "/api/amazon/dashboard", "methods": ["GET"] },
+    { "path": "/api/amazon/stores", "methods": ["GET"] }
   ],
   "resources": {
     "cpu": "500m",

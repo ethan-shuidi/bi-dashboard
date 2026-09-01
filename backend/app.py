@@ -1,12 +1,18 @@
+import asyncio
 import json
 import os
 import re
+import base64
+import hashlib
+import time
+from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
     Boolean,
@@ -35,17 +41,76 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-Sync-Key"],
 )
+
+
+def require_business_access(
+    x_sync_key: str | None,
+) -> None:
+    """Read-only dashboard endpoints are intentionally open on the private route.
+
+    The write-capable sync endpoint keeps its separate SYNC_API_KEY check.
+    """
+    return
 
 Base = declarative_base()
 _engine = None
 _session_factory = None
+_lingxing_token: dict[str, Any] = {}
+_lingxing_token_lock = asyncio.Lock()
+_lingxing_performance_lock = asyncio.Lock()
+_lingxing_performance_last_call = 0.0
+_lingxing_ad_report_lock = asyncio.Lock()
+_amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+AMAZON_CACHE_TTL_SECONDS = 600
+AMAZON_UPSTREAM_CONCURRENCY = 5
+AMAZON_CURRENCY_CODES = {
+    "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
+    "英国": "GBP", "德国": "EUR", "法国": "EUR", "意大利": "EUR",
+    "西班牙": "EUR", "荷兰": "EUR", "比利时": "EUR", "瑞典": "SEK",
+}
 
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_API_VERSION = "2026-07"
 DEFAULT_INITIAL_SYNC_DAYS = 90
 DEFAULT_SYNC_COOLDOWN_SECONDS = 600
+
+LINGXING_API_BASE = "https://openapi.lingxing.com"
+AMAZON_SERIES = [
+    "TN10系列（主链接）汇总",
+    "TN10系列（小链接）汇总",
+    "TN20系列（主链接）汇总",
+]
+AMAZON_PRODUCTS = [
+    "TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色",
+    "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色",
+    "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-樱桃红",
+    "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
+]
+AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "加拿大": "CA", "澳洲": "AU", "德国": "DE", "法国": "FR", "意大利": "IT", "西班牙": "ES", "英国": "UK", "荷兰": "NL", "比利时": "BE", "瑞典": "SE"}
+
+# The Feishu mapping is keyed by site + ASIN.  Site-specific ASIN lists are
+# intentionally kept as data, so a later refresh can replace this block
+# without changing aggregation logic.
+ASIN_MAPPING = {
+    "US": {"B0G1XQ3H4H":"TN10-主链接-黑色","B0G1YMLFSZ":"TN10-主链接-银色","B0GMGP9B1D":"TN10-主链接-橙色","B0GSJMTSMQ":"TN10-小链接-黑色","B0GZNNL72W":"TN10-小链接-银色","B0GR9CDQYG":"TN10-小链接-橙色","B0H8SF6N61":"TN20-主链接-黑色","B0H8S9M43Y":"TN20-主链接-银色","B0H8SZZN8X":"TN20-主链接-樱桃红","B0H8MRQW7Q":"TN20-小链接-黑色","B0H8CKG9P5":"TN20-小链接-银色","B0H8NP9TVK":"TN20-小链接-樱桃红"},
+    "JP": {"B0G4M5QMNG":"TN10-主链接-黑色","B0G4M4YMHZ":"TN10-主链接-银色","B0G4M4KZ5S":"TN10-主链接-橙色","B0HC6V88K5":"TN20-主链接-黑色","B0HC75XJ3D":"TN20-主链接-银色","B0HC78T99S":"TN20-主链接-樱桃红","B0HD7GRRL5":"TN20-小链接-黑色","B0HD77JKX5":"TN20-小链接-银色","B0HD7QJ1XJ":"TN20-小链接-樱桃红"},
+}
+for _site, _asins, _series in [
+    ("CA", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8NCJLMD","B0H8RSZHB3","B0H8S2TK5K","B0H94CHVCN","B0H94MYQP3","B0H94QM3TZ"], None),
+    ("AU", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8N38BB4","B0H8N3KCBK","B0H8NGTX8G","B0H8PFZ3WW","B0H8PCPN8Z","B0H8PDYNH9"], None),
+    ("DE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("FR", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("IT", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("ES", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("UK", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8CKG9P5","B0H936F1P3","B0H931MPDZ"], None),
+    ("NL", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("BE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+    ("SE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
+]:
+    _names = ["TN10-主链接-黑色","TN10-主链接-银色","TN10-主链接-橙色","TN10-小链接-黑色","TN10-小链接-银色","TN10-小链接-橙色","TN20-主链接-黑色","TN20-主链接-银色","TN20-主链接-樱桃红"]
+    ASIN_MAPPING[_site] = dict(zip(_asins, _names))
 
 SINGLE_VALUE_SKUS = {
     "TN10P051",
@@ -165,6 +230,334 @@ def decimal_value(value: Any) -> Decimal:
         return Decimal(str(value or "0"))
     except Exception:
         return Decimal("0")
+
+
+async def lingxing_access_token() -> str:
+    """Obtain and cache a LingXing token without exposing credentials."""
+    global _lingxing_token
+    now = datetime.now(timezone.utc).timestamp()
+    if _lingxing_token.get("value") and now < float(_lingxing_token.get("expires_at", 0)) - 60:
+        return str(_lingxing_token["value"])
+    async with _lingxing_token_lock:
+        now = datetime.now(timezone.utc).timestamp()
+        if _lingxing_token.get("value") and now < float(_lingxing_token.get("expires_at", 0)) - 60:
+            return str(_lingxing_token["value"])
+        app_id = os.environ.get("LINGXING_APP_ID", "").strip()
+        app_secret = os.environ.get("LINGXING_APP_SECRET", "").strip()
+        if not app_id or not app_secret:
+            raise RuntimeError("LINGXING_APP_ID / LINGXING_APP_SECRET missing")
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{LINGXING_API_BASE}/api/auth-server/oauth/access-token",
+                files={"appId": (None, app_id), "appSecret": (None, app_secret)},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        data = payload.get("data") or {}
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError(f"LingXing token request failed: {payload.get('msg', 'unknown error')}")
+        _lingxing_token = {"value": token, "expires_at": now + int(data.get("expires_in", 7199))}
+        return token
+
+
+def amazon_product(site: str, asin: Any) -> str | None:
+    """Resolve a product from every ASIN candidate returned by LingXing.
+
+    The product-performance endpoint returns ``asins`` as an array of objects,
+    not a single scalar.  Taking only the first entry silently discarded a
+    valid performance row whenever the mapped ASIN appeared later in that
+    array.  Sales rows still matched their scalar ASIN, which is exactly why
+    sales/orders were visible while B2B, Sessions and performance metrics were
+    blank for the same date.
+    """
+    mapping = ASIN_MAPPING.get(site, {})
+
+    def candidates(value: Any):
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from candidates(item)
+            return
+        if isinstance(value, dict):
+            direct = value.get("asin") or value.get("ASIN")
+            if direct:
+                yield from candidates(direct)
+            for key in ("asins", "items", "list"):
+                if value.get(key):
+                    yield from candidates(value[key])
+            return
+        text = str(value or "").strip().upper()
+        if text:
+            yield text
+
+    for candidate in candidates(asin):
+        product = mapping.get(candidate)
+        if product:
+            return product
+    return None
+
+
+def amazon_series(product: str | None) -> str | None:
+    if not product:
+        return None
+    if product.startswith("TN10-主链接"):
+        return AMAZON_SERIES[0]
+    if product.startswith("TN10-小链接"):
+        return AMAZON_SERIES[1]
+    if product.startswith("TN20-主链接"):
+        return AMAZON_SERIES[2]
+    return None
+
+
+async def lingxing_store_rows() -> list[dict[str, Any]]:
+    body = await lingxing_get("/erp/sc/data/seller/lists")
+    return list(body.get("data") or [])
+
+
+def amazon_sid_accounts(
+    site_name: str,
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return every LingXing shop that contributes to an Amazon site.
+
+    Japan is intentionally a multi-shop site: Comu-JP owns TN20 while
+    Comulytic-JP owns TN10.  The dashboard must query both sids and let the
+    normal period/ASIN aggregation merge them into one JP result.
+    """
+    site_code = AMAZON_SITE_CODES.get(site_name, site_name)
+    raw = sid_map.get(site_name) or sid_map.get(site_code)
+    candidates: list[dict[str, Any]] = []
+
+    def add(value: Any, name: str = "") -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item, name)
+            return
+        if isinstance(value, dict):
+            sid = value.get("sid")
+            if sid is not None:
+                candidates.append({"sid": sid, "name": str(value.get("name") or value.get("account_name") or name)})
+            return
+        if value not in (None, ""):
+            candidates.append({"sid": value, "name": name})
+
+    add(raw)
+    if site_code == "JP":
+        # Always supplement configured values with the authoritative store
+        # list, because older configurations may contain only one JP sid.
+        for row in store_rows or []:
+            country = str(row.get("country") or "")
+            name = str(row.get("name") or row.get("account_name") or "")
+            if country in {"日本", "JP"} and name in {"Comu-JP", "Comulytic-JP"}:
+                add(row.get("sid"), name)
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item.get("sid") or "")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def first_value(row: dict[str, Any], *names: str) -> float:
+    for name in names:
+        value = row.get(name)
+        if value is not None:
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def optional_value(row: dict[str, Any], *names: str) -> float | None:
+    """Read a metric only when the upstream response actually contains it."""
+    for name in names:
+        if name in row and row.get(name) is not None and row.get(name) != "":
+            try:
+                return float(row.get(name) or 0)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def lingxing_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
+    data = body.get("data") or []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("list", "rows", "data", "records", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+async def fetch_asin_statistics(sid: int, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    """Fetch ASIN sales/profit statistics in API-safe 31-day windows.
+
+    LingXing exposes sales, orders, ad sales and ad cost in the ASIN statistics
+    endpoint.  The parser intentionally accepts the documented camelCase names
+    and common snake_case variants so a minor API-version response change does
+    not silently turn real values into zeroes.
+    """
+    result: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        window_end = min(cursor + timedelta(days=6), end_date)
+        payload = {
+            "sids": [sid],
+            "startDate": cursor.isoformat(),
+            "endDate": window_end.isoformat(),
+            "offset": 0,
+            "length": 1000,
+            "summaryEnabled": False,
+            "orderStatus": "Disbursed",
+        }
+        body = await lingxing_post("/bd/profit/statistics/open/asin/list", payload)
+        result.extend(lingxing_rows(body))
+        cursor = window_end + timedelta(days=1)
+    return result
+
+
+async def fetch_store_sales(sid: int, start_date: date, end_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
+    """Fetch the daily ASIN sales report used for actual paid sales/order data."""
+    cache_key = ("sales", sid, start_date.isoformat(), end_date.isoformat())
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached[1]
+    async with semaphore:
+        body = await lingxing_post("/erp/sc/data/sales_report/sales", {
+            "sid": sid, "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(), "offset": 0, "length": 10000,
+        }, client=client)
+    rows = lingxing_rows(body)
+    _amazon_cache[cache_key] = (time.monotonic(), rows)
+    return rows
+
+
+async def fetch_ad_report(sid: int, report_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
+    cache_key = ("ads", sid, report_date.isoformat())
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached[1]
+    async with semaphore:
+        body = await lingxing_post("/pb/openapi/newad/spProductAdReports", {
+            "sid": sid, "report_date": report_date.isoformat(),
+            "show_detail": 1, "offset": 0, "length": 500,
+        }, client=client)
+    data = body.get("data") or []
+    rows = data if isinstance(data, list) else (data.get("list") or data.get("rows") or data.get("data") or [])
+    _amazon_cache[cache_key] = (time.monotonic(), rows)
+    return rows
+
+
+async def fetch_ad_reports_range(sid: int, start_date: date, end_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
+    """Fetch daily product ad reports as a fallback for period gaps.
+
+    Product-performance may return range summaries without a date column (or
+    be temporarily unavailable for an individual period). The daily ad report
+    endpoint provides dated ad metrics, so use it to fill only those gaps.
+    Requests are serialized to respect LingXing's small token bucket.
+    """
+    rows: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        async with _lingxing_ad_report_lock:
+            try:
+                daily = await fetch_ad_report(sid, cursor, client, semaphore)
+            except RuntimeError as exc:
+                if "频繁" in str(exc) or "too frequent" in str(exc).lower():
+                    await asyncio.sleep(2)
+                    daily = await fetch_ad_report(sid, cursor, client, semaphore)
+                else:
+                    raise
+        for row in daily:
+            if isinstance(row, dict):
+                row["_source"] = "ad_report"
+                row["_dashboard_date"] = cursor.isoformat()
+                rows.append(row)
+        cursor += timedelta(days=1)
+    return rows
+
+
+def asin_stat_values(row: dict[str, Any]) -> dict[str, float | None]:
+    sales = optional_value(row, "totalSalesAmount", "total_sales_amount", "salesAmount", "amount")
+    refunds = optional_value(row, "totalSalesRefunds", "total_sales_refunds", "salesRefunds", "refundAmount") or 0.0
+    net_sales = (sales - refunds) if sales is not None else None
+    units = optional_value(row, "totalSalesQuantity", "total_sales_quantity", "salesQuantity", "volume", "units")
+    orders = optional_value(row, "totalOrderQuantity", "total_order_quantity", "orderQuantity", "orderCount", "orders", "order_items")
+    ad_units = optional_value(row, "totalAdsSalesQuantity", "total_ads_sales_quantity", "adsSalesQuantity", "adUnits")
+    ad_sales = optional_value(row, "totalAdsSales", "total_ads_sales", "adsSales", "adSalesAmount")
+    ad_cost = optional_value(row, "totalAdsCost", "total_ads_cost", "adsCost", "adCost")
+    b2b_units = optional_value(row, "totalB2bSalesQuantity", "totalB2BSalesQuantity", "b2bSalesQuantity", "b2b_units", "b2bUnits")
+    b2b_orders = optional_value(row, "totalB2bOrderQuantity", "totalB2BOrderQuantity", "b2bOrderQuantity", "b2b_orders", "b2bOrders")
+    sessions = optional_value(row, "sessionTotal", "Session-Total", "sessionsTotal", "sessions", "session_total", "trafficSessionTotal")
+    return {"units": units, "net_sales": net_sales, "orders": orders, "ad_units": ad_units, "ad_sales": ad_sales, "ad_cost": ad_cost, "b2b_units": b2b_units, "b2b_orders": b2b_orders, "sessions": sessions}
+
+
+async def lingxing_post(path: str, payload: dict[str, Any], client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    token = await lingxing_access_token()
+    params = lingxing_auth_params(token, payload)
+    request_params = {key: params[key] for key in ("access_token", "app_key", "timestamp", "sign")}
+    owns_client = client is None
+    request_client = client or httpx.AsyncClient(timeout=45)
+    body: dict[str, Any] = {}
+    try:
+        response = await request_client.post(
+            f"{LINGXING_API_BASE}{path}",
+            params=request_params,
+            headers={"X-API-VERSION": "2"},
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+    finally:
+        if owns_client:
+            await request_client.aclose()
+    if str(body.get("code", "200")) not in {"200", "0"}:
+        raise RuntimeError(f"LingXing API failed: {body.get('msg', 'unknown error')}")
+    return body
+
+
+async def lingxing_get(path: str) -> dict[str, Any]:
+    token = await lingxing_access_token()
+    params = lingxing_auth_params(token, {})
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.get(
+            f"{LINGXING_API_BASE}{path}",
+            params=params,
+            headers={"X-API-VERSION": "2"},
+        )
+        response.raise_for_status()
+        body = response.json()
+    if str(body.get("code", "200")) not in {"200", "0"}:
+        raise RuntimeError(f"LingXing API failed: {body.get('message') or body.get('msg', 'unknown error')}")
+    return body
+
+
+def lingxing_auth_params(token: str, business: dict[str, Any]) -> dict[str, Any]:
+    app_id = os.environ.get("LINGXING_APP_ID", "").strip()
+    params = {k: v for k, v in business.items() if v is not None and v != ""}
+    params.update({"access_token": token, "app_key": app_id, "timestamp": int(time.time())})
+    def signing_value(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+    signing = "&".join(f"{key}={signing_value(params[key])}" for key in sorted(params))
+    digest = hashlib.md5(signing.encode("utf-8")).hexdigest().upper().encode("utf-8")
+    key = app_id.encode("utf-8")
+    if len(key) not in {16, 24, 32}:
+        key = hashlib.md5(key).digest()
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    padded = digest + bytes([16 - len(digest) % 16]) * (16 - len(digest) % 16)
+    params["sign"] = base64.b64encode(encryptor.update(padded) + encryptor.finalize()).decode("ascii")
+    return params
 
 
 def database_url() -> str:
@@ -575,7 +968,9 @@ def dashboard_payload(db: Session, start: date, end: date, store: str | None) ->
     ).all()
 
     stores = db.execute(
-        select(Order.store_domain, Order.store_name).distinct().order_by(Order.store_name)
+        select(Order.store_domain, Order.store_name)
+        .distinct()
+        .order_by(Order.store_domain, Order.store_name)
     ).all()
     last = latest_success(db)
     currency = db.scalar(select(Order.currency).where(*base_conditions).limit(1)) or "USD"
@@ -627,16 +1022,541 @@ def verify_mysql():
 def status():
     configured = bool(os.environ.get("SHOPIFY_STORES_JSON") or os.environ.get("SHOPIFY_STORE"))
     database_configured = bool(os.environ.get("DATABASE_URL", "").strip())
+    amazon_configured = bool(os.environ.get("LINGXING_APP_ID") and os.environ.get("LINGXING_APP_SECRET"))
     return {
         "configured": configured and database_configured,
         "shopify_configured": configured,
         "database_configured": database_configured,
+        "amazon_configured": amazon_configured,
         "sync_mode": "on_demand",
     }
 
 
+def amazon_empty_row(series: str, product: str | None = None) -> dict[str, Any]:
+    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
+
+
+def amazon_periods(start_date: date, end_date: date, comparison: str) -> list[tuple[str, date, date]]:
+    periods: list[tuple[str, date, date]] = []
+    if comparison == "日":
+        cursor = start_date
+        while cursor <= end_date:
+            periods.append((cursor.isoformat(), cursor, cursor))
+            cursor += timedelta(days=1)
+        return periods
+    if comparison == "周":
+        cursor = start_date - timedelta(days=start_date.weekday())
+        while cursor <= end_date:
+            period_end = cursor + timedelta(days=6)
+            periods.append((f"{cursor.isoformat()}~{period_end.isoformat()}", cursor, period_end))
+            cursor += timedelta(days=7)
+        return periods
+    cursor = start_date.replace(day=1)
+    while cursor <= end_date:
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        period_end = next_month - timedelta(days=1)
+        periods.append((cursor.strftime("%Y-%m"), cursor, period_end))
+        cursor = next_month
+    return periods
+
+
+async def fetch_product_performance(
+    sid: int,
+    start_date: date,
+    end_date: date,
+    comparison: str,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    asin_list: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Read LingXing's product-performance endpoint for all dashboard metrics."""
+    # An explicitly empty list means the selected products have no ASINs
+    # mapped for this site; avoid issuing an unfiltered request in that case.
+    if asin_list == []:
+        return []
+    # LingXing limits this endpoint to a maximum 92-day date range.  The
+    # dashboard allows up to 180 days, so split longer requests into bounded
+    # chunks and merge the returned rows.  Chunk responses are kept in the
+    # normal cache, which also prevents repeated filter changes from issuing
+    # the same upstream request again.
+    rows: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        chunk_end = min(cursor + timedelta(days=91), end_date)
+        cache_key = ("product-performance-v2", sid, cursor.isoformat(), chunk_end.isoformat(), tuple(asin_list or ()))
+        cached = _amazon_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+            chunk_rows = cached[1]
+        else:
+            payload = {
+                "offset": 0,
+                "length": 10000,
+                "sort_field": "volume",
+                "sort_type": "desc",
+                # LingXing documents a scalar string for a single-shop query;
+                # arrays are reserved for multi-shop aggregation.
+                "sid": str(sid),
+                "start_date": cursor.isoformat(),
+                "end_date": chunk_end.isoformat(),
+                "summary_field": "asin",
+                "is_recently_enum": False,
+                "purchase_status": 0,
+            }
+            # The endpoint supports native ASIN filtering through
+            # search_field/search_value (up to 50 ASINs per request).
+            if asin_list is not None:
+                payload["search_field"] = "asin"
+                payload["search_value"] = asin_list
+            # LingXing may briefly reject consecutive requests for the same
+            # account even when each request is within the documented range.
+            # Retry only that specific upstream response with bounded backoff;
+            # all other errors still fail fast and remain visible to the UI.
+            rate_limited = False
+            for attempt in range(6):
+                try:
+                    # The documented token bucket for this endpoint is 1.
+                    # Serialize product-performance calls across periods so a
+                    # week/month query cannot self-rate-limit its own requests.
+                    global _lingxing_performance_last_call
+                    async with _lingxing_performance_lock:
+                        # LingXing documents a one-request token bucket for
+                        # this endpoint when querying a single shop. Keep a
+                        # small spacing between period requests so later
+                        # periods are not silently rate-limited.
+                        wait_for = 1.05 - (time.monotonic() - _lingxing_performance_last_call)
+                        if wait_for > 0:
+                            await asyncio.sleep(wait_for)
+                        async with semaphore:
+                            body = await lingxing_post("/bd/productPerformance/openApi/asinList", payload, client=client)
+                        _lingxing_performance_last_call = time.monotonic()
+                    break
+                except RuntimeError as exc:
+                    error_text = str(exc).lower()
+                    if "too frequent" in error_text or "request later" in error_text:
+                        if attempt == 5:
+                            rate_limited = True
+                            break
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    if "频繁" not in str(exc):
+                        raise
+                    if attempt == 4:
+                        rate_limited = True
+                        break
+                    await asyncio.sleep(2 * (attempt + 1))
+            if rate_limited:
+                # A rate-limited later chunk must not discard the data already
+                # fetched for earlier chunks or turn the whole dashboard into
+                # HTTP 500.  Return the successful prefix; the normal cache
+                # keeps it available while a subsequent request retries the
+                # missing chunk after LingXing's cooldown.
+                break
+            data = body.get("data") or {}
+            if isinstance(data, list):
+                chunk_rows = data
+            elif isinstance(data, dict):
+                chunk_rows = data.get("list") or data.get("rows") or data.get("records") or data.get("items")
+                if not isinstance(chunk_rows, list) and isinstance(data.get("data"), dict):
+                    nested = data["data"]
+                    chunk_rows = nested.get("list") or nested.get("rows") or nested.get("records") or nested.get("items")
+            else:
+                chunk_rows = []
+            chunk_rows = chunk_rows if isinstance(chunk_rows, list) else []
+            _amazon_cache[cache_key] = (time.monotonic(), chunk_rows)
+        rows.extend(chunk_rows)
+        cursor = chunk_end + timedelta(days=1)
+    return rows
+
+
+def optional_metric(row: dict[str, Any], *names: str) -> float | None:
+    return optional_value(row, *names)
+
+
+async def amazon_dashboard_periodic(
+    comparison: str,
+    start_date: date,
+    end_date: date,
+    site: str | None,
+    selected_series: set[str],
+    selected_products: set[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    periods = amazon_periods(start_date, end_date, comparison)
+    selected_sites = [site] if site else list(AMAZON_SITE_CODES)
+    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
+    cache_key = ("periodic-dashboard-v3", comparison, start_date.isoformat(), end_date.isoformat(), site or "", tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        async def fetch_site(site_name: str):
+            site_code = AMAZON_SITE_CODES.get(site_name, site_name)
+            accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
+            if not accounts:
+                return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), []
+            # Translate the UI's product selection back to the site's mapped
+            # ASINs so LingXing can filter at the source. Keep a full request
+            # for "all products"; an empty mapped result intentionally yields
+            # no performance rows for this site.
+            asin_filter: list[str] | None
+            if selected_products == set(AMAZON_PRODUCTS):
+                asin_filter = None
+            else:
+                site_mapping = ASIN_MAPPING.get(site_code, {})
+                asin_filter = [asin for asin, product_name in site_mapping.items() if product_name in selected_products]
+            all_rows: list[dict[str, Any]] = []
+            for account in accounts:
+                sid_value = account["sid"]
+                performance_rows = []
+                try:
+                    # The product-performance endpoint has a token bucket of 1.
+                    # Query each natural dashboard period separately so every
+                    # day/week/month receives the metrics belonging to it.
+                    for period_label, period_start, period_end in periods:
+                        period_rows = await fetch_product_performance(
+                            int(sid_value), period_start, period_end, comparison,
+                            client, semaphore, asin_filter,
+                        )
+                        for period_row in period_rows:
+                            if isinstance(period_row, dict):
+                                tagged = dict(period_row)
+                                tagged["_dashboard_period"] = period_label
+                                tagged["_source"] = "performance"
+                                performance_rows.append(tagged)
+                except RuntimeError as exc:
+                    if "ip not permit" in str(exc).lower() or "白名单" in str(exc):
+                        performance_rows = []
+                    else:
+                        raise
+                for row in performance_rows:
+                    row["_source"] = "performance"
+                try:
+                    sales_rows = await fetch_store_sales(int(sid_value), start_date, end_date, client, semaphore)
+                except RuntimeError as exc:
+                    if "ip not permit" in str(exc).lower() or "白名单" in str(exc):
+                        sales_rows = []
+                    else:
+                        raise
+                for row in sales_rows:
+                    row["_source"] = "sales"
+                ad_report_rows = await fetch_ad_reports_range(
+                    int(sid_value), start_date, end_date, client, semaphore
+                )
+                all_rows.extend(performance_rows + sales_rows + ad_report_rows)
+            return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), all_rows
+
+        results = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
+
+    aggregate: dict[tuple[str, str, str], dict[str, Any]] = {}
+    def row_date(raw: dict[str, Any]) -> date | None:
+        if raw.get("_dashboard_date"):
+            try:
+                return date.fromisoformat(str(raw["_dashboard_date"])[:10])
+            except ValueError:
+                pass
+        for key in ("r_date", "rDate", "data_date", "dataDate", "date", "report_date", "reportDate", "stat_date", "statDate"):
+            value = raw.get(key)
+            if value:
+                text = str(value).strip().replace("/", "-")
+                for candidate in (text[:10], text.split(" ", 1)[0]):
+                    try:
+                        return datetime.fromisoformat(candidate).date()
+                    except ValueError:
+                        pass
+                for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        return datetime.strptime(text, fmt).date()
+                    except ValueError:
+                        pass
+        return None
+
+    def period_for(value: date | None) -> tuple[str, date, date] | None:
+        if value is None:
+            # 产品表现接口返回的是所选区间汇总，没有日期列。将区间广告汇总放在最新周期；销售明细仍按 r_date 分配到每个自然周期。
+            return periods[-1] if periods else None
+        return next((p for p in periods if p[1] <= value <= p[2]), None)
+
+    for site_name, site_code, default_currency, raw_rows in results:
+        for raw in raw_rows:
+            forced_period = raw.get("_dashboard_period") if isinstance(raw, dict) else None
+            period_info = next((p for p in periods if p[0] == forced_period), None) if forced_period else period_for(row_date(raw))
+            if period_info is None:
+                continue
+            period_label, period_start, period_end = period_info
+            product = amazon_product(
+                site_code,
+                raw.get("asin") or raw.get("ASIN") or raw.get("asins") or raw.get("ASINs") or raw,
+            )
+            group = amazon_series(product)
+            if not group or group not in selected_series or product not in selected_products:
+                continue
+            key = (period_label, group, product)
+            item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency})
+            source = raw.get("_source", "performance")
+            fields = ({
+                "units": ("volume", "totalSalesQuantity"),
+                "net_sales": ("net_amount", "netAmount", "amount", "totalSalesAmount"),
+                "orders": ("order_items", "orderItems", "totalOrderQuantity"),
+                "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
+                "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
+                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+            } if source == "sales" else {
+                "impressions": ("impressions",),
+                "clicks": ("clicks",),
+                "ad_sales": ("sales", "sales_14d"),
+                "ad_cost": ("cost",),
+                "ad_units": ("units", "units_14d"),
+                "ad_orders": ("orders", "orders_14d"),
+            } if source == "ad_report" else {
+                "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
+                "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
+                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+                "impressions": ("impressions",),
+                "clicks": ("clicks",),
+                "ad_sales": ("ad_sales_amount", "adSalesAmount", "totalAdsSales"),
+                "ad_cost": ("spend", "totalAdsCost", "adCost"),
+                "ad_units": ("ads_sales_volume_quantity", "adsSalesVolumeQuantity", "totalAdsSalesQuantity", "adSalesQuantity", "ad_units"),
+                "ad_orders": ("ad_order_quantity", "adOrderQuantity", "ad_orders"),
+                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+            })
+            for field, names in fields.items():
+                value = optional_metric(raw, *names)
+                if value is not None:
+                    # Performance data is authoritative when present; daily ad
+                    # reports only backfill missing ad fields.
+                    if source == "ad_report" and field in {"ad_sales", "ad_cost", "ad_units", "ad_orders", "impressions", "clicks"} and item.get(field) is not None:
+                        continue
+                    item[field] = (item.get(field) or 0) + value
+            for field, names in {
+                "source_ctr": ("ctr",),
+                "source_cvr": ("cvr",),
+                "source_ad_cvr": ("ad_cvr", "adCvr"),
+                "source_acoas": ("acoas",),
+                "source_acos": ("acos",),
+                "source_cpc": ("cpc",),
+            }.items():
+                value = optional_metric(raw, *names)
+                if value is not None:
+                    item[field] = value
+
+    rows: list[dict[str, Any]] = []
+    for (period_label, group, product), item in aggregate.items():
+        units = item.get("units")
+        net_sales = item.get("net_sales")
+        orders = item.get("orders")
+        clicks = item.get("clicks")
+        impressions = item.get("impressions")
+        ad_sales = item.get("ad_sales")
+        ad_cost = item.get("ad_cost")
+        ad_orders = item.get("ad_orders")
+        sessions = item.get("sessions")
+        ad_units = item.get("ad_units")
+        ad_sales_share = (ad_units / units) if ad_units is not None and units else None
+        # ACoAS is defined by the dashboard requirement as ad spend divided
+        # by net sales. Recalculate it from the period totals instead of
+        # trusting a range-level/source value that may use another denominator.
+        calculated_acoas = (ad_cost / net_sales) if ad_cost is not None and net_sales else None
+        rows.append({
+            "period": item["period"], "period_start": item["period_start"], "period_end": item["period_end"],
+            "series": group, "product": product, "currency": item.get("currency", "USD"),
+            "units": int(units) if units is not None else None, "net_sales": net_sales, "orders": int(orders) if orders is not None else None,
+            "b2b_units": int(item["b2b_units"]) if item.get("b2b_units") is not None else None, "b2b_orders": int(item["b2b_orders"]) if item.get("b2b_orders") is not None else None,
+            "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
+            "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks else item.get("source_cpc"),
+            "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else item.get("source_ad_cvr"),
+            "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
+            "cvr": orders / sessions if orders is not None and sessions else item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
+            "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_sales": ad_sales,
+            "sessions": int(sessions) if sessions is not None else None,
+        })
+    response = {"period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED", "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)}, "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods], "rows": rows, "mapping": {"key": "site+asin", "sites": list(AMAZON_SITE_CODES)}}
+    _amazon_cache[cache_key] = (time.monotonic(), response)
+    return response
+
+
+@app.get("/api/amazon/dashboard")
+async def amazon_dashboard(
+    comparison: str = Query(default="周", pattern="^(日|周|月)$"),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    site: str | None = Query(default=None),
+    series: list[str] = Query(default=[]),
+    products: list[str] = Query(default=[]),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key)
+    today = utcnow().date()
+    if (start_date is None) != (end_date is None):
+        raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
+    if start_date is None:
+        if comparison == "日":
+            start_date = end_date = today
+        elif comparison == "周":
+            end_date = today - timedelta(days=(today.weekday() + 1) % 7)
+            start_date = end_date - timedelta(days=6)
+        else:
+            end_date = today.replace(day=1) - timedelta(days=1)
+            start_date = end_date.replace(day=1)
+    if start_date > today or end_date > today:
+        raise HTTPException(status_code=422, detail="日期不能晚于今天")
+    if comparison == "周" and (start_date.weekday() != 0 or end_date.weekday() != 6):
+        raise HTTPException(status_code=422, detail="周维度只能选择自然周的周一至周日")
+    if comparison == "月":
+        next_month = (end_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if start_date.day != 1 or end_date != next_month - timedelta(days=1):
+            raise HTTPException(status_code=422, detail="月维度只能选择自然月的月初至月末")
+    if start_date > end_date or (end_date - start_date).days > 180:
+        raise HTTPException(status_code=422, detail="日期范围无效，最多支持 180 天")
+    if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+        raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+    selected_sites = [site] if site else list(AMAZON_SITE_CODES)
+    selected_series = set(series or AMAZON_SERIES)
+    selected_products = {re.sub(r"-(黑|银|橙)$", r"-\1色", str(value)) for value in (products or AMAZON_PRODUCTS)}
+    try:
+        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+    if not sid_map:
+        for store_item in await lingxing_store_rows():
+            country = str(store_item.get("country") or "")
+            sid = store_item.get("sid")
+            if country and sid and int(store_item.get("status") or 0) == 1:
+                sid_map.setdefault(country, {"sid": sid})
+    store_rows = []
+    if site == "日本" or not sid_map:
+        store_rows = await lingxing_store_rows()
+    return await amazon_dashboard_periodic(comparison, start_date, end_date, site, selected_series, selected_products, sid_map, store_rows)
+    dashboard_cache_key = (
+        "dashboard", comparison, start_date.isoformat(), end_date.isoformat(),
+        site or "", tuple(sorted(selected_series)), tuple(sorted(selected_products)),
+    )
+    cached_dashboard = _amazon_cache.get(dashboard_cache_key)
+    if cached_dashboard and time.monotonic() - cached_dashboard[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached_dashboard[1]
+    try:
+        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+    if not sid_map:
+        for store_item in await lingxing_store_rows():
+            country = str(store_item.get("country") or "")
+            sid = store_item.get("sid")
+            if country and sid and int(store_item.get("status") or 0) == 1:
+                sid_map.setdefault(country, {"sid": sid})
+    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=45) as client:
+        async def fetch_site(site_name: str) -> tuple[str, str, str, list[list[dict[str, Any]]], list[dict[str, Any]]]:
+            site_code = AMAZON_SITE_CODES.get(site_name, site_name)
+            account = sid_map.get(site_name) or sid_map.get(site_code) or {}
+            sid = account.get("sid") if isinstance(account, dict) else account
+            if not sid:
+                return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), [], []
+            ad_tasks = []
+            cursor = start_date
+            while cursor <= end_date:
+                ad_tasks.append(fetch_ad_report(int(sid), cursor, client, semaphore))
+                cursor += timedelta(days=1)
+            ad_results, sales_rows = await asyncio.gather(
+                asyncio.gather(*ad_tasks),
+                fetch_store_sales(int(sid), start_date, end_date, client, semaphore),
+            )
+            return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), ad_results, sales_rows
+
+        site_results = await asyncio.gather(*(fetch_site(name) for name in selected_sites))
+
+    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    for site_name, site_code, currency, ad_results, sales_rows in site_results:
+        for report_rows in ad_results:
+            for raw in report_rows:
+                product = amazon_product(site_code, raw.get("asin"))
+                group = amazon_series(product)
+                if not group or group not in selected_series or product not in selected_products:
+                    continue
+                key = (group, product)
+                item = aggregate.setdefault(key, {"currency": currency, "clicks": 0, "impressions": 0, "cost": 0, "orders": 0, "sales": 0, "units": 0, "stat": {}})
+                if item["currency"] != currency:
+                    item["currency"] = "MIXED"
+                item["clicks"] += first_value(raw, "clicks")
+                item["impressions"] += first_value(raw, "impressions")
+                item["cost"] += first_value(raw, "cost", "spend")
+                item["orders"] += first_value(raw, "orders", "order_count")
+                item["sales"] += first_value(raw, "sales", "ad_sales")
+                item["units"] += first_value(raw, "units", "ad_units")
+        for raw in sales_rows:
+            product = amazon_product(site_code, raw.get("asin") or raw.get("ASIN"))
+            group = amazon_series(product)
+            if not group or group not in selected_series or product not in selected_products:
+                continue
+            key = (group, product)
+            item = aggregate.setdefault(key, {"currency": currency, "clicks": 0, "impressions": 0, "cost": 0, "orders": 0, "sales": 0, "units": 0, "stat": {}})
+            if item["currency"] != currency:
+                item["currency"] = "MIXED"
+            stats = item["stat"]
+            stats["units"] = (stats.get("units") or 0) + first_value(raw, "volume", "units")
+            stats["orders"] = (stats.get("orders") or 0) + first_value(raw, "order_items", "orders")
+            stats["net_sales"] = (stats.get("net_sales") or 0) + first_value(raw, "amount", "sales", "net_sales")
+    rows = []
+    for (group, product), item in aggregate.items():
+        clicks, impressions, cost, ad_orders, ad_sales, ad_units = (item[k] for k in ("clicks", "impressions", "cost", "orders", "sales", "units"))
+        stat = item.get("stat") or {}
+        units = stat.get("units")
+        net_sales = stat.get("net_sales")
+        orders = stat.get("orders")
+        b2b_units = stat.get("b2b_units")
+        b2b_orders = stat.get("b2b_orders")
+        sessions = stat.get("sessions")
+        # Prefer the sales-statistics values when present; advertising report
+        # values are the fallback for ad-specific columns.
+        if stat.get("ad_units") is not None:
+            ad_units = stat["ad_units"]
+        if stat.get("ad_cost") is not None:
+            cost = stat["ad_cost"]
+        if stat.get("ad_sales") is not None:
+            ad_sales = stat["ad_sales"]
+        rows.append({"series": group, "product": product, "currency": item.get("currency", "USD"), "acoas": (cost / net_sales if net_sales not in (None, 0) else None), "ad_sales_share": (ad_units / units if units not in (None, 0) else None), "units": (int(units) if units is not None else None), "net_sales": net_sales, "orders": (int(orders) if orders is not None else None), "b2b_units": (int(b2b_units) if b2b_units is not None else None), "b2b_orders": (int(b2b_orders) if b2b_orders is not None else None), "ctr": (clicks / impressions if impressions else None), "clicks": int(clicks), "cpc": (cost / clicks if clicks else None), "ad_cost": cost, "ad_cvr": (ad_orders / clicks if clicks else None), "ad_units": int(ad_units), "ad_orders": int(ad_orders), "cvr": (orders / sessions if orders not in (None, 0) and sessions not in (None, 0) else None), "acos": (cost / ad_sales if ad_sales else None), "sessions": (int(sessions) if sessions is not None else None)})
+    response_payload = {"period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED", "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)}, "rows": rows, "mapping": {"key": "site+asin", "sites": list(AMAZON_SITE_CODES)}}
+    _amazon_cache[dashboard_cache_key] = (time.monotonic(), response_payload)
+    return response_payload
+
+
+@app.get("/api/amazon/stores")
+async def amazon_stores(
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Return the authorized Amazon stores without exposing credentials."""
+    require_business_access(x_sync_key)
+    if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+        raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+    try:
+        raw_stores = await lingxing_store_rows()
+        stores = []
+        for item in raw_stores:
+            stores.append({
+                "sid": int(item.get("sid")) if item.get("sid") is not None else None,
+                "name": str(item.get("name") or item.get("account_name") or "未命名店铺"),
+                "country": str(item.get("country") or "未知站点"),
+                "region": str(item.get("region") or ""),
+                "seller_id": str(item.get("seller_id") or ""),
+                "has_ads_setting": int(item.get("has_ads_setting") or 0),
+                "status": int(item.get("status") or 0),
+            })
+        return {"stores": stores, "count": len(stores)}
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{str(exc)[:200]}") from exc
+
+
 @app.post("/api/sync")
-async def sync(trigger: str = Query(default="button", pattern="^(button|dashboard)$")):
+async def sync(
+    trigger: str = Query(default="button", pattern="^(button|dashboard)$"),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    configured_key = os.environ.get("SYNC_API_KEY", "").strip()
+    if not configured_key or x_sync_key != configured_key:
+        raise HTTPException(status_code=401, detail="同步接口需要有效的 X-Sync-Key")
     try:
         return await run_sync(trigger)
     except RuntimeError as exc:
@@ -653,9 +1573,11 @@ async def dashboard(
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
     store: str | None = Query(default=None, max_length=255),
-    auto_sync: bool = Query(default=True),
+    auto_sync: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     try:
+        require_business_access(x_sync_key)
         if (start_date is None) != (end_date is None):
             raise HTTPException(status_code=422, detail="自定义日期需要同时提供开始日期和结束日期")
         if start_date is not None and end_date is not None:
@@ -671,6 +1593,9 @@ async def dashboard(
             period_start = period_end - timedelta(days=days)
         factory = session_factory()
         if auto_sync:
+            configured_key = os.environ.get("SYNC_API_KEY", "").strip()
+            if not configured_key or x_sync_key != configured_key:
+                raise HTTPException(status_code=401, detail="自动同步需要有效的 X-Sync-Key")
             await run_sync("dashboard")
         with factory() as db:
             return dashboard_payload(db, period_start, period_end, store)
@@ -679,4 +1604,4 @@ async def dashboard(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Dashboard query failed: {str(exc)[:300]}") from exc
+        raise HTTPException(status_code=500, detail="Dashboard query failed") from exc
