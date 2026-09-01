@@ -1,6 +1,6 @@
 # Shopify BI Dashboard
 
-一个独立于原 Shopify 飞书播报项目的 IdeaDock 全栈 BI 看板。
+IdeaDock 全栈 BI 看板。
 
 ## 架构
 
