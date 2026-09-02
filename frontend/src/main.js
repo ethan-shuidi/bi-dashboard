@@ -3,5 +3,5 @@ import App from "./App.vue"
 import "./style.css"
 import ElementPlus from "element-plus"
 import "element-plus/dist/index.css"
-// Git push connectivity test comment.
+// Git push connectivity test comment - second round.
 createApp(App).use(ElementPlus).mount("#app")
