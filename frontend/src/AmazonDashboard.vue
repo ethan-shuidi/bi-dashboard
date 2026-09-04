@@ -307,6 +307,7 @@ function toggle(row) {
 }
 
 async function loadRuntime() {
+  await fetch("./ideadock.verify.json", { cache: "no-store" }).catch(() => null)
   try { const response = await fetch("./ideadock.runtime.json", { cache: "no-store" }); apiBase.value = String((await response.json()).backend_base_url || "").replace(/\/$/, "") } catch { apiBase.value = "http://127.0.0.1:8000" }
 }
 

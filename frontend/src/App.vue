@@ -153,6 +153,9 @@ async function loadRuntime() {
     if (!response.ok) throw new Error("runtime config unavailable")
     const config = await response.json()
     apiBase.value = String(config.backend_base_url || "").replace(/\/$/, "")
+    if (apiBase.value) {
+      await fetchWithDashboardAuth(`${apiBase.value}/health`, { cache: "no-store" }).catch(() => null)
+    }
   } catch {
     apiBase.value = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000"
   }
@@ -231,6 +234,9 @@ watch(period, (value) => {
   if (value !== "custom") loadDashboard({ autoSync: false })
 })
 watch(store, () => loadDashboard({ autoSync: false }))
+watch(activeDashboard, (value) => {
+  if (value === "commerce" && !status.value) loadDashboard({ autoSync: false })
+})
 watch(dashboard, renderCharts, { flush: "post" })
 
 onMounted(async () => {
@@ -239,7 +245,8 @@ onMounted(async () => {
     productChart?.resize()
   })
   await loadRuntime()
-  await loadDashboard({ autoSync: false })
+  if (activeDashboard.value === "commerce") await loadDashboard({ autoSync: false })
+  else loading.value = false
   await nextTick()
   if (salesChartElement.value) resizeObserver.observe(salesChartElement.value)
   if (productChartElement.value) resizeObserver.observe(productChartElement.value)

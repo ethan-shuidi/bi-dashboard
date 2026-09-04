@@ -63,7 +63,7 @@ app.add_middleware(
 def require_business_access(
     x_sync_key: str | None,
 ) -> None:
-    """Require the configured dashboard key for every business API request."""
+    """Require the configured dashboard key for protected business APIs."""
     configured_key = (
         os.environ.get("DASHBOARD_API_KEY", "").strip()
         or os.environ.get("SYNC_API_KEY", "").strip()
@@ -1356,9 +1356,8 @@ async def amazon_dashboard(
     site: str | None = Query(default=None),
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
-    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key)
+    """Return read-only Amazon dashboard data; credentials stay server-side."""
     today = utcnow().date()
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
@@ -1404,10 +1403,8 @@ async def amazon_dashboard(
 
 @app.get("/api/amazon/stores")
 async def amazon_stores(
-    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    """Return the authorized Amazon stores without exposing credentials."""
-    require_business_access(x_sync_key)
+    """Return read-only Amazon stores without exposing credentials."""
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:
