@@ -267,9 +267,7 @@ def amazon_product(site: str, asin: Any) -> str | None:
     The product-performance endpoint returns ``asins`` as an array of objects,
     not a single scalar.  Taking only the first entry silently discarded a
     valid performance row whenever the mapped ASIN appeared later in that
-    array.  Sales rows still matched their scalar ASIN, which is exactly why
-    sales/orders were visible while B2B, Sessions and performance metrics were
-    blank for the same date.
+    array.
     """
     mapping = ASIN_MAPPING.get(site, {})
 
@@ -362,17 +360,6 @@ def amazon_sid_accounts(
     return unique
 
 
-def first_value(row: dict[str, Any], *names: str) -> float:
-    for name in names:
-        value = row.get(name)
-        if value is not None:
-            try:
-                return float(value or 0)
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
-
-
 def optional_value(row: dict[str, Any], *names: str) -> float | None:
     """Read a metric only when the upstream response actually contains it."""
     for name in names:
@@ -396,49 +383,6 @@ def lingxing_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-async def fetch_asin_statistics(sid: int, start_date: date, end_date: date) -> list[dict[str, Any]]:
-    """Fetch ASIN sales/profit statistics in API-safe 31-day windows.
-
-    LingXing exposes sales, orders, ad sales and ad cost in the ASIN statistics
-    endpoint.  The parser intentionally accepts the documented camelCase names
-    and common snake_case variants so a minor API-version response change does
-    not silently turn real values into zeroes.
-    """
-    result: list[dict[str, Any]] = []
-    cursor = start_date
-    while cursor <= end_date:
-        window_end = min(cursor + timedelta(days=6), end_date)
-        payload = {
-            "sids": [sid],
-            "startDate": cursor.isoformat(),
-            "endDate": window_end.isoformat(),
-            "offset": 0,
-            "length": 1000,
-            "summaryEnabled": False,
-            "orderStatus": "Disbursed",
-        }
-        body = await lingxing_post("/bd/profit/statistics/open/asin/list", payload)
-        result.extend(lingxing_rows(body))
-        cursor = window_end + timedelta(days=1)
-    return result
-
-
-async def fetch_store_sales(sid: int, start_date: date, end_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
-    """Fetch the daily ASIN sales report used for actual paid sales/order data."""
-    cache_key = ("sales", sid, start_date.isoformat(), end_date.isoformat())
-    cached = _amazon_cache.get(cache_key)
-    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
-        return cached[1]
-    async with semaphore:
-        body = await lingxing_post("/erp/sc/data/sales_report/sales", {
-            "sid": sid, "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(), "offset": 0, "length": 10000,
-        }, client=client)
-    rows = lingxing_rows(body)
-    _amazon_cache[cache_key] = (time.monotonic(), rows)
-    return rows
-
-
 async def fetch_ad_report(sid: int, report_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
     cache_key = ("ads", sid, report_date.isoformat())
     cached = _amazon_cache.get(cache_key)
@@ -456,13 +400,7 @@ async def fetch_ad_report(sid: int, report_date: date, client: httpx.AsyncClient
 
 
 async def fetch_ad_reports_range(sid: int, start_date: date, end_date: date, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> list[dict[str, Any]]:
-    """Fetch daily product ad reports as a fallback for period gaps.
-
-    Product-performance may return range summaries without a date column (or
-    be temporarily unavailable for an individual period). The daily ad report
-    endpoint provides dated ad metrics, so use it to fill only those gaps.
-    Requests are serialized to respect LingXing's small token bucket.
-    """
+    """Fetch the daily product ad reports used for all advertising metrics."""
     rows: list[dict[str, Any]] = []
     cursor = start_date
     while cursor <= end_date:
@@ -482,21 +420,6 @@ async def fetch_ad_reports_range(sid: int, start_date: date, end_date: date, cli
                 rows.append(row)
         cursor += timedelta(days=1)
     return rows
-
-
-def asin_stat_values(row: dict[str, Any]) -> dict[str, float | None]:
-    sales = optional_value(row, "totalSalesAmount", "total_sales_amount", "salesAmount", "amount")
-    refunds = optional_value(row, "totalSalesRefunds", "total_sales_refunds", "salesRefunds", "refundAmount") or 0.0
-    net_sales = (sales - refunds) if sales is not None else None
-    units = optional_value(row, "totalSalesQuantity", "total_sales_quantity", "salesQuantity", "volume", "units")
-    orders = optional_value(row, "totalOrderQuantity", "total_order_quantity", "orderQuantity", "orderCount", "orders", "order_items")
-    ad_units = optional_value(row, "totalAdsSalesQuantity", "total_ads_sales_quantity", "adsSalesQuantity", "adUnits")
-    ad_sales = optional_value(row, "totalAdsSales", "total_ads_sales", "adsSales", "adSalesAmount")
-    ad_cost = optional_value(row, "totalAdsCost", "total_ads_cost", "adsCost", "adCost")
-    b2b_units = optional_value(row, "totalB2bSalesQuantity", "totalB2BSalesQuantity", "b2bSalesQuantity", "b2b_units", "b2bUnits")
-    b2b_orders = optional_value(row, "totalB2bOrderQuantity", "totalB2BOrderQuantity", "b2bOrderQuantity", "b2b_orders", "b2bOrders")
-    sessions = optional_value(row, "sessionTotal", "Session-Total", "sessionsTotal", "sessions", "session_total", "trafficSessionTotal")
-    return {"units": units, "net_sales": net_sales, "orders": orders, "ad_units": ad_units, "ad_sales": ad_sales, "ad_cost": ad_cost, "b2b_units": b2b_units, "b2b_orders": b2b_orders, "sessions": sessions}
 
 
 async def lingxing_post(path: str, payload: dict[str, Any], client: httpx.AsyncClient | None = None) -> dict[str, Any]:
@@ -1069,7 +992,7 @@ async def fetch_product_performance(
     semaphore: asyncio.Semaphore,
     asin_list: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Read LingXing's product-performance endpoint for all dashboard metrics."""
+    """Read LingXing's product-performance endpoint for operating metrics."""
     # An explicitly empty list means the selected products have no ASINs
     # mapped for this site; avoid issuing an unfiltered request in that case.
     if asin_list == []:
@@ -1232,19 +1155,10 @@ async def amazon_dashboard_periodic(
                         raise
                 for row in performance_rows:
                     row["_source"] = "performance"
-                try:
-                    sales_rows = await fetch_store_sales(int(sid_value), start_date, end_date, client, semaphore)
-                except RuntimeError as exc:
-                    if "ip not permit" in str(exc).lower() or "白名单" in str(exc):
-                        sales_rows = []
-                    else:
-                        raise
-                for row in sales_rows:
-                    row["_source"] = "sales"
                 ad_report_rows = await fetch_ad_reports_range(
                     int(sid_value), start_date, end_date, client, semaphore
                 )
-                all_rows.extend(performance_rows + sales_rows + ad_report_rows)
+                all_rows.extend(performance_rows + ad_report_rows)
             return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), all_rows
 
         results = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
@@ -1274,7 +1188,7 @@ async def amazon_dashboard_periodic(
 
     def period_for(value: date | None) -> tuple[str, date, date] | None:
         if value is None:
-            # 产品表现接口返回的是所选区间汇总，没有日期列。将区间广告汇总放在最新周期；销售明细仍按 r_date 分配到每个自然周期。
+            # 产品表现接口返回的是所选区间汇总，没有日期列，归入当前请求对应的周期。
             return periods[-1] if periods else None
         return next((p for p in periods if p[1] <= value <= p[2]), None)
 
@@ -1295,48 +1209,43 @@ async def amazon_dashboard_periodic(
             key = (period_label, group, product)
             item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency})
             source = raw.get("_source", "performance")
-            fields = ({
-                "units": ("volume", "totalSalesQuantity"),
-                "net_sales": ("net_amount", "netAmount", "amount", "totalSalesAmount"),
-                "orders": ("order_items", "orderItems", "totalOrderQuantity"),
-                "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
-                "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
-                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-            } if source == "sales" else {
-                "impressions": ("impressions",),
-                "clicks": ("clicks",),
-                "ad_sales": ("sales", "sales_14d"),
-                "ad_cost": ("cost",),
-                "ad_units": ("units", "units_14d"),
-                "ad_orders": ("orders", "orders_14d"),
-            } if source == "ad_report" else {
-                "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
-                "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
-                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-                "impressions": ("impressions",),
-                "clicks": ("clicks",),
-                "ad_sales": ("ad_sales_amount", "adSalesAmount", "totalAdsSales"),
-                "ad_cost": ("spend", "totalAdsCost", "adCost"),
-                "ad_units": ("ads_sales_volume_quantity", "adsSalesVolumeQuantity", "totalAdsSalesQuantity", "adSalesQuantity", "ad_units"),
-                "ad_orders": ("ad_order_quantity", "adOrderQuantity", "ad_orders"),
-                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-            })
+            if source == "performance":
+                # Product-performance is the sole source for operating metrics.
+                # Deliberately do not fall back to amount/totalSalesAmount:
+                # those are sales amount fields, not the product-performance
+                # field labelled net_amount (净销售额).
+                fields = {
+                    "units": ("volume", "totalSalesQuantity"),
+                    "net_sales": ("net_amount", "netAmount", "net_sales", "netSales"),
+                    "orders": ("order_items", "orderItems", "totalOrderQuantity"),
+                    "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
+                    "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
+                    "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+                }
+                source_fields = {"source_cvr": ("cvr", "conversion_rate", "conversionRate")}
+            elif source == "ad_report":
+                # Advertising metrics come only from the advertising backend.
+                fields = {
+                    "impressions": ("impressions",),
+                    "clicks": ("clicks",),
+                    "ad_sales": ("sales", "sales_14d", "ad_sales", "adSales"),
+                    "ad_cost": ("cost", "spend"),
+                    "ad_units": ("units", "units_14d", "ad_units", "adUnits"),
+                    "ad_orders": ("orders", "orders_14d", "order_count", "ad_orders", "adOrders"),
+                }
+                source_fields = {
+                    "source_ctr": ("ctr", "click_through_rate", "clickThroughRate"),
+                    "source_cpc": ("cpc", "cost_per_click", "costPerClick"),
+                    "source_ad_cvr": ("ad_cvr", "adCvr", "ad_conversion_rate", "adConversionRate"),
+                    "source_acos": ("acos", "ACOS"),
+                }
+            else:
+                continue
             for field, names in fields.items():
                 value = optional_metric(raw, *names)
                 if value is not None:
-                    # Performance data is authoritative when present; daily ad
-                    # reports only backfill missing ad fields.
-                    if source == "ad_report" and field in {"ad_sales", "ad_cost", "ad_units", "ad_orders", "impressions", "clicks"} and item.get(field) is not None:
-                        continue
                     item[field] = (item.get(field) or 0) + value
-            for field, names in {
-                "source_ctr": ("ctr",),
-                "source_cvr": ("cvr",),
-                "source_ad_cvr": ("ad_cvr", "adCvr"),
-                "source_acoas": ("acoas",),
-                "source_acos": ("acos",),
-                "source_cpc": ("cpc",),
-            }.items():
+            for field, names in source_fields.items():
                 value = optional_metric(raw, *names)
                 if value is not None:
                     item[field] = value
@@ -1363,15 +1272,31 @@ async def amazon_dashboard_periodic(
             "series": group, "product": product, "currency": item.get("currency", "USD"),
             "units": int(units) if units is not None else None, "net_sales": net_sales, "orders": int(orders) if orders is not None else None,
             "b2b_units": int(item["b2b_units"]) if item.get("b2b_units") is not None else None, "b2b_orders": int(item["b2b_orders"]) if item.get("b2b_orders") is not None else None,
-            "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
-            "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks else item.get("source_cpc"),
-            "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else item.get("source_ad_cvr"),
+            "ctr": item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
+            "impressions": int(impressions) if impressions is not None else None, "cpc": item.get("source_cpc"),
+            "ad_cost": ad_cost, "ad_cvr": item.get("source_ad_cvr"),
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
-            "cvr": orders / sessions if orders is not None and sessions else item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
+            "cvr": item.get("source_cvr"), "acos": item.get("source_acos"),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_sales": ad_sales,
             "sessions": int(sessions) if sessions is not None else None,
         })
-    response = {"period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED", "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)}, "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods], "rows": rows, "mapping": {"key": "site+asin", "sites": list(AMAZON_SITE_CODES)}}
+    response = {
+        "period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()},
+        "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED",
+        "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)},
+        "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods],
+        "rows": rows,
+        "mapping": {
+            "key": "site+asin",
+            "sites": list(AMAZON_SITE_CODES),
+            "sources": {
+                "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr"],
+                "ad_report": ["clicks", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
+                "calculated": ["acoas", "ad_sales_share"],
+            },
+            "net_sales_field": "net_amount",
+        },
+    }
     _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
 
@@ -1428,97 +1353,6 @@ async def amazon_dashboard(
     if site == "日本" or not sid_map:
         store_rows = await lingxing_store_rows()
     return await amazon_dashboard_periodic(comparison, start_date, end_date, site, selected_series, selected_products, sid_map, store_rows)
-    dashboard_cache_key = (
-        "dashboard", comparison, start_date.isoformat(), end_date.isoformat(),
-        site or "", tuple(sorted(selected_series)), tuple(sorted(selected_products)),
-    )
-    cached_dashboard = _amazon_cache.get(dashboard_cache_key)
-    if cached_dashboard and time.monotonic() - cached_dashboard[0] < AMAZON_CACHE_TTL_SECONDS:
-        return cached_dashboard[1]
-    try:
-        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-    if not sid_map:
-        for store_item in await lingxing_store_rows():
-            country = str(store_item.get("country") or "")
-            sid = store_item.get("sid")
-            if country and sid and int(store_item.get("status") or 0) == 1:
-                sid_map.setdefault(country, {"sid": sid})
-    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
-    async with httpx.AsyncClient(timeout=45) as client:
-        async def fetch_site(site_name: str) -> tuple[str, str, str, list[list[dict[str, Any]]], list[dict[str, Any]]]:
-            site_code = AMAZON_SITE_CODES.get(site_name, site_name)
-            account = sid_map.get(site_name) or sid_map.get(site_code) or {}
-            sid = account.get("sid") if isinstance(account, dict) else account
-            if not sid:
-                return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), [], []
-            ad_tasks = []
-            cursor = start_date
-            while cursor <= end_date:
-                ad_tasks.append(fetch_ad_report(int(sid), cursor, client, semaphore))
-                cursor += timedelta(days=1)
-            ad_results, sales_rows = await asyncio.gather(
-                asyncio.gather(*ad_tasks),
-                fetch_store_sales(int(sid), start_date, end_date, client, semaphore),
-            )
-            return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), ad_results, sales_rows
-
-        site_results = await asyncio.gather(*(fetch_site(name) for name in selected_sites))
-
-    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
-    for site_name, site_code, currency, ad_results, sales_rows in site_results:
-        for report_rows in ad_results:
-            for raw in report_rows:
-                product = amazon_product(site_code, raw.get("asin"))
-                group = amazon_series(product)
-                if not group or group not in selected_series or product not in selected_products:
-                    continue
-                key = (group, product)
-                item = aggregate.setdefault(key, {"currency": currency, "clicks": 0, "impressions": 0, "cost": 0, "orders": 0, "sales": 0, "units": 0, "stat": {}})
-                if item["currency"] != currency:
-                    item["currency"] = "MIXED"
-                item["clicks"] += first_value(raw, "clicks")
-                item["impressions"] += first_value(raw, "impressions")
-                item["cost"] += first_value(raw, "cost", "spend")
-                item["orders"] += first_value(raw, "orders", "order_count")
-                item["sales"] += first_value(raw, "sales", "ad_sales")
-                item["units"] += first_value(raw, "units", "ad_units")
-        for raw in sales_rows:
-            product = amazon_product(site_code, raw.get("asin") or raw.get("ASIN"))
-            group = amazon_series(product)
-            if not group or group not in selected_series or product not in selected_products:
-                continue
-            key = (group, product)
-            item = aggregate.setdefault(key, {"currency": currency, "clicks": 0, "impressions": 0, "cost": 0, "orders": 0, "sales": 0, "units": 0, "stat": {}})
-            if item["currency"] != currency:
-                item["currency"] = "MIXED"
-            stats = item["stat"]
-            stats["units"] = (stats.get("units") or 0) + first_value(raw, "volume", "units")
-            stats["orders"] = (stats.get("orders") or 0) + first_value(raw, "order_items", "orders")
-            stats["net_sales"] = (stats.get("net_sales") or 0) + first_value(raw, "amount", "sales", "net_sales")
-    rows = []
-    for (group, product), item in aggregate.items():
-        clicks, impressions, cost, ad_orders, ad_sales, ad_units = (item[k] for k in ("clicks", "impressions", "cost", "orders", "sales", "units"))
-        stat = item.get("stat") or {}
-        units = stat.get("units")
-        net_sales = stat.get("net_sales")
-        orders = stat.get("orders")
-        b2b_units = stat.get("b2b_units")
-        b2b_orders = stat.get("b2b_orders")
-        sessions = stat.get("sessions")
-        # Prefer the sales-statistics values when present; advertising report
-        # values are the fallback for ad-specific columns.
-        if stat.get("ad_units") is not None:
-            ad_units = stat["ad_units"]
-        if stat.get("ad_cost") is not None:
-            cost = stat["ad_cost"]
-        if stat.get("ad_sales") is not None:
-            ad_sales = stat["ad_sales"]
-        rows.append({"series": group, "product": product, "currency": item.get("currency", "USD"), "acoas": (cost / net_sales if net_sales not in (None, 0) else None), "ad_sales_share": (ad_units / units if units not in (None, 0) else None), "units": (int(units) if units is not None else None), "net_sales": net_sales, "orders": (int(orders) if orders is not None else None), "b2b_units": (int(b2b_units) if b2b_units is not None else None), "b2b_orders": (int(b2b_orders) if b2b_orders is not None else None), "ctr": (clicks / impressions if impressions else None), "clicks": int(clicks), "cpc": (cost / clicks if clicks else None), "ad_cost": cost, "ad_cvr": (ad_orders / clicks if clicks else None), "ad_units": int(ad_units), "ad_orders": int(ad_orders), "cvr": (orders / sessions if orders not in (None, 0) and sessions not in (None, 0) else None), "acos": (cost / ad_sales if ad_sales else None), "sessions": (int(sessions) if sessions is not None else None)})
-    response_payload = {"period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED", "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)}, "rows": rows, "mapping": {"key": "site+asin", "sites": list(AMAZON_SITE_CODES)}}
-    _amazon_cache[dashboard_cache_key] = (time.monotonic(), response_payload)
-    return response_payload
 
 
 @app.get("/api/amazon/stores")

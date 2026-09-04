@@ -152,11 +152,22 @@ function aggregate(items) {
   for (const item of items) for (const key of ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "sessions"]) if (item[key] != null) out[key] = (out[key] || 0) + Number(item[key])
   out.acoas = out.net_sales && out.ad_cost != null ? out.ad_cost / out.net_sales : null
   out.ad_sales_share = out.units && out.ad_units != null ? out.ad_units / out.units : null
-  out.ctr = out.impressions ? out.clicks / out.impressions : null
-  out.cpc = out.clicks ? out.ad_cost / out.clicks : null
-  out.ad_cvr = out.clicks ? out.ad_orders / out.clicks : null
-  out.cvr = out.sessions ? out.orders / out.sessions : null
-  out.acos = out.ad_sales ? out.ad_cost / out.ad_sales : null
+  const weighted = (metric, weight) => {
+    let numerator = 0
+    let denominator = 0
+    for (const item of items) {
+      if (item[metric] != null && item[weight] != null && Number(item[weight]) > 0) {
+        numerator += Number(item[metric]) * Number(item[weight])
+        denominator += Number(item[weight])
+      }
+    }
+    return denominator ? numerator / denominator : null
+  }
+  out.ctr = weighted("ctr", "impressions")
+  out.cpc = weighted("cpc", "clicks")
+  out.ad_cvr = weighted("ad_cvr", "clicks")
+  out.cvr = weighted("cvr", "sessions")
+  out.acos = weighted("acos", "ad_sales")
   return out
 }
 
