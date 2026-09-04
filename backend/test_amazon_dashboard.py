@@ -17,10 +17,19 @@ from app import (
     amazon_series,
     amazon_sid_accounts,
     optional_metric,
+    require_business_access,
 )
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
+    def test_business_access_never_trusts_origin_header(self):
+        with patch.dict("os.environ", {"DASHBOARD_API_KEY": "dashboard-secret", "SYNC_API_KEY": "sync-secret"}, clear=False):
+            with self.assertRaises(Exception):
+                require_business_access(None)
+            with self.assertRaises(Exception):
+                require_business_access("wrong-key")
+            self.assertIsNone(require_business_access("dashboard-secret"))
+
     def test_japan_uses_both_named_shops(self):
         accounts = amazon_sid_accounts("日本", {"JP": {"sid": 100}}, [
             {"sid": 100, "country": "日本", "name": "Comu-JP"},
@@ -42,6 +51,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             amazon_product("US", {"asins": [{"ASIN": "B0G1YMLFSZ"}]}),
             "TN10-小链接-银色",
         )
+
+    def test_tn20_main_red_product_name_is_used_by_api_mapping(self):
+        self.assertIn("TN20-主链接-红", AMAZON_PRODUCTS)
+        self.assertNotIn("TN20-主链接-樱桃红", AMAZON_PRODUCTS)
+        self.assertEqual(amazon_product("US", "B0H8SZZN8X"), "TN20-主链接-红")
+        self.assertEqual(amazon_series("TN20-主链接-红"), "TN20系列（主链接）汇总")
 
     def test_us_asin_product_mapping_matches_latest_assignment(self):
         expected = {

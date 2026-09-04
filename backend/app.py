@@ -62,18 +62,15 @@ app.add_middleware(
 
 def require_business_access(
     x_sync_key: str | None,
-    origin: str | None,
 ) -> None:
-    """Require the configured dashboard key or an approved IdeaDock origin."""
+    """Require the configured dashboard key for every business API request."""
     configured_key = (
         os.environ.get("DASHBOARD_API_KEY", "").strip()
         or os.environ.get("SYNC_API_KEY", "").strip()
     )
     if configured_key and x_sync_key and hmac.compare_digest(x_sync_key, configured_key):
         return
-    if origin and origin.rstrip("/") in _DASHBOARD_ORIGINS:
-        return
-    raise HTTPException(status_code=401, detail="看板接口需要有效的访问凭证或受信任来源")
+    raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
 
 Base = declarative_base()
 _engine = None
@@ -106,7 +103,7 @@ AMAZON_SERIES = [
 AMAZON_PRODUCTS = [
     "TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色",
     "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色",
-    "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-樱桃红",
+    "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红",
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
 AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "加拿大": "CA", "澳洲": "AU", "德国": "DE", "法国": "FR", "意大利": "IT", "西班牙": "ES", "英国": "UK", "荷兰": "NL", "比利时": "BE", "瑞典": "SE"}
@@ -115,8 +112,8 @@ AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "加拿大": "CA", "澳洲"
 # intentionally kept as data, so a later refresh can replace this block
 # without changing aggregation logic.
 ASIN_MAPPING = {
-    "US": {"B0G1XQ3H4H":"TN10-主链接-黑色","B0G1YMLFSZ":"TN10-小链接-银色","B0GMGP9B1D":"TN10-小链接-橙色","B0GSJMTSMQ":"TN10-小链接-黑色","B0GZNNL72W":"TN10-主链接-橙色","B0GR9CDQYG":"TN10-主链接-银色","B0H8SF6N61":"TN20-主链接-黑色","B0H8S9M43Y":"TN20-主链接-银色","B0H8SZZN8X":"TN20-主链接-樱桃红","B0H8MRQW7Q":"TN20-小链接-黑色","B0H8CKG9P5":"TN20-小链接-银色","B0H8NP9TVK":"TN20-小链接-樱桃红"},
-    "JP": {"B0G4M5QMNG":"TN10-主链接-黑色","B0G4M4YMHZ":"TN10-主链接-银色","B0G4M4KZ5S":"TN10-主链接-橙色","B0HC6V88K5":"TN20-主链接-黑色","B0HC75XJ3D":"TN20-主链接-银色","B0HC78T99S":"TN20-主链接-樱桃红","B0HD7GRRL5":"TN20-小链接-黑色","B0HD77JKX5":"TN20-小链接-银色","B0HD7QJ1XJ":"TN20-小链接-樱桃红"},
+    "US": {"B0G1XQ3H4H":"TN10-主链接-黑色","B0G1YMLFSZ":"TN10-小链接-银色","B0GMGP9B1D":"TN10-小链接-橙色","B0GSJMTSMQ":"TN10-小链接-黑色","B0GZNNL72W":"TN10-主链接-橙色","B0GR9CDQYG":"TN10-主链接-银色","B0H8SF6N61":"TN20-主链接-黑色","B0H8S9M43Y":"TN20-主链接-银色","B0H8SZZN8X":"TN20-主链接-红","B0H8MRQW7Q":"TN20-小链接-黑色","B0H8CKG9P5":"TN20-小链接-银色","B0H8NP9TVK":"TN20-小链接-樱桃红"},
+    "JP": {"B0G4M5QMNG":"TN10-主链接-黑色","B0G4M4YMHZ":"TN10-主链接-银色","B0G4M4KZ5S":"TN10-主链接-橙色","B0HC6V88K5":"TN20-主链接-黑色","B0HC75XJ3D":"TN20-主链接-银色","B0HC78T99S":"TN20-主链接-红","B0HD7GRRL5":"TN20-小链接-黑色","B0HD77JKX5":"TN20-小链接-银色","B0HD7QJ1XJ":"TN20-小链接-樱桃红"},
 }
 for _site, _asins, _series in [
     ("CA", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8NCJLMD","B0H8RSZHB3","B0H8S2TK5K","B0H94CHVCN","B0H94MYQP3","B0H94QM3TZ"], None),
@@ -130,7 +127,7 @@ for _site, _asins, _series in [
     ("BE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
     ("SE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
 ]:
-    _names = ["TN10-主链接-黑色","TN10-主链接-银色","TN10-主链接-橙色","TN10-小链接-黑色","TN10-小链接-银色","TN10-小链接-橙色","TN20-主链接-黑色","TN20-主链接-银色","TN20-主链接-樱桃红"]
+    _names = ["TN10-主链接-黑色","TN10-主链接-银色","TN10-主链接-橙色","TN10-小链接-黑色","TN10-小链接-银色","TN10-小链接-橙色","TN20-主链接-黑色","TN20-主链接-银色","TN20-主链接-红"]
     ASIN_MAPPING[_site] = dict(zip(_asins, _names))
 
 SINGLE_VALUE_SKUS = {
@@ -1360,9 +1357,8 @@ async def amazon_dashboard(
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
-    origin: str | None = Header(default=None),
 ):
-    require_business_access(x_sync_key, origin)
+    require_business_access(x_sync_key)
     today = utcnow().date()
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
@@ -1409,10 +1405,9 @@ async def amazon_dashboard(
 @app.get("/api/amazon/stores")
 async def amazon_stores(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
-    origin: str | None = Header(default=None),
 ):
     """Return the authorized Amazon stores without exposing credentials."""
-    require_business_access(x_sync_key, origin)
+    require_business_access(x_sync_key)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:
@@ -1461,10 +1456,9 @@ async def dashboard(
     store: str | None = Query(default=None, max_length=255),
     auto_sync: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
-    origin: str | None = Header(default=None),
 ):
     try:
-        require_business_access(x_sync_key, origin)
+        require_business_access(x_sync_key)
         if (start_date is None) != (end_date is None):
             raise HTTPException(status_code=422, detail="自定义日期需要同时提供开始日期和结束日期")
         if start_date is not None and end_date is not None:
