@@ -1,7 +1,7 @@
 import unittest
 from datetime import date
 
-from app import amazon_periods, amazon_product, amazon_sid_accounts
+from app import amazon_periods, amazon_product, amazon_series, amazon_sid_accounts
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
@@ -24,8 +24,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_product_performance_nested_asins_are_supported(self):
         self.assertEqual(
             amazon_product("US", {"asins": [{"ASIN": "B0G1YMLFSZ"}]}),
-            "TN10-主链接-银色",
+            "TN10-小链接-银色",
         )
+
+    def test_us_asin_product_mapping_matches_latest_assignment(self):
+        expected = {
+            "B0GZNNL72W": "TN10-主链接-橙色",
+            "B0GMGP9B1D": "TN10-小链接-橙色",
+            "B0GR9CDQYG": "TN10-主链接-银色",
+            "B0G1YMLFSZ": "TN10-小链接-银色",
+        }
+        expected_series = {
+            "TN10-主链接-橙色": "TN10系列（主链接）汇总",
+            "TN10-小链接-橙色": "TN10系列（小链接）汇总",
+            "TN10-主链接-银色": "TN10系列（主链接）汇总",
+            "TN10-小链接-银色": "TN10系列（小链接）汇总",
+        }
+        for asin, product in expected.items():
+            with self.subTest(asin=asin):
+                self.assertEqual(amazon_product("US", asin), product)
+                self.assertEqual(amazon_series(product), expected_series[product])
 
     def test_daily_periods_cover_every_day(self):
         periods = amazon_periods(date(2026, 8, 24), date(2026, 8, 27), "日")
