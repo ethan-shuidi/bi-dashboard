@@ -4,6 +4,7 @@ import os
 import re
 import base64
 import hashlib
+import hmac
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
@@ -36,9 +37,23 @@ from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 
 app = FastAPI(title="Shopify BI Dashboard API", version="1.0.0")
+
+
+def dashboard_origins() -> list[str]:
+    configured = os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").strip()
+    if configured:
+        return [origin.rstrip("/") for origin in configured.split(",") if origin.strip()]
+    return [
+        "https://ideadock.shuidihuzhu.com",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
+_DASHBOARD_ORIGINS = dashboard_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_DASHBOARD_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Sync-Key"],
@@ -47,12 +62,18 @@ app.add_middleware(
 
 def require_business_access(
     x_sync_key: str | None,
+    origin: str | None,
 ) -> None:
-    """Read-only dashboard endpoints are intentionally open on the private route.
-
-    The write-capable sync endpoint keeps its separate SYNC_API_KEY check.
-    """
-    return
+    """Require the configured dashboard key or an approved IdeaDock origin."""
+    configured_key = (
+        os.environ.get("DASHBOARD_API_KEY", "").strip()
+        or os.environ.get("SYNC_API_KEY", "").strip()
+    )
+    if configured_key and x_sync_key and hmac.compare_digest(x_sync_key, configured_key):
+        return
+    if origin and origin.rstrip("/") in _DASHBOARD_ORIGINS:
+        return
+    raise HTTPException(status_code=401, detail="看板接口需要有效的访问凭证或受信任来源")
 
 Base = declarative_base()
 _engine = None
@@ -61,6 +82,7 @@ _lingxing_token: dict[str, Any] = {}
 _lingxing_token_lock = asyncio.Lock()
 _lingxing_performance_lock = asyncio.Lock()
 _lingxing_performance_last_call = 0.0
+_lingxing_ad_report_lock = asyncio.Lock()
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
 AMAZON_CACHE_TTL_SECONDS = 600
 AMAZON_UPSTREAM_CONCURRENCY = 5
@@ -380,6 +402,69 @@ def lingxing_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(value, list):
                 return value
     return []
+
+
+async def fetch_ad_report(
+    sid: int,
+    report_date: date,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> list[dict[str, Any]]:
+    """Read LingXing's dated advertising report for one store."""
+    cache_key = ("ads", sid, report_date.isoformat())
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached[1]
+    async with semaphore:
+        body = await lingxing_post(
+            "/pb/openapi/newad/spProductAdReports",
+            {
+                "sid": sid,
+                "report_date": report_date.isoformat(),
+                "show_detail": 1,
+                "offset": 0,
+                "length": 500,
+            },
+            client=client,
+        )
+    data = body.get("data") or []
+    rows = data if isinstance(data, list) else (
+        data.get("list") or data.get("rows") or data.get("data") or []
+        if isinstance(data, dict) else []
+    )
+    rows = rows if isinstance(rows, list) else []
+    _amazon_cache[cache_key] = (time.monotonic(), rows)
+    return rows
+
+
+async def fetch_ad_reports_range(
+    sid: int,
+    start_date: date,
+    end_date: date,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> list[dict[str, Any]]:
+    """Read dated advertising reports, serializing requests for LingXing's rate limit."""
+    rows: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        async with _lingxing_ad_report_lock:
+            try:
+                daily = await fetch_ad_report(sid, cursor, client, semaphore)
+            except RuntimeError as exc:
+                if "频繁" in str(exc) or "too frequent" in str(exc).lower():
+                    await asyncio.sleep(2)
+                    daily = await fetch_ad_report(sid, cursor, client, semaphore)
+                else:
+                    raise
+        for row in daily:
+            if isinstance(row, dict):
+                tagged = dict(row)
+                tagged["_source"] = "ad_report"
+                tagged["_dashboard_date"] = cursor.isoformat()
+                rows.append(tagged)
+        cursor += timedelta(days=1)
+    return rows
 
 
 async def lingxing_post(path: str, payload: dict[str, Any], client: httpx.AsyncClient | None = None) -> dict[str, Any]:
@@ -736,7 +821,7 @@ async def run_sync(trigger: str) -> dict[str, Any]:
             if failed_run:
                 failed_run.status = "failed"
                 failed_run.finished_at = utcnow()
-                failed_run.message = str(exc)[:1000]
+                failed_run.message = "同步失败，请检查服务日志"
                 db.commit()
             raise
         finally:
@@ -916,7 +1001,7 @@ def status():
 
 
 def amazon_empty_row(series: str, product: str | None = None) -> dict[str, Any]:
-    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
+    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "ad_order_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
 
 
 def amazon_periods(start_date: date, end_date: date, comparison: str) -> list[tuple[str, date, date]]:
@@ -1055,6 +1140,40 @@ def optional_metric(row: dict[str, Any], *names: str) -> float | None:
     return optional_value(row, *names)
 
 
+AMAZON_SOURCE_FIELDS = {
+    "performance": {
+        "units": ("volume", "totalSalesQuantity"),
+        "net_sales": ("net_amount", "netAmount", "net_sales", "netSales"),
+        "orders": ("order_items", "orderItems", "totalOrderQuantity"),
+        "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
+        "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
+        "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+    },
+    "ad_report": {
+        "impressions": ("impressions",),
+        "clicks": ("clicks",),
+        "ad_sales": ("sales", "sales_14d", "ad_sales", "adSales"),
+        "ad_cost": ("spends", "cost", "spend"),
+        "ad_units": ("ad_units", "units", "units_14d", "adUnits"),
+        "ad_orders": ("orders", "orders_14d", "order_count", "ad_orders", "adOrders"),
+    },
+}
+AMAZON_SOURCE_RATIOS = {
+    "performance": {"source_cvr": ("cvr", "conversion_rate", "conversionRate")},
+    "ad_report": {
+        "source_ctr": ("ctr", "click_through_rate", "clickThroughRate"),
+        "source_cpc": ("cpc", "cost_per_click", "costPerClick"),
+        "source_ad_cvr": ("ad_cvr", "adCvr", "ad_conversion_rate", "adConversionRate"),
+        "source_acos": ("acos", "ACOS"),
+    },
+}
+AMAZON_METRIC_SOURCES = {
+    "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr"],
+    "ad_report": ["impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
+    "calculated": ["acoas", "ad_sales_share", "ad_order_share"],
+}
+
+
 async def amazon_dashboard_periodic(
     comparison: str,
     start_date: date,
@@ -1115,10 +1234,10 @@ async def amazon_dashboard_periodic(
                         raise
                 for row in performance_rows:
                     row["_source"] = "performance"
-                # Product performance is the single upstream source for every
-                # dashboard metric. Advertising fields are read from the same
-                # product-performance rows instead of a separate ad report.
-                all_rows.extend(performance_rows)
+                ad_report_rows = await fetch_ad_reports_range(
+                    int(sid_value), start_date, end_date, client, semaphore
+                )
+                all_rows.extend(performance_rows + ad_report_rows)
             return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), all_rows
 
         results = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
@@ -1169,33 +1288,10 @@ async def amazon_dashboard_periodic(
             key = (period_label, group, product)
             item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency})
             source = raw.get("_source", "performance")
-            if source != "performance":
+            if source not in AMAZON_SOURCE_FIELDS:
                 continue
-            # Product-performance is the sole upstream source for every
-            # dashboard metric. Deliberately do not fall back to
-            # amount/totalSalesAmount: those are sales amount fields, not the
-            # product-performance field labelled net_amount (净销售额).
-            fields = {
-                "units": ("volume", "totalSalesQuantity"),
-                "net_sales": ("net_amount", "netAmount", "net_sales", "netSales"),
-                "orders": ("order_items", "orderItems", "totalOrderQuantity"),
-                "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
-                "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
-                "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-                "impressions": ("impressions", "ad_impressions", "adImpressions", "totalAdsImpressions"),
-                "clicks": ("clicks", "ad_clicks", "adClicks", "totalAdsClicks"),
-                "ad_sales": ("ad_sales_amount", "adSalesAmount", "totalAdsSales", "ad_sales", "adSales"),
-                "ad_cost": ("spend", "totalAdsCost", "adCost", "ad_cost", "adCost"),
-                "ad_units": ("ads_sales_volume_quantity", "adsSalesVolumeQuantity", "totalAdsSalesQuantity", "adSalesQuantity", "ad_units", "adUnits"),
-                "ad_orders": ("ad_order_quantity", "adOrderQuantity", "ad_orders", "adOrders"),
-            }
-            source_fields = {
-                "source_ctr": ("ctr", "ad_ctr", "adCtr", "click_through_rate", "clickThroughRate"),
-                "source_cvr": ("cvr", "conversion_rate", "conversionRate"),
-                "source_cpc": ("cpc", "ad_cpc", "adCpc", "cost_per_click", "costPerClick"),
-                "source_ad_cvr": ("ad_cvr", "adCvr", "ad_conversion_rate", "adConversionRate"),
-                "source_acos": ("acos", "ACOS"),
-            }
+            fields = AMAZON_SOURCE_FIELDS[source]
+            source_fields = AMAZON_SOURCE_RATIOS[source]
             for field, names in fields.items():
                 value = optional_metric(raw, *names)
                 if value is not None:
@@ -1218,6 +1314,7 @@ async def amazon_dashboard_periodic(
         sessions = item.get("sessions")
         ad_units = item.get("ad_units")
         ad_sales_share = (ad_units / units) if ad_units is not None and units else None
+        ad_order_share = (ad_orders / orders) if ad_orders is not None and orders else None
         # ACoAS is defined by the dashboard requirement as ad spend divided
         # by net sales. Recalculate it from the period totals instead of
         # trusting a range-level/source value that may use another denominator.
@@ -1231,8 +1328,8 @@ async def amazon_dashboard_periodic(
             "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks else item.get("source_cpc"),
             "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else item.get("source_ad_cvr"),
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
-            "cvr": orders / sessions if orders is not None and sessions else item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
-            "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_sales": ad_sales,
+            "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
+            "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
             "sessions": int(sessions) if sessions is not None else None,
         })
     response = {
@@ -1245,8 +1342,7 @@ async def amazon_dashboard_periodic(
             "key": "site+asin",
             "sites": list(AMAZON_SITE_CODES),
             "sources": {
-                "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos", "acoas"],
-                "calculated": ["ad_sales_share"],
+                **AMAZON_METRIC_SOURCES,
             },
             "net_sales_field": "net_amount",
         },
@@ -1264,8 +1360,9 @@ async def amazon_dashboard(
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    origin: str | None = Header(default=None),
 ):
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, origin)
     today = utcnow().date()
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
@@ -1312,9 +1409,10 @@ async def amazon_dashboard(
 @app.get("/api/amazon/stores")
 async def amazon_stores(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    origin: str | None = Header(default=None),
 ):
     """Return the authorized Amazon stores without exposing credentials."""
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, origin)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:
@@ -1334,7 +1432,7 @@ async def amazon_stores(
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{str(exc)[:200]}") from exc
+        raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
 
 
 @app.post("/api/sync")
@@ -1348,11 +1446,11 @@ async def sync(
     try:
         return await run_sync(trigger)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail="同步服务暂不可用") from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Shopify request failed: HTTP {exc.response.status_code}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Sync failed: {str(exc)[:300]}") from exc
+        raise HTTPException(status_code=500, detail="同步失败，请稍后重试") from exc
 
 
 @app.get("/api/dashboard")
@@ -1363,9 +1461,10 @@ async def dashboard(
     store: str | None = Query(default=None, max_length=255),
     auto_sync: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    origin: str | None = Header(default=None),
 ):
     try:
-        require_business_access(x_sync_key)
+        require_business_access(x_sync_key, origin)
         if (start_date is None) != (end_date is None):
             raise HTTPException(status_code=422, detail="自定义日期需要同时提供开始日期和结束日期")
         if start_date is not None and end_date is not None:
@@ -1390,6 +1489,6 @@ async def dashboard(
     except HTTPException:
         raise
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail="看板服务暂不可用") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Dashboard query failed") from exc

@@ -152,6 +152,7 @@ function aggregate(items) {
   for (const item of items) for (const key of ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "sessions"]) if (item[key] != null) out[key] = (out[key] || 0) + Number(item[key])
   out.acoas = out.net_sales && out.ad_cost != null ? out.ad_cost / out.net_sales : null
   out.ad_sales_share = out.units && out.ad_units != null ? out.ad_units / out.units : null
+  out.ad_order_share = out.orders && out.ad_orders != null ? out.ad_orders / out.orders : null
   const weighted = (metric, weight) => {
     let numerator = 0
     let denominator = 0
@@ -172,7 +173,7 @@ function aggregate(items) {
 }
 
 function cells(item) {
-  return [percent(item.acoas), percent(item.ad_sales_share), number(item.units), money(item.net_sales, item.currency), number(item.orders), number(item.b2b_units), number(item.b2b_orders), percent(item.ctr), number(item.clicks), item.cpc == null ? "—" : money(item.cpc, item.currency), money(item.ad_cost, item.currency), percent(item.ad_cvr), number(item.ad_units), number(item.ad_orders), percent(item.cvr), percent(item.acos), number(item.sessions)]
+  return [percent(item.acoas), percent(item.ad_sales_share), percent(item.ad_order_share), number(item.units), money(item.net_sales, item.currency), number(item.orders), number(item.b2b_units), number(item.b2b_orders), percent(item.ctr), number(item.clicks), item.cpc == null ? "—" : money(item.cpc, item.currency), money(item.ad_cost, item.currency), percent(item.ad_cvr), number(item.ad_units), number(item.ad_orders), percent(item.cvr), percent(item.acos), number(item.sessions)]
 }
 
 function toggle(row) {
@@ -218,7 +219,7 @@ onMounted(async () => { normalizeDateRange(); await loadRuntime(); await loadSit
     </section>
     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><small>全部系列 · 全部产品 · {{ site }} · {{ comparison }}汇总</small></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
-      <div v-else class="amazon-table-wrap"><table class="amazon-table"><thead><tr><th>时间</th><th>系列（展开查看产品）</th><th v-for="head in ['ACoAS','广告销量占比','销量','净销售额','订单量','B2B销量','B2B订单量','CTR','点击','CPC','广告花费','广告CVR','广告销量','广告订单量','CVR','ACOS','Session-Total']" :key="head">{{ head }}</th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }">{{ row.periodFirst ? row.period : '' }}</td><td class="series-cell"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><span>{{ row.type === 'detail' ? displayProduct(row.product) : displaySeries(row.series) }}</span></span></td><td v-for="(cell,index) in cells(row.metrics)" :key="index">{{ cell }}</td></tr><tr v-if="!displayRows.length"><td colspan="19" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
+      <div v-else class="amazon-table-wrap"><table class="amazon-table"><thead><tr><th>时间</th><th>系列（展开查看产品）</th><th v-for="head in ['ACoAS','广告销量占比','广告订单占比','销量','净销售额','订单量','B2B销量','B2B订单量','CTR','点击','CPC','广告花费','广告CVR','广告销量','广告订单量','CVR','ACOS','Session-Total']" :key="head">{{ head }}</th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }">{{ row.periodFirst ? row.period : '' }}</td><td class="series-cell"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><span>{{ row.type === 'detail' ? displayProduct(row.product) : displaySeries(row.series) }}</span></span></td><td v-for="(cell,index) in cells(row.metrics)" :key="index">{{ cell }}</td></tr><tr v-if="!displayRows.length"><td colspan="20" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
     </section>
   </div>
 </template>

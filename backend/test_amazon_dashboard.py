@@ -1,7 +1,23 @@
+import asyncio
 import unittest
 from datetime import date
+from unittest.mock import AsyncMock, patch
 
-from app import amazon_periods, amazon_product, amazon_series, amazon_sid_accounts
+from app import (
+    AMAZON_PRODUCTS,
+    AMAZON_METRIC_SOURCES,
+    AMAZON_SERIES,
+    AMAZON_SOURCE_FIELDS,
+    ASIN_MAPPING,
+    AMAZON_SITE_CODES,
+    amazon_empty_row,
+    amazon_dashboard_periodic,
+    amazon_periods,
+    amazon_product,
+    amazon_series,
+    amazon_sid_accounts,
+    optional_metric,
+)
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
@@ -60,6 +76,77 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         periods = amazon_periods(date(2026, 8, 1), date(2026, 9, 30), "月")
         self.assertEqual(periods[0][0], "2026-08")
         self.assertEqual(periods[1][0], "2026-09")
+
+
+    def test_new_ad_order_share_field_is_preserved(self):
+        self.assertIn("ad_order_share", amazon_empty_row("series"))
+        self.assertIn("ad_order_share", AMAZON_METRIC_SOURCES["calculated"])
+
+    def test_net_sales_and_ad_report_use_confirmed_upstream_fields(self):
+        self.assertEqual(
+            optional_metric({"net_amount": "12.5", "amount": "99"}, *AMAZON_SOURCE_FIELDS["performance"]["net_sales"]),
+            12.5,
+        )
+        self.assertEqual(
+            optional_metric({"spends": "3.25"}, *AMAZON_SOURCE_FIELDS["ad_report"]["ad_cost"]),
+            3.25,
+        )
+        self.assertEqual(
+            optional_metric({"ad_units": "4"}, *AMAZON_SOURCE_FIELDS["ad_report"]["ad_units"]),
+            4.0,
+        )
+
+    def test_metric_source_mapping_separates_performance_and_ad_report(self):
+        self.assertIn("cvr", AMAZON_METRIC_SOURCES["performance"])
+        self.assertIn("ctr", AMAZON_METRIC_SOURCES["ad_report"])
+        self.assertNotIn("ctr", AMAZON_METRIC_SOURCES["performance"])
+
+    def test_dashboard_aggregates_performance_and_ad_report_separately(self):
+        site_name = next(iter(AMAZON_SITE_CODES))
+        product = next(iter(ASIN_MAPPING["US"].values()))
+        asin = next(iter(ASIN_MAPPING["US"]))
+        series = next(iter(AMAZON_SERIES))
+        performance = [{
+            "asin": asin,
+            "volume": 10,
+            "net_amount": 80,
+            "amount": 99,
+            "order_items": 5,
+            "b2b_volume": 1,
+            "b2b_order_items": 1,
+            "sessions_total": 50,
+            "cvr": 0.1,
+        }]
+        ad_report = [{
+            "asin": asin,
+            "impressions": 100,
+            "clicks": 5,
+            "sales": 20,
+            "spends": 2,
+            "ad_units": 3,
+            "orders": 2,
+            "_source": "ad_report",
+            "_dashboard_date": "2026-09-04",
+        }]
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)), patch(
+            "app.fetch_ad_reports_range", new=AsyncMock(return_value=ad_report)
+        ):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日",
+                date(2026, 9, 4),
+                date(2026, 9, 4),
+                site_name,
+                set(AMAZON_SERIES),
+                set(AMAZON_PRODUCTS),
+                {"US": {"sid": 1}},
+            ))
+        row = next(item for item in result["rows"] if item["product"] == product)
+        self.assertEqual(row["net_sales"], 80)
+        self.assertEqual(row["ad_cost"], 2)
+        self.assertEqual(row["ad_units"], 3)
+        self.assertEqual(row["ad_orders"], 2)
+        self.assertEqual(row["ad_order_share"], 0.4)
+        self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)
 
 
 if __name__ == "__main__":
