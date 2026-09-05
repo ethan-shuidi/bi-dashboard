@@ -24,12 +24,12 @@ from app import (
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_business_access_never_trusts_origin_header(self):
-        with patch.dict("os.environ", {"DASHBOARD_API_KEY": "dashboard-secret", "SYNC_API_KEY": "sync-secret"}, clear=False):
+        with patch.dict("os.environ", {"DASHBOARD_API_KEY": "test-dashboard-key", "SYNC_API_KEY": "test-sync-key"}, clear=False):
             with self.assertRaises(Exception):
                 require_business_access(None)
             with self.assertRaises(Exception):
                 require_business_access("wrong-key")
-            self.assertIsNone(require_business_access("dashboard-secret"))
+            self.assertIsNone(require_business_access("test-dashboard-key"))
 
     def test_japan_uses_both_named_shops(self):
         accounts = amazon_sid_accounts("日本", {"JP": {"sid": 100}}, [
@@ -173,6 +173,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["ad_units"], 3)
         self.assertEqual(row["ad_orders"], 2)
         self.assertEqual(row["ad_order_share"], 0.4)
+        self.assertEqual(row["asin"], asin)
         self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)
 
 

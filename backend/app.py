@@ -329,6 +329,12 @@ def amazon_product(site: str, asin: Any) -> str | None:
     return None
 
 
+def amazon_asins_for_product(site: str, product: str | None) -> list[str]:
+    if not product:
+        return []
+    return [asin for asin, mapped_product in ASIN_MAPPING.get(site, {}).items() if mapped_product == product]
+
+
 def amazon_series(product: str | None) -> str | None:
     if not product:
         return None
@@ -1304,7 +1310,8 @@ async def amazon_dashboard_periodic(
             if not group or group not in selected_series or product not in selected_products:
                 continue
             key = (period_label, group, product)
-            item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency})
+            item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency, "asins": set()})
+            item["asins"].update(amazon_asins_for_product(site_code, product))
             source = raw.get("_source", "performance")
             if source not in AMAZON_SOURCE_FIELDS:
                 continue
@@ -1339,7 +1346,7 @@ async def amazon_dashboard_periodic(
         calculated_acoas = (ad_cost / net_sales) if ad_cost is not None and net_sales else None
         rows.append({
             "period": item["period"], "period_start": item["period_start"], "period_end": item["period_end"],
-            "series": group, "product": product, "currency": item.get("currency", "USD"),
+            "series": group, "product": product, "asin": ", ".join(sorted(item.get("asins") or [])) or None, "currency": item.get("currency", "USD"),
             "units": int(units) if units is not None else None, "net_sales": net_sales, "orders": int(orders) if orders is not None else None,
             "b2b_units": int(item["b2b_units"]) if item.get("b2b_units") is not None else None, "b2b_orders": int(item["b2b_orders"]) if item.get("b2b_orders") is not None else None,
             "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
@@ -1375,10 +1382,13 @@ async def amazon_dashboard(
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
     site: str | None = Query(default=None),
+    refresh: bool = Query(default=False),
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
+    require_business_access(x_sync_key)
     timezone_name = AMAZON_SITE_TIMEZONES.get(site or "", DEFAULT_TIMEZONE)
     today = datetime.now(ZoneInfo(timezone_name)).date()
     if (start_date is None) != (end_date is None):
@@ -1414,13 +1424,17 @@ async def amazon_dashboard(
     store_rows = []
     if site == "日本" or not sid_map:
         store_rows = await lingxing_store_rows()
+    if refresh:
+        _amazon_cache.clear()
     return await amazon_dashboard_periodic(comparison, start_date, end_date, site, selected_series, selected_products, sid_map, store_rows)
 
 
 @app.get("/api/amazon/stores")
 async def amazon_stores(
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon stores without exposing credentials."""
+    require_business_access(x_sync_key)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:

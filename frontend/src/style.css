@@ -161,3 +161,13 @@
 .amazon-panel-head{z-index:120!important}
 .column-config-panel{z-index:140!important}
 @media(max-width:760px){.amazon-panel-actions{width:100%;align-items:flex-end;justify-content:space-between}.amazon-panel-actions small{max-width:55%;text-align:right}.column-config-panel{right:0;width:min(240px,calc(100vw - 48px))}}
+.table-refresh-button{min-height:34px;padding:0 11px;display:inline-flex;align-items:center;gap:7px;border:1px solid #cbdced;border-radius:8px;color:#31577f;background:#fff;font-size:12px;font-weight:750;cursor:pointer;transition:.2s}
+.table-refresh-button:hover:not(:disabled){border-color:#8db4e0;color:#1f5db6;background:#f2f7ff}
+.table-refresh-button:disabled{cursor:not-allowed;opacity:.55}
+.table-refresh-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.table-refresh-button:disabled svg{animation:amazon-spin .8s linear infinite}
+.amazon-table td.period-cell{overflow:hidden!important;text-overflow:ellipsis;white-space:nowrap}
+.amazon-table tr.detail td.series-cell,.amazon-table tr.detail .series-content{overflow:visible!important}
+.product-hover{position:relative;display:inline-block;cursor:default}
+.product-hover::after{content:attr(data-asin);position:absolute;left:0;top:calc(100% + 5px);z-index:180;min-width:max-content;padding:7px 10px;border:1px solid #d5e2f1;border-radius:6px;background:#fff;color:#31577f;box-shadow:0 8px 18px rgba(27,66,112,.16);font-size:12px;font-weight:650;line-height:1;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .15s ease,visibility .15s ease}
+.product-hover:hover::after{opacity:1;visibility:visible}
