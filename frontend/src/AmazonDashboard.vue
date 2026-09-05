@@ -14,7 +14,8 @@ const formatDate = (value) => {
   const d = toDate(value) || new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
 }
-const todayDate = () => toDate(today())
+const siteToday = ref(today())
+const todayDate = () => toDate(siteToday.value) || toDate(today())
 const startDate = ref(today())
 const endDate = ref(today())
 const site = ref("美国")
@@ -26,6 +27,21 @@ const loading = ref(true)
 const error = ref("")
 const currency = ref("USD")
 const expanded = ref(new Set())
+const quickDatePreset = ref("")
+const quickDateOptions = [
+  { key: "today", label: "今日" },
+  { key: "yesterday", label: "昨日" },
+  { key: "previous-7", label: "前七天" },
+  { key: "recent-7", label: "近七天" },
+  { key: "previous-30", label: "前30天" },
+  { key: "recent-30", label: "近30天" },
+  { key: "this-week", label: "本周" },
+  { key: "previous-week", label: "上周" },
+  { key: "this-month", label: "本月" },
+  { key: "previous-month", label: "上月" },
+  { key: "this-year", label: "今年" },
+  { key: "previous-year", label: "去年" },
+]
 
 const seriesOptions = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
 const productOptions = ["TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色", "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色", "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红"]
@@ -57,6 +73,7 @@ const dataColumns = ref([
 ])
 const columnConfigOpen = ref(false)
 const visibleDataColumns = computed(() => dataColumns.value.filter((column) => column.visible))
+const sortState = ref({ key: "", direction: "reset" })
 const tableStyle = computed(() => ({
   "--amazon-period-width": `${fixedColumns.value[0].width}px`,
   "--amazon-series-width": `${fixedColumns.value[1].width}px`,
@@ -97,7 +114,10 @@ function isAllowedDate(value, field) {
   const today = todayDate()
   if (!d || !today || d > today) return false
   if (comparison.value === "日") return true
-  if (comparison.value === "周") return field === "start" ? d.getDay() === 1 : d.getDay() === 0
+  if (comparison.value === "周") {
+    const other = toDate(field === "start" ? endDate.value : startDate.value)
+    return field === "start" ? !other || d <= other : !other || d >= other
+  }
   return field === "start" ? d.getDate() === 1 : d.getTime() === monthEnd(d).getTime()
 }
 
@@ -134,23 +154,83 @@ function nearestEnd(value) {
 }
 
 function normalizeDateRange() {
-  let start = nearestStart(startDate.value)
-  let end = nearestEnd(endDate.value)
+  let start = toDate(startDate.value) || todayDate()
+  let end = toDate(endDate.value) || todayDate()
+  const today = todayDate()
+  if (start > today) start = today
+  if (end > today) end = today
+  if (comparison.value === "日") {
+    // Keep arbitrary dates for the daily view while clamping to the site date.
+  } else if (comparison.value === "周") {
+    // Weekly filters intentionally accept any dates; the backend clips the
+    // first and last natural weeks to the selected range.
+  } else {
+    start = nearestStart(start)
+    end = nearestEnd(end)
+  }
   if (start > end) {
-    end = nearestEnd(start)
-    if (start > end) start = nearestStart(end)
+    end = start
   }
   startDate.value = formatDate(start)
   endDate.value = formatDate(end)
 }
 
 function handleComparisonChange() {
+  quickDatePreset.value = ""
   normalizeDateRange()
   load()
 }
 
 function handleDateChange() {
-  normalizeDateRange()
+  quickDatePreset.value = ""
+  if (!startDate.value || !endDate.value || startDate.value > endDate.value) {
+    error.value = "开始日期必须早于或等于结束日期"
+    return
+  }
+  error.value = ""
+  load()
+}
+
+function addDays(value, amount) {
+  const result = toDate(value) || todayDate()
+  result.setDate(result.getDate() + amount)
+  return result
+}
+
+function weekStart(value) {
+  const result = toDate(value) || todayDate()
+  result.setDate(result.getDate() - ((result.getDay() + 6) % 7))
+  return result
+}
+
+function quickDateRange(key) {
+  const current = todayDate()
+  const currentWeekStart = weekStart(current)
+  const currentMonthStart = new Date(current.getFullYear(), current.getMonth(), 1)
+  if (key === "today") return [current, current]
+  if (key === "yesterday") return [addDays(current, -1), addDays(current, -1)]
+  if (key === "previous-7") return [addDays(current, -7), addDays(current, -1)]
+  if (key === "recent-7") return [addDays(current, -6), current]
+  if (key === "previous-30") return [addDays(current, -30), addDays(current, -1)]
+  if (key === "recent-30") return [addDays(current, -29), current]
+  if (key === "this-week") return [currentWeekStart, current]
+  if (key === "previous-week") return [addDays(currentWeekStart, -7), addDays(currentWeekStart, -1)]
+  if (key === "this-month") return [currentMonthStart, current]
+  if (key === "previous-month") {
+    const previousStart = new Date(current.getFullYear(), current.getMonth() - 1, 1)
+    return [previousStart, monthEnd(previousStart)]
+  }
+  if (key === "this-year") return [new Date(current.getFullYear(), 0, 1), current]
+  if (key === "previous-year") return [new Date(current.getFullYear() - 1, 0, 1), new Date(current.getFullYear() - 1, 11, 31)]
+  return [current, current]
+}
+
+function selectQuickDate(key) {
+  const [start, end] = quickDateRange(key)
+  startDate.value = formatDate(start)
+  endDate.value = formatDate(end)
+  quickDatePreset.value = key
+  error.value = ""
   load()
 }
 
@@ -170,12 +250,34 @@ const displayRows = computed(() => {
     const seriesMap = grouped.get(period) || new Map()
     const periodRows = []
     const periodDetails = []
-    for (const series of visibleSeries) {
-      const detail = seriesMap.get(series) || []
-      periodDetails.push(...detail)
+    const seriesItems = visibleSeries.map((series, index) => ({
+      series,
+      index,
+      detail: seriesMap.get(series) || [],
+    }))
+    if (sortState.value.direction !== "reset") {
+      seriesItems.sort((left, right) => compareSortable(
+        aggregate(left.detail)[sortState.value.key],
+        aggregate(right.detail)[sortState.value.key],
+        sortState.value.direction,
+        left.index,
+        right.index,
+      ))
+    }
+    for (const { series, detail } of seriesItems) {
+      const orderedDetails = sortState.value.direction === "reset"
+        ? detail
+        : [...detail].sort((left, right) => compareSortable(
+          left[sortState.value.key],
+          right[sortState.value.key],
+          sortState.value.direction,
+          detail.indexOf(left),
+          detail.indexOf(right),
+        ))
+      periodDetails.push(...orderedDetails)
       const key = `${period}|${series}`
-      periodRows.push({ type: "group", key, period, series, detail, expanded: expanded.value.has(key), metrics: aggregate(detail) })
-      if (expanded.value.has(key)) detail.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, series, product: item.product, metrics: item }))
+      periodRows.push({ type: "group", key, period, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails) })
+      if (expanded.value.has(key)) orderedDetails.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, series, product: item.product, metrics: item }))
     }
     periodRows.push({ type: "period-total", key: `${period}|total`, period, series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
     if (periodRows.length) periodRows[0].periodFirst = true
@@ -183,6 +285,27 @@ const displayRows = computed(() => {
   }
   return result
 })
+
+function compareSortable(left, right, direction, leftIndex, rightIndex) {
+  const leftMissing = left == null || Number.isNaN(Number(left))
+  const rightMissing = right == null || Number.isNaN(Number(right))
+  if (leftMissing || rightMissing) {
+    if (leftMissing && rightMissing) return leftIndex - rightIndex
+    return leftMissing ? 1 : -1
+  }
+  const difference = Number(left) - Number(right)
+  return difference === 0 ? leftIndex - rightIndex : direction === "desc" ? -difference : difference
+}
+
+function cycleSort(column) {
+  if (sortState.value.key !== column.key) {
+    sortState.value = { key: column.key, direction: "desc" }
+  } else if (sortState.value.direction === "desc") {
+    sortState.value = { key: column.key, direction: "asc" }
+  } else {
+    sortState.value = { key: "", direction: "reset" }
+  }
+}
 
 function aggregate(items) {
   const out = { currency: currency.value }
@@ -311,6 +434,14 @@ async function loadRuntime() {
   try { const response = await fetch("./ideadock.runtime.json", { cache: "no-store" }); apiBase.value = String((await response.json()).backend_base_url || "").replace(/\/$/, "") } catch { apiBase.value = "http://127.0.0.1:8000" }
 }
 
+async function loadDateContext() {
+  try {
+    const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/date-context?site=${encodeURIComponent(site.value)}`)
+    const data = await response.json()
+    if (response.ok && data.today) siteToday.value = data.today
+  } catch {}
+}
+
 async function load() {
   if (!startDate.value || !endDate.value || startDate.value > endDate.value) { error.value = "请选择有效日期范围"; return }
   loading.value = true; error.value = ""
@@ -327,9 +458,18 @@ async function load() {
   } catch (e) { error.value = e.message || "数据加载失败" } finally { loading.value = false }
 }
 
+async function handleSiteChange() {
+  await loadDateContext()
+  if (quickDatePreset.value) {
+    const [start, end] = quickDateRange(quickDatePreset.value)
+    startDate.value = formatDate(start)
+    endDate.value = formatDate(end)
+  }
+  load()
+}
 async function loadSites() { try { const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/stores`); const data = await response.json(); const values = (data.stores || []).filter((x) => x.status === 1).map((x) => x.country).filter(Boolean); if (values.length) sites.value = [...new Set(values)]; } catch {} }
 watch([fixedColumns, dataColumns], saveColumnPreferences, { deep: true })
-onMounted(async () => { loadColumnPreferences(); normalizeDateRange(); await loadRuntime(); await loadSites(); await load() })
+onMounted(async () => { loadColumnPreferences(); await loadRuntime(); await loadDateContext(); normalizeDateRange(); await loadSites(); await load() })
 onBeforeUnmount(() => resizeCleanup?.())
 </script>
 
@@ -338,15 +478,16 @@ onBeforeUnmount(() => resizeCleanup?.())
     <div class="amazon-page-head"><div><div class="breadcrumb"><span>数据中心</span><i>/</i><strong>广告分析</strong></div><h1>数据看板</h1><p>按系列和产品查看销售、流量及广告核心指标。</p></div><span class="period-badge">{{ startDate }} 至 {{ endDate }}</span></div>
     <section class="amazon-filter-bar">
       <label><span>数据对比（日/周/月）</span><el-select v-model="comparison" @change="handleComparisonChange"><el-option label="日" value="日"/><el-option label="周" value="周"/><el-option label="月" value="月"/></el-select></label>
+      <label><span>快速选择日期</span><el-select v-model="quickDatePreset" placeholder="请选择" @change="selectQuickDate"><el-option v-for="item in quickDateOptions" :key="item.key" :label="item.label" :value="item.key"/></el-select></label>
       <label><span>开始日期（选择）</span><el-date-picker v-model="startDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'start')" @change="handleDateChange"/></label>
       <label><span>结束日期（选择）</span><el-date-picker v-model="endDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'end')" @change="handleDateChange"/></label>
-      <label><span>站点（单选）</span><el-select v-model="site" @change="load"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
+      <label><span>站点（单选）</span><el-select v-model="site" @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
       <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"/></el-select></label>
       <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"/></el-select></label>
     </section>
     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ site }} · {{ comparison }}汇总</small><button class="column-config-button" type="button" @click="columnConfigOpen = !columnConfigOpen" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel" role="dialog" aria-label="列配置"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></div></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
-      <div v-else class="amazon-table-wrap"><table class="amazon-table" :style="tableStyle"><thead><tr><th :style="columnStyle(fixedColumns[0])"><span>{{ fixedColumns[0].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[0])"></i></th><th :style="columnStyle(fixedColumns[1])"><span>{{ fixedColumns[1].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[1])"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])">{{ row.periodFirst ? row.period : '' }}</td><td class="series-cell" :style="columnStyle(fixedColumns[1])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><span>{{ row.type === 'detail' ? displayProduct(row.product) : displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)">{{ cellValue(row.metrics, column) }}</td></tr><tr v-if="!displayRows.length"><td :colspan="2 + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
+      <div v-else class="amazon-table-wrap"><table class="amazon-table" :style="tableStyle"><thead><tr><th :style="columnStyle(fixedColumns[0])"><span>{{ fixedColumns[0].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[0])"></i></th><th :style="columnStyle(fixedColumns[1])"><span>{{ fixedColumns[1].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[1])"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])">{{ row.periodFirst ? row.period : '' }}</td><td class="series-cell" :style="columnStyle(fixedColumns[1])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><span>{{ row.type === 'detail' ? displayProduct(row.product) : displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)">{{ cellValue(row.metrics, column) }}</td></tr><tr v-if="!displayRows.length"><td :colspan="2 + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
     </section>
   </div>
 </template>

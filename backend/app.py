@@ -10,6 +10,7 @@ from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -107,6 +108,21 @@ AMAZON_PRODUCTS = [
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
 AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "加拿大": "CA", "澳洲": "AU", "德国": "DE", "法国": "FR", "意大利": "IT", "西班牙": "ES", "英国": "UK", "荷兰": "NL", "比利时": "BE", "瑞典": "SE"}
+AMAZON_SITE_TIMEZONES = {
+    "美国": "America/Los_Angeles",
+    "日本": "Asia/Tokyo",
+    "加拿大": "America/Toronto",
+    "澳洲": "Australia/Sydney",
+    "德国": "Europe/Berlin",
+    "法国": "Europe/Paris",
+    "意大利": "Europe/Rome",
+    "西班牙": "Europe/Madrid",
+    "英国": "Europe/London",
+    "荷兰": "Europe/Amsterdam",
+    "比利时": "Europe/Brussels",
+    "瑞典": "Europe/Stockholm",
+}
+AMAZON_MAX_DATE_RANGE_DAYS = 400
 
 # The Feishu mapping is keyed by site + ASIN.  Site-specific ASIN lists are
 # intentionally kept as data, so a later refresh can replace this block
@@ -1012,15 +1028,19 @@ def amazon_periods(start_date: date, end_date: date, comparison: str) -> list[tu
     if comparison == "周":
         cursor = start_date - timedelta(days=start_date.weekday())
         while cursor <= end_date:
-            period_end = cursor + timedelta(days=6)
-            periods.append((f"{cursor.isoformat()}~{period_end.isoformat()}", cursor, period_end))
+            natural_end = cursor + timedelta(days=6)
+            period_start = max(cursor, start_date)
+            period_end = min(natural_end, end_date)
+            periods.append((f"{period_start.isoformat()}~{period_end.isoformat()}", period_start, period_end))
             cursor += timedelta(days=7)
         return periods
     cursor = start_date.replace(day=1)
     while cursor <= end_date:
         next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
-        period_end = next_month - timedelta(days=1)
-        periods.append((cursor.strftime("%Y-%m"), cursor, period_end))
+        natural_end = next_month - timedelta(days=1)
+        period_start = max(cursor, start_date)
+        period_end = min(natural_end, end_date)
+        periods.append((cursor.strftime("%Y-%m"), period_start, period_end))
         cursor = next_month
     return periods
 
@@ -1040,8 +1060,9 @@ async def fetch_product_performance(
     if asin_list == []:
         return []
     # LingXing limits this endpoint to a maximum 92-day date range.  The
-    # dashboard allows up to 180 days, so split longer requests into bounded
-    # chunks and merge the returned rows.  Chunk responses are kept in the
+    # dashboard allows a wider range for quick presets such as "去年", so split
+    # longer requests into bounded chunks and merge the returned rows.  Chunk
+    # responses are kept in the
     # normal cache, which also prevents repeated filter changes from issuing
     # the same upstream request again.
     rows: list[dict[str, Any]] = []
@@ -1358,7 +1379,8 @@ async def amazon_dashboard(
     products: list[str] = Query(default=[]),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
-    today = utcnow().date()
+    timezone_name = AMAZON_SITE_TIMEZONES.get(site or "", DEFAULT_TIMEZONE)
+    today = datetime.now(ZoneInfo(timezone_name)).date()
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
     if start_date is None:
@@ -1372,14 +1394,8 @@ async def amazon_dashboard(
             start_date = end_date.replace(day=1)
     if start_date > today or end_date > today:
         raise HTTPException(status_code=422, detail="日期不能晚于今天")
-    if comparison == "周" and (start_date.weekday() != 0 or end_date.weekday() != 6):
-        raise HTTPException(status_code=422, detail="周维度只能选择自然周的周一至周日")
-    if comparison == "月":
-        next_month = (end_date.replace(day=28) + timedelta(days=4)).replace(day=1)
-        if start_date.day != 1 or end_date != next_month - timedelta(days=1):
-            raise HTTPException(status_code=422, detail="月维度只能选择自然月的月初至月末")
-    if start_date > end_date or (end_date - start_date).days > 180:
-        raise HTTPException(status_code=422, detail="日期范围无效，最多支持 180 天")
+    if start_date > end_date or (end_date - start_date).days > AMAZON_MAX_DATE_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"日期范围无效，最多支持 {AMAZON_MAX_DATE_RANGE_DAYS} 天")
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     selected_sites = [site] if site else list(AMAZON_SITE_CODES)
@@ -1425,6 +1441,21 @@ async def amazon_stores(
         raise HTTPException(status_code=502, detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
+
+
+@app.get("/api/amazon/date-context")
+async def amazon_date_context(
+    site: str = Query(default="美国"),
+):
+    """Return the current calendar date for the selected marketplace site."""
+    if site not in AMAZON_SITE_CODES:
+        raise HTTPException(status_code=422, detail="不支持的 Amazon 站点")
+    timezone_name = AMAZON_SITE_TIMEZONES.get(site, DEFAULT_TIMEZONE)
+    return {
+        "site": site,
+        "timezone": timezone_name,
+        "today": datetime.now(ZoneInfo(timezone_name)).date().isoformat(),
+    }
 
 
 @app.post("/api/sync")

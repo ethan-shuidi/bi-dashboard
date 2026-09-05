@@ -11,7 +11,8 @@
     { "path": "/api/sync", "methods": ["POST"] },
     { "path": "/api/dashboard", "methods": ["GET"] },
     { "path": "/api/amazon/dashboard", "methods": ["GET"] },
-    { "path": "/api/amazon/stores", "methods": ["GET"] }
+    { "path": "/api/amazon/stores", "methods": ["GET"] },
+    { "path": "/api/amazon/date-context", "methods": ["GET"] }
   ],
   "resources": {
     "cpu": "500m",

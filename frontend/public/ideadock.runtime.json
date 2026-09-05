@@ -1,15 +1,9 @@
 {
   "schema": "ideadock.runtime.v1",
-  "project_id": 1549,
-  "project_slug": "bi-dashboard",
   "namespace": "8uxh4y1ulu",
   "project": "bi-dashboard",
   "backend_service_id": 31,
-  "service_name": "bi-dashboard-api",
   "route_code": "bs_50fe18fb",
   "backend_base_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb",
-  "run_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb/",
-  "active_deployment_id": 386,
-  "deployment_status": "healthy",
-  "generated_at": "2026-09-05T04:27:59"
+  "run_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb/"
 }

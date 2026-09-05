@@ -143,7 +143,21 @@
 .amazon-table th>span{display:block;overflow:hidden;text-overflow:ellipsis;padding-right:8px}
 .amazon-table th>span[draggable="true"]{cursor:grab}
 .amazon-table th>span[draggable="true"]:active,.amazon-table th>span.column-dragging{cursor:grabbing;opacity:.58}
+.amazon-table th>span[draggable="true"]{display:inline-block;max-width:calc(100% - 22px);vertical-align:middle}
+.column-sort-button{position:relative;width:16px;height:18px;margin-left:2px;padding:0;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;border:0;background:transparent;color:#b8c3d0;cursor:pointer}
+.column-sort-button i,.column-sort-button i::after{position:absolute;left:4px;width:0;height:0;display:block;border-left:4px solid transparent;border-right:4px solid transparent;content:""}
+.column-sort-button i{top:2px;border-bottom:5px solid currentColor}
+.column-sort-button i::after{top:8px;left:-4px;border-top:5px solid currentColor;border-bottom:0}
+.column-sort-button:hover{color:#6c829d}
+.column-sort-button.is-desc i{border-bottom-color:#2563eb}
+.column-sort-button.is-desc i::after{border-top-color:#c8d2df}
+.column-sort-button.is-asc i{border-bottom-color:#c8d2df}
+.column-sort-button.is-asc i::after{border-top-color:#2563eb}
+.amazon-table th,.amazon-table td{border-right:1px solid #e4ebf3}
+.amazon-table th:last-child,.amazon-table td:last-child{border-right:0}
 .column-resize-handle{position:absolute;top:0;right:-1px;bottom:0;width:10px;display:block;border-right:1px solid transparent;cursor:col-resize;touch-action:none;z-index:2}
 .column-resize-handle:hover,.column-resize-handle:active{border-right-color:#4d8fd6;background:linear-gradient(90deg,transparent 42%,rgba(77,143,214,.15) 42%,rgba(77,143,214,.15) 58%,transparent 58%)}
 .resizing-amazon-column,.resizing-amazon-column *{cursor:col-resize!important;user-select:none!important}
+.amazon-panel-head{z-index:120!important}
+.column-config-panel{z-index:140!important}
 @media(max-width:760px){.amazon-panel-actions{width:100%;align-items:flex-end;justify-content:space-between}.amazon-panel-actions small{max-width:55%;text-align:right}.column-config-panel{right:0;width:min(240px,calc(100vw - 48px))}}

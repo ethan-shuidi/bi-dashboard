@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import unittest
 from datetime import date
 from unittest.mock import AsyncMock, patch
@@ -85,7 +86,18 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_week_periods_are_natural_monday_to_sunday_windows(self):
         periods = amazon_periods(date(2026, 8, 24), date(2026, 8, 31), "周")
         self.assertEqual(periods[0][1:], (date(2026, 8, 24), date(2026, 8, 30)))
-        self.assertEqual(periods[1][1:], (date(2026, 8, 31), date(2026, 9, 6)))
+        self.assertEqual(periods[1][1:], (date(2026, 8, 31), date(2026, 8, 31)))
+
+    def test_week_periods_clip_partial_natural_weeks_to_selected_range(self):
+        periods = amazon_periods(date(2026, 8, 1), date(2026, 8, 14), "周")
+        self.assertEqual(
+            periods,
+            [
+                ("2026-08-01~2026-08-02", date(2026, 8, 1), date(2026, 8, 2)),
+                ("2026-08-03~2026-08-09", date(2026, 8, 3), date(2026, 8, 9)),
+                ("2026-08-10~2026-08-14", date(2026, 8, 10), date(2026, 8, 14)),
+            ],
+        )
 
     def test_month_periods_cover_cross_month_range(self):
         periods = amazon_periods(date(2026, 8, 1), date(2026, 9, 30), "月")
