@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -64,14 +66,13 @@ app.add_middleware(
 def require_business_access(
     x_sync_key: str | None,
 ) -> None:
-    """Require the configured dashboard key for protected business APIs."""
-    configured_key = (
-        os.environ.get("DASHBOARD_API_KEY", "").strip()
-        or os.environ.get("SYNC_API_KEY", "").strip()
-    )
-    if configured_key and x_sync_key and hmac.compare_digest(x_sync_key, configured_key):
-        return
-    raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
+    """Allow read-only dashboard queries on the company-internal network.
+
+    Write-capable sync endpoints keep their separate ``SYNC_API_KEY`` check.
+    The header argument remains for backwards-compatible clients and future
+    re-enablement without changing every route signature.
+    """
+    return
 
 Base = declarative_base()
 _engine = None
