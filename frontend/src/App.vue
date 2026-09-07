@@ -272,7 +272,7 @@ onBeforeUnmount(() => {
       <aside :class="['dashboard-sidebar', { collapsed: sidebarCollapsed }]" aria-label="看板导航">
         <div class="dashboard-sidebar-head"><span class="dashboard-sidebar-label">看板导航</span><button class="sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开看板导航' : '收起看板导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="sidebarCollapsed = !sidebarCollapsed"><span aria-hidden="true">{{ sidebarCollapsed ? '›' : '‹' }}</span></button></div>
         <button :class="['dashboard-nav-item', { active: activeDashboard === 'commerce' }]" @click="activeDashboard = 'commerce'"><span class="dashboard-nav-icon">⌁</span><span>Shopify数据看板</span></button>
-        <button :class="['dashboard-nav-item', { active: activeDashboard === 'amazon' }]" @click="activeDashboard = 'amazon'"><span class="dashboard-nav-icon">▦</span><span>Amazon数据看板</span></button>
+        <button :class="['dashboard-nav-item', { active: activeDashboard === 'amazon' }]" @click="activeDashboard = 'amazon'"><span class="dashboard-nav-icon">▦</span><span>Amazon-广告数据</span></button>
       </aside>
 
       <AmazonDashboard v-if="activeDashboard === 'amazon'" class="amazon-dashboard-frame" />

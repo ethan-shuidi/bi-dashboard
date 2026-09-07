@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import AmazonStrategyBoard from "./AmazonStrategyBoard.vue"
 
 const apiBase = ref("")
 const comparison = ref("周")
@@ -18,16 +19,27 @@ const siteToday = ref(today())
 const todayDate = () => toDate(siteToday.value) || toDate(today())
 const startDate = ref(today())
 const endDate = ref(today())
-const site = ref("美国")
+const site = ref(["美国"])
 const selectedSeries = ref([])
 const selectedProducts = ref([])
 const rows = ref([])
 const periods = ref([])
 const loading = ref(true)
 const error = ref("")
-const currency = ref("USD")
+const currency = ref("original")
+const currencyOptions = [
+  { value: "original", label: "原币种" },
+  { value: "USD", label: "美元 USD" },
+  { value: "CNY", label: "人民币 CNY" },
+  { value: "JPY", label: "日元 JPY" },
+  { value: "EUR", label: "欧元 EUR" },
+  { value: "GBP", label: "英镑 GBP" },
+  { value: "CAD", label: "加元 CAD" },
+  { value: "AUD", label: "澳元 AUD" },
+  { value: "SEK", label: "瑞典克朗 SEK" },
+]
 const expanded = ref(new Set())
-const quickDatePreset = ref("")
+const quickDatePreset = ref("previous-week")
 const quickDateOptions = [
   { key: "today", label: "今日" },
   { key: "yesterday", label: "昨日" },
@@ -44,11 +56,12 @@ const quickDateOptions = [
 ]
 
 const seriesOptions = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
-const productOptions = ["TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色", "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色", "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红"]
+const productOptions = ["TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色", "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色", "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红", "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红"]
 const sites = ref(["美国"])
 
 const fixedColumns = ref([
   { key: "period", label: "时间", width: 185 },
+  { key: "site", label: "站点", width: 92 },
   { key: "series", label: "系列", width: 165 },
 ])
 const dataColumns = ref([
@@ -73,11 +86,31 @@ const dataColumns = ref([
 ])
 const columnConfigOpen = ref(false)
 const visibleDataColumns = computed(() => dataColumns.value.filter((column) => column.visible))
+const adBreakdownMetricKeys = new Set(["clicks", "ad_cost", "ad_units", "ad_orders"])
+const adBreakdownTypes = [
+  { key: "sp", label: "SP" },
+  { key: "sb", label: "SB" },
+  { key: "sbv", label: "SBV" },
+  { key: "sd", label: "SD" },
+]
+const adBreakdownMetricMap = {
+  clicks: "clicks",
+  ad_cost: "ad_cost",
+  ad_units: "ad_units",
+  ad_orders: "ad_orders",
+}
+const breakdownOpenKey = ref("")
+const copiedProductKey = ref("")
+const copyMessage = ref("")
+let copyMessageTimer = null
+const selectedSiteLabel = computed(() => site.value.length ? site.value.join("、") : "全部站点")
+const currencyLabel = computed(() => currencyOptions.find((item) => item.value === currency.value)?.label || currency.value)
 const sortState = ref({ key: "", direction: "reset" })
 const tableStyle = computed(() => ({
   "--amazon-period-width": `${fixedColumns.value[0].width}px`,
-  "--amazon-series-width": `${fixedColumns.value[1].width}px`,
-  "--amazon-table-min-width": `${fixedColumns.value[0].width + fixedColumns.value[1].width + visibleDataColumns.value.reduce((sum, column) => sum + column.width, 0)}px`,
+  "--amazon-site-width": `${fixedColumns.value[1].width}px`,
+  "--amazon-series-width": `${fixedColumns.value[2].width}px`,
+  "--amazon-table-min-width": `${fixedColumns.value.reduce((sum, column) => sum + column.width, 0) + visibleDataColumns.value.reduce((sum, column) => sum + column.width, 0)}px`,
 }))
 const columnStyle = (column) => ({ "--amazon-column-width": `${column.width}px` })
 const columnStorageKey = "ideadock.amazon-dashboard.columns.v1"
@@ -99,10 +132,101 @@ const displayProduct = (value) => String(value || "")
   .replace(/-橙色$/g, "-橙")
   .replace(/TN20-主-樱桃红$/g, "TN20-主-红")
 
+function breakdownMetricValue(item, columnKey, typeKey) {
+  const metricKey = adBreakdownMetricMap[columnKey]
+  return item?.ad_breakdown?.[typeKey]?.[metricKey]
+}
+
+function breakdownTotal(item, columnKey) {
+  if (!adBreakdownMetricKeys.has(columnKey) || !item?.ad_breakdown) return null
+  const metricKey = adBreakdownMetricMap[columnKey]
+  const values = adBreakdownTypes.map(({ key }) => item.ad_breakdown?.[key]?.[metricKey])
+  if (!values.some((value) => value !== undefined && value !== null)) return null
+  return values.reduce((sum, value) => sum + Number(value || 0), 0)
+}
+
+function metricValue(item, columnKey) {
+  const typedTotal = breakdownTotal(item, columnKey)
+  return typedTotal == null ? item?.[columnKey] : typedTotal
+}
+
+function breakdownHasData(item) {
+  return adBreakdownTypes.some(({ key }) => Object.values(item?.ad_breakdown?.[key] || {}).some((value) => Number(value || 0) !== 0))
+}
+
+function breakdownValue(item, columnKey, typeKey) {
+  const value = breakdownMetricValue(item, columnKey, typeKey)
+  if (value == null) return "—"
+  return columnKey === "ad_cost" ? money(value, item?.currency) : number(value)
+}
+
+function breakdownKey(row, column) {
+  return `${row.key}|${column.key}`
+}
+
+function toggleBreakdown(row, column) {
+  const key = breakdownKey(row, column)
+  breakdownOpenKey.value = breakdownOpenKey.value === key ? "" : key
+}
+
+function amazonDomain(siteCode) {
+  return {
+    US: "www.amazon.com",
+    JP: "www.amazon.co.jp",
+    UK: "www.amazon.co.uk",
+    DE: "www.amazon.de",
+    FR: "www.amazon.fr",
+    IT: "www.amazon.it",
+    ES: "www.amazon.es",
+    CA: "www.amazon.ca",
+    AU: "www.amazon.com.au",
+  }[siteCode] || "www.amazon.com"
+}
+
+async function copyProductLink(row) {
+  const asins = String(row.metrics?.asin || "").split(",").map((value) => value.trim()).filter(Boolean)
+  if (!asins.length) {
+    copyMessage.value = "当前产品没有可复制的 ASIN 链接"
+    return
+  }
+  const siteCode = row.metrics?.site_code || row.site_code || ({ 美国: "US", 日本: "JP", 英国: "UK", 德国: "DE", 法国: "FR", 意大利: "IT", 西班牙: "ES", 加拿大: "CA", 澳大利亚: "AU" }[row.site] || "US")
+  const text = asins.map((asin) => `https://${amazonDomain(siteCode)}/dp/${asin}`).join("\n")
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const input = document.createElement("textarea")
+      input.value = text
+      input.setAttribute("readonly", "")
+      input.style.position = "fixed"
+      input.style.opacity = "0"
+      document.body.appendChild(input)
+      input.select()
+      document.execCommand("copy")
+      input.remove()
+    }
+    copiedProductKey.value = row.key
+    copyMessage.value = "已复制对应URL"
+    if (copyMessageTimer) window.clearTimeout(copyMessageTimer)
+    copyMessageTimer = window.setTimeout(() => {
+      if (copiedProductKey.value === row.key) copiedProductKey.value = ""
+      if (copyMessage.value) copyMessage.value = ""
+      copyMessageTimer = null
+    }, 1000)
+  } catch {
+    copyMessage.value = "复制失败，请检查浏览器剪贴板权限"
+  }
+}
+
 const number = (v) => v == null ? "—" : new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Number(v || 0))
 const money = (v, c = currency.value) => v == null ? "—" : new Intl.NumberFormat("zh-CN", { style: "currency", currency: c || "USD", maximumFractionDigits: 2 }).format(Number(v || 0))
 const percent = (v) => v == null ? "—" : `${(Number(v) * 100).toFixed(2)}%`
-const normalize = (v) => v.replace(/-黑$/, "-黑色").replace(/-银$/, "-银色").replace(/-橙$/, "-橙色")
+const normalize = (v) => v
+  .replace(/-黑$/, "-黑色")
+  .replace(/-银$/, "-银色")
+  .replace(/-橙$/, "-橙色")
+  .replace(/-主-红$/, "-主链接-红")
+  .replace(/-小-樱桃红$/, "-小链接-樱桃红")
 
 function monthEnd(value) {
   const d = toDate(value)
@@ -244,55 +368,64 @@ function selectOnlyProduct(value) {
   load()
 }
 
-const showPeriodTotals = computed(() => selectedSeries.value.length !== 1)
+const showPeriodTotals = computed(() => selectedSeries.value.length !== 1 && (site.value.length <= 1 || currency.value !== "original"))
 
 const displayRows = computed(() => {
   const grouped = new Map()
   for (const row of rows.value) {
+    // Older deployed backends do not return the new site field.  Preserve a
+    // useful single-site local preview until that backend is redeployed.
+    const rowSite = row.site || (site.value.length === 1 ? site.value[0] : "")
     if (!grouped.has(row.period)) grouped.set(row.period, new Map())
-    const seriesMap = grouped.get(row.period)
+    const siteMap = grouped.get(row.period)
+    if (!siteMap.has(rowSite)) siteMap.set(rowSite, new Map())
+    const seriesMap = siteMap.get(rowSite)
     if (!seriesMap.has(row.series)) seriesMap.set(row.series, [])
     seriesMap.get(row.series).push(row)
   }
   const result = []
   const orderedPeriods = [...periods.value].sort((a, b) => String(b.label).localeCompare(String(a.label)))
+  const visibleSites = site.value.length ? site.value : sites.value
   const visibleSeries = selectedSeries.value.length ? selectedSeries.value : seriesOptions
   for (const periodInfo of orderedPeriods) {
     const period = periodInfo.label
-    const seriesMap = grouped.get(period) || new Map()
+    const siteMap = grouped.get(period) || new Map()
     const periodRows = []
     const periodDetails = []
-    const seriesItems = visibleSeries.map((series, index) => ({
-      series,
-      index,
-      detail: seriesMap.get(series) || [],
-    }))
-    if (sortState.value.direction !== "reset") {
-      seriesItems.sort((left, right) => compareSortable(
-        aggregate(left.detail)[sortState.value.key],
-        aggregate(right.detail)[sortState.value.key],
-        sortState.value.direction,
-        left.index,
-        right.index,
-      ))
-    }
-    for (const { series, detail } of seriesItems) {
-      const orderedDetails = sortState.value.direction === "reset"
-        ? detail
-        : [...detail].sort((left, right) => compareSortable(
-          left[sortState.value.key],
-          right[sortState.value.key],
+    for (const siteName of visibleSites) {
+      const seriesMap = siteMap.get(siteName) || new Map()
+      const seriesItems = visibleSeries.map((series, index) => ({
+        series,
+        index,
+        detail: seriesMap.get(series) || [],
+      }))
+      if (sortState.value.direction !== "reset") {
+        seriesItems.sort((left, right) => compareSortable(
+          aggregate(left.detail)[sortState.value.key],
+          aggregate(right.detail)[sortState.value.key],
           sortState.value.direction,
-          detail.indexOf(left),
-          detail.indexOf(right),
+          left.index,
+          right.index,
         ))
-      periodDetails.push(...orderedDetails)
-      const key = `${period}|${series}`
-      periodRows.push({ type: "group", key, period, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails) })
-      if (expanded.value.has(key)) orderedDetails.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, series, product: item.product, metrics: item }))
+      }
+      for (const { series, detail } of seriesItems) {
+        const orderedDetails = sortState.value.direction === "reset"
+          ? [...detail].sort((left, right) => compareSortable(left.units, right.units, "desc", detail.indexOf(left), detail.indexOf(right)))
+          : [...detail].sort((left, right) => compareSortable(
+            left[sortState.value.key],
+            right[sortState.value.key],
+            sortState.value.direction,
+            detail.indexOf(left),
+            detail.indexOf(right),
+          ))
+        periodDetails.push(...orderedDetails)
+        const key = `${period}|${siteName}|${series}`
+        periodRows.push({ type: "group", key, period, site: siteName, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails) })
+        if (expanded.value.has(key)) orderedDetails.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, site: siteName, series, product: item.product, metrics: item }))
+      }
     }
     if (showPeriodTotals.value) {
-      periodRows.push({ type: "period-total", key: `${period}|total`, period, series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
+      periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "全部站点", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
     }
     if (periodRows.length) periodRows[0].periodFirst = true
     result.push(...periodRows)
@@ -322,8 +455,25 @@ function cycleSort(column) {
 }
 
 function aggregate(items) {
-  const out = { currency: currency.value }
-  for (const item of items) for (const key of ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "sessions"]) if (item[key] != null) out[key] = (out[key] || 0) + Number(item[key])
+  const currencies = [...new Set(items.map((item) => item.currency).filter((value) => value && value !== "original"))]
+  const aggregateCurrency = currencies.length === 1 ? currencies[0] : (currency.value !== "original" ? currency.value : "USD")
+  const out = { currency: aggregateCurrency }
+  for (const item of items) {
+    for (const key of ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "sessions"]) {
+      const value = metricValue(item, key)
+      if (value != null) out[key] = (out[key] || 0) + Number(value)
+    }
+    if (item.ad_breakdown) {
+      out.ad_breakdown ||= {}
+      for (const { key: typeKey } of adBreakdownTypes) {
+        out.ad_breakdown[typeKey] ||= {}
+        for (const metricKey of ["impressions", "clicks", "ad_cost", "ad_units", "ad_orders", "ad_sales"]) {
+          const value = item.ad_breakdown[typeKey]?.[metricKey]
+          if (value != null) out.ad_breakdown[typeKey][metricKey] = (out.ad_breakdown[typeKey][metricKey] || 0) + Number(value)
+        }
+      }
+    }
+  }
   out.acoas = out.net_sales && out.ad_cost != null ? out.ad_cost / out.net_sales : null
   out.ad_sales_share = out.units && out.ad_units != null ? out.ad_units / out.units : null
   out.ad_order_share = out.orders && out.ad_orders != null ? out.ad_orders / out.orders : null
@@ -351,7 +501,7 @@ function cells(item) {
 }
 
 function cellValue(item, column) {
-  const value = item[column.key]
+  const value = metricValue(item, column.key)
   if (["acoas", "ad_sales_share", "ad_order_share", "ctr", "ad_cvr", "cvr", "acos"].includes(column.key)) return percent(value)
   if (["net_sales", "cpc", "ad_cost"].includes(column.key)) return money(value, item.currency)
   return number(value)
@@ -455,7 +605,9 @@ async function loadRuntime() {
 
 async function loadDateContext() {
   try {
-    const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/date-context?site=${encodeURIComponent(site.value)}`)
+    const query = new URLSearchParams()
+    site.value.forEach((siteName) => query.append("site", siteName))
+    const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/date-context?${query}`)
     const data = await response.json()
     if (response.ok && data.today) siteToday.value = data.today
   } catch {}
@@ -465,7 +617,8 @@ async function load(forceRefresh = false) {
   if (!startDate.value || !endDate.value || startDate.value > endDate.value) { error.value = "请选择有效日期范围"; return }
   loading.value = true; error.value = ""
   try {
-    const query = new URLSearchParams({ comparison: comparison.value, start_date: startDate.value, end_date: endDate.value, site: site.value })
+    const query = new URLSearchParams({ comparison: comparison.value, start_date: startDate.value, end_date: endDate.value, currency: currency.value })
+    site.value.forEach((siteName) => query.append("site", siteName))
     if (forceRefresh) query.set("refresh", "true")
     selectedSeries.value.forEach((v) => query.append("series", v))
     selectedProducts.value.forEach((v) => query.append("products", normalize(v)))
@@ -474,11 +627,12 @@ async function load(forceRefresh = false) {
     let data = {}
     try { data = raw ? JSON.parse(raw) : {} } catch { throw new Error(raw || `HTTP ${response.status}`) }
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    currency.value = data.currency || "USD"; rows.value = data.rows || []; periods.value = data.periods || []; expanded.value = new Set()
+    rows.value = data.rows || []; periods.value = data.periods || []; expanded.value = new Set()
   } catch (e) { error.value = e.message || "数据加载失败" } finally { loading.value = false }
 }
 
 async function handleSiteChange() {
+  if (!site.value.length && sites.value.length) site.value = [sites.value[0]]
   await loadDateContext()
   if (quickDatePreset.value) {
     const [start, end] = quickDateRange(quickDatePreset.value)
@@ -487,10 +641,37 @@ async function handleSiteChange() {
   }
   load()
 }
-async function loadSites() { try { const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/stores`); const data = await response.json(); const values = (data.stores || []).filter((x) => x.status === 1).map((x) => x.country).filter(Boolean); if (values.length) sites.value = [...new Set(values)]; } catch {} }
+async function handleCurrencyChange() {
+  await load()
+}
+async function loadSites() {
+  try {
+    const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/stores`)
+    const data = await response.json()
+    const values = (data.stores || []).filter((x) => x.status === 1).map((x) => x.country).filter(Boolean)
+    if (values.length) {
+      sites.value = [...new Set(values)]
+      site.value = site.value.filter((siteName) => sites.value.includes(siteName))
+      if (!site.value.length) site.value = [sites.value[0]]
+    }
+  } catch {}
+}
 watch([fixedColumns, dataColumns], saveColumnPreferences, { deep: true })
-onMounted(async () => { loadColumnPreferences(); await loadRuntime(); await loadDateContext(); normalizeDateRange(); await loadSites(); await load() })
-onBeforeUnmount(() => resizeCleanup?.())
+onMounted(async () => {
+  loadColumnPreferences()
+  await loadRuntime()
+  await loadSites()
+  await loadDateContext()
+  const [start, end] = quickDateRange("previous-week")
+  startDate.value = formatDate(start)
+  endDate.value = formatDate(end)
+  quickDatePreset.value = "previous-week"
+  await load()
+})
+onBeforeUnmount(() => {
+  resizeCleanup?.()
+  if (copyMessageTimer) window.clearTimeout(copyMessageTimer)
+})
 </script>
 
 <template>
@@ -501,13 +682,16 @@ onBeforeUnmount(() => resizeCleanup?.())
       <label><span>快速选择日期</span><el-select v-model="quickDatePreset" placeholder="请选择" @change="selectQuickDate"><el-option v-for="item in quickDateOptions" :key="item.key" :label="item.label" :value="item.key"/></el-select></label>
       <label><span>开始日期（选择）</span><el-date-picker v-model="startDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'start')" @change="handleDateChange"/></label>
       <label><span>结束日期（选择）</span><el-date-picker v-model="endDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'end')" @change="handleDateChange"/></label>
-      <label><span>站点（单选）</span><el-select v-model="site" @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
+      <label><span>站点（多选）</span><el-select v-model="site" multiple collapse-tags collapse-tags-tooltip @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
+      <label><span>币种</span><el-select v-model="currency" @change="handleCurrencyChange"><el-option v-for="item in currencyOptions" :key="item.value" :label="item.label" :value="item.value"/></el-select></label>
       <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displaySeries(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlySeries(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displayProduct(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlyProduct(item)">仅筛选此项</button></template></el-option></el-select></label>
     </section>
-    <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ site }} · {{ comparison }}汇总</small><button class="column-config-button" type="button" @click="columnConfigOpen = !columnConfigOpen" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel" role="dialog" aria-label="列配置"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></div></div>
+     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><button class="column-config-button" type="button" @click="columnConfigOpen = !columnConfigOpen" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel" role="dialog" aria-label="列配置"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></div></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
-      <div v-else class="amazon-table-wrap"><table class="amazon-table" :style="tableStyle"><thead><tr><th :style="columnStyle(fixedColumns[0])"><span>{{ fixedColumns[0].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[0])"></i></th><th :style="columnStyle(fixedColumns[1])"><span>{{ fixedColumns[1].label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, fixedColumns[1])"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="series-cell" :style="columnStyle(fixedColumns[1])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><span v-if="row.type === 'detail'" class="product-hover" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin || ''">{{ displayProduct(row.product) }}</span><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)">{{ cellValue(row.metrics, column) }}</td></tr><tr v-if="!displayRows.length"><td :colspan="2 + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
+        <div v-else class="amazon-table-wrap"><table class="amazon-table" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.site || (site.length === 1 ? site[0] : "—") }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column)"><i aria-hidden="true"></i></button><span class="ad-breakdown-popover" role="tooltip"><strong>{{ column.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(row.metrics, column.key, adType.key) }}</em></span><small v-if="!breakdownHasData(row.metrics)">暂无四类广告明细</small></span></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
     </section>
-  </div>
-</template>
+    <AmazonStrategyBoard :api-base="apiBase" :start-date="startDate" :end-date="endDate" :sites="site" />
+     <div v-if="copyMessage" class="amazon-copy-toast" role="status" aria-live="polite">{{ copyMessage }}</div>
+   </div>
+ </template>

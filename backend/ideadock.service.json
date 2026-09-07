@@ -12,7 +12,10 @@
     { "path": "/api/dashboard", "methods": ["GET"] },
     { "path": "/api/amazon/dashboard", "methods": ["GET"] },
     { "path": "/api/amazon/stores", "methods": ["GET"] },
-    { "path": "/api/amazon/date-context", "methods": ["GET"] }
+    { "path": "/api/amazon/date-context", "methods": ["GET"] },
+    { "path": "/api/amazon/strategy-board", "methods": ["GET"] },
+    { "path": "/api/amazon/strategy-board/campaign-strategy", "methods": ["POST"] },
+    { "path": "/api/amazon/strategy-board/note", "methods": ["POST"] }
   ],
   "resources": {
     "cpu": "500m",

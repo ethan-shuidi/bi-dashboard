@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
     Boolean,
@@ -90,11 +90,14 @@ AMAZON_CURRENCY_CODES = {
     "英国": "GBP", "德国": "EUR", "法国": "EUR", "意大利": "EUR",
     "西班牙": "EUR", "荷兰": "EUR", "比利时": "EUR", "瑞典": "SEK",
 }
+AMAZON_SUPPORTED_CURRENCIES = ("USD", "CNY", "JPY", "EUR", "GBP", "CAD", "AUD", "SEK")
 
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_API_VERSION = "2026-07"
 DEFAULT_INITIAL_SYNC_DAYS = 90
 DEFAULT_SYNC_COOLDOWN_SECONDS = 600
+
+AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "/")
 
 LINGXING_API_BASE = "https://openapi.lingxing.com"
 AMAZON_SERIES = [
@@ -225,6 +228,35 @@ class OrderItem(Base):
     item_type = Column(String(32), nullable=False, default="product")
 
     order = relationship("Order", back_populates="items")
+
+
+class AmazonCampaignStrategy(Base):
+    __tablename__ = "amazon_campaign_strategies"
+    __table_args__ = (
+        UniqueConstraint("site_code", "campaign_id", name="uq_amazon_campaign_strategy"),
+        Index("ix_amazon_campaign_strategy_site", "site_code"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(12), nullable=False)
+    campaign_id = Column(String(255), nullable=False)
+    campaign_name = Column(String(500), nullable=False, default="")
+    strategy = Column(String(80), nullable=False, default="/")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AmazonStrategyNote(Base):
+    __tablename__ = "amazon_strategy_notes"
+    __table_args__ = (
+        UniqueConstraint("site_code", "strategy", name="uq_amazon_strategy_note"),
+        Index("ix_amazon_strategy_note_site", "site_code"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(12), nullable=False)
+    strategy = Column(String(80), nullable=False)
+    note = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
 SHOPIFY_ORDERS_QUERY = """#graphql
@@ -485,6 +517,97 @@ async def fetch_ad_reports_range(
                 rows.append(tagged)
         cursor += timedelta(days=1)
     return rows
+
+
+def ad_report_campaign_id(row: dict[str, Any]) -> str:
+    for key in ("campaign_id", "campaignId", "campaignID", "ads_id", "adsId", "id"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            return str(value).strip()
+    return ""
+
+
+def ad_report_campaign_name(row: dict[str, Any]) -> str:
+    for key in ("name", "campaign_name", "campaignName", "campaign"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            return str(value).strip()
+    return ""
+
+
+def ad_report_number(row: dict[str, Any], *names: str) -> float:
+    value = optional_value(row, *names)
+    return float(value or 0)
+
+
+def normalize_strategy(value: Any) -> str:
+    strategy = str(value or "/").strip()
+    return strategy or "/"
+
+
+def strategy_metrics(row: dict[str, Any]) -> dict[str, float]:
+    clicks = ad_report_number(row, "clicks", "click", "bn_total_ad_clicks", "ad_clicks", "total_clicks")
+    impressions = ad_report_number(row, "impressions", "impression", "bn_total_ad_impressions", "ad_impressions", "total_impressions")
+    ad_cost = ad_report_number(row, "spends", "spend", "ad_cost", "advertising_spend", "cost")
+    ad_sales = ad_report_number(row, "sales", "bn_total_ad_sales", "ad_sales", "advertising_sales", "sales_amount")
+    ad_units = ad_report_number(row, "ad_units", "bn_total_ad_units", "ads_sales_volume_quantity", "ad_sales_volume_quantity", "sales_volume_quantity")
+    ad_orders = ad_report_number(row, "orders", "bn_total_ad_orders", "ad_orders", "ad_order_quantity", "order_quantity")
+    return {
+        "impressions": impressions,
+        "clicks": clicks,
+        "ad_cost": ad_cost,
+        "ad_sales": ad_sales,
+        "ad_units": ad_units,
+        "ad_orders": ad_orders,
+    }
+
+
+def strategy_campaign_id(row: dict[str, Any]) -> str:
+    value = ad_report_campaign_id(row)
+    return value or f"name:{strategy_campaign_name(row)}"
+
+
+def strategy_campaign_name(row: dict[str, Any]) -> str:
+    for key in ("campaign_name", "campaignName", "name", "campaign", "ads_name", "adsName", "ad_name"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            return str(value).strip()
+    return "未命名广告活动"
+
+
+def strategy_site_code(value: str) -> str:
+    return AMAZON_SITE_CODES.get(value, value)
+
+
+def strategy_date_range(start_date: date | None, end_date: date | None) -> tuple[date, date]:
+    if (start_date is None) != (end_date is None):
+        raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
+    if start_date is None:
+        today = datetime.now(timezone.utc).date()
+        end_date = today - timedelta(days=(today.weekday() + 1) % 7)
+        start_date = end_date - timedelta(days=6)
+    if start_date > end_date:
+        raise HTTPException(status_code=422, detail="开始日期必须早于或等于结束日期")
+    if (end_date - start_date).days > AMAZON_MAX_DATE_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"日期范围最多支持 {AMAZON_MAX_DATE_RANGE_DAYS} 天")
+    return start_date, end_date
+
+
+def finalize_strategy_metrics(total: dict[str, float]) -> dict[str, float | None]:
+    clicks = total.get("clicks", 0)
+    impressions = total.get("impressions", 0)
+    ad_cost = total.get("ad_cost", 0)
+    ad_sales = total.get("ad_sales", 0)
+    ad_orders = total.get("ad_orders", 0)
+    return {
+        "clicks": int(clicks),
+        "cpc": ad_cost / clicks if clicks else None,
+        "ad_cost": ad_cost,
+        "ad_sales": ad_sales,
+        "acos": ad_cost / ad_sales if ad_sales else None,
+        "roas": ad_sales / ad_cost if ad_cost else None,
+        "ad_cvr": ad_orders / clicks if clicks else None,
+    }
 
 
 async def lingxing_post(path: str, payload: dict[str, Any], client: httpx.AsyncClient | None = None) -> dict[str, Any]:
@@ -1060,6 +1183,7 @@ async def fetch_product_performance(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     asin_list: list[str] | None = None,
+    currency_code: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read LingXing's product-performance endpoint for operating metrics."""
     # An explicitly empty list means the selected products have no ASINs
@@ -1076,7 +1200,7 @@ async def fetch_product_performance(
     cursor = start_date
     while cursor <= end_date:
         chunk_end = min(cursor + timedelta(days=91), end_date)
-        cache_key = ("product-performance-v2", sid, cursor.isoformat(), chunk_end.isoformat(), tuple(asin_list or ()))
+        cache_key = ("product-performance-v3", sid, cursor.isoformat(), chunk_end.isoformat(), tuple(asin_list or ()), currency_code or "")
         cached = _amazon_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
             chunk_rows = cached[1]
@@ -1095,6 +1219,8 @@ async def fetch_product_performance(
                 "is_recently_enum": False,
                 "purchase_status": 0,
             }
+            if currency_code:
+                payload["currency_code"] = currency_code
             # The endpoint supports native ASIN filtering through
             # search_field/search_value (up to 50 ASINs per request).
             if asin_list is not None:
@@ -1173,46 +1299,115 @@ AMAZON_SOURCE_FIELDS = {
         "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
         "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
         "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-    },
-    "ad_report": {
         "impressions": ("impressions",),
         "clicks": ("clicks",),
-        "ad_sales": ("sales", "sales_14d", "ad_sales", "adSales"),
-        "ad_cost": ("spends", "cost", "spend"),
-        "ad_units": ("ad_units", "units", "units_14d", "adUnits"),
-        "ad_orders": ("orders", "orders_14d", "order_count", "ad_orders", "adOrders"),
+        "ad_sales": ("ad_sales_amount", "ads_sales_amount", "adSalesAmount"),
+        "ad_cost": ("spend", "ad_cost", "advertising_spend"),
+        "ad_units": ("ads_sales_volume_quantity", "ad_sales_volume_quantity", "adUnits"),
+        "ad_orders": ("ad_order_quantity", "ad_orders", "adOrders"),
     },
 }
 AMAZON_SOURCE_RATIOS = {
     "performance": {"source_cvr": ("cvr", "conversion_rate", "conversionRate")},
-    "ad_report": {
-        "source_ctr": ("ctr", "click_through_rate", "clickThroughRate"),
-        "source_cpc": ("cpc", "cost_per_click", "costPerClick"),
-        "source_ad_cvr": ("ad_cvr", "adCvr", "ad_conversion_rate", "adConversionRate"),
-        "source_acos": ("acos", "ACOS"),
-    },
 }
 AMAZON_METRIC_SOURCES = {
-    "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr"],
-    "ad_report": ["impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
+    "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
     "calculated": ["acoas", "ad_sales_share", "ad_order_share"],
 }
+
+AMAZON_AD_BREAKDOWN_FIELDS = {
+    "sp": {
+        "impressions": ("ad_impressions_sp", "adImpressionsSp", "impressions_sp"),
+        "clicks": ("ad_clicks_sp", "adClicksSp", "clicks_sp"),
+        "ad_cost": ("ads_sp_cost", "adSpendSp", "spend_sp"),
+        "ad_units": ("ads_sp_sales_volume_quantity", "adSalesVolumeQuantitySp", "ad_units_sp"),
+        "ad_orders": ("ad_order_quantity_sp", "adOrderQuantitySp", "ad_orders_sp"),
+        "ad_sales": ("ads_sp_sales", "adsSpSales", "ad_sales_sp"),
+    },
+    "sb": {
+        "impressions": ("shared_ad_impressions_sb", "sharedAdImpressionsSb", "ad_impressions_sb"),
+        "clicks": ("shared_ad_clicks_sb", "sharedAdClicksSb", "ad_clicks_sb"),
+        "ad_cost": ("shared_ads_sb_cost", "sharedAdsSbCost", "ad_spend_sb"),
+        "ad_units": ("shared_ads_sb_sales_volume_quantity", "sharedAdsSbSalesVolumeQuantity", "ad_units_sb"),
+        "ad_orders": ("shared_ad_order_quantity_sb", "sharedAdOrderQuantitySb", "ad_orders_sb"),
+        "ad_sales": ("shared_ads_sb_sales", "sharedAdsSbSales", "ad_sales_sb"),
+    },
+    "sbv": {
+        "impressions": ("shared_ad_impressions_sbv", "sharedAdImpressionsSbv", "ad_impressions_sbv"),
+        "clicks": ("shared_ad_clicks_sbv", "sharedAdClicksSbv", "ad_clicks_sbv"),
+        "ad_cost": ("shared_ads_sbv_cost", "sharedAdsSbvCost", "ad_spend_sbv"),
+        "ad_units": ("shared_ads_sbv_sales_volume_quantity", "sharedAdsSbvSalesVolumeQuantity", "ad_units_sbv"),
+        "ad_orders": ("shared_ad_order_quantity_sbv", "sharedAdOrderQuantitySbv", "ad_orders_sbv"),
+        "ad_sales": ("shared_ads_sbv_sales", "sharedAdsSbvSales", "ad_sales_sbv"),
+    },
+    "sd": {
+        "impressions": ("ad_impressions_sd", "adImpressionsSd", "impressions_sd"),
+        "clicks": ("ad_clicks_sd", "adClicksSd", "clicks_sd"),
+        "ad_cost": ("ads_sd_cost", "adSpendSd", "spend_sd"),
+        "ad_units": ("ads_sd_sales_volume_quantity", "adSalesVolumeQuantitySd", "ad_units_sd"),
+        "ad_orders": ("ad_order_quantity_sd", "adOrderQuantitySd", "ad_orders_sd"),
+        "ad_sales": ("ads_sd_sales", "adsSdSales", "ad_sales_sd"),
+    },
+}
+
+
+def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str, float]]:
+    """Normalize LingXing's product-performance advertising dimensions."""
+    result: dict[str, dict[str, float]] = {}
+    for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items():
+        result[ad_type] = {}
+        for metric, names in fields.items():
+            result[ad_type][metric] = optional_metric(raw, *names) or 0.0
+    return result
+
+
+def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
+    """Sum the four product-performance ad types when those fields are present.
+
+    LingXing's generic ``clicks``/``spend`` fields can be incomplete for some
+    accounts.  The typed fields are the authoritative product-performance
+    dimensions for this dashboard, so prefer their sum and let the caller
+    fall back to the generic field only when no typed field was returned.
+    """
+    totals: dict[str, float] = {}
+    for metric, _ in next(iter(AMAZON_AD_BREAKDOWN_FIELDS.values())).items():
+        present = False
+        total = 0.0
+        for fields in AMAZON_AD_BREAKDOWN_FIELDS.values():
+            names = fields[metric]
+            if any(name in raw and raw.get(name) not in (None, "") for name in names):
+                present = True
+            total += optional_metric(raw, *names) or 0.0
+        if present:
+            totals[metric] = total
+    return totals
 
 
 async def amazon_dashboard_periodic(
     comparison: str,
     start_date: date,
     end_date: date,
-    site: str | None,
+    site: str | list[str] | None,
     selected_series: set[str],
     selected_products: set[str],
     sid_map: dict[str, Any],
     store_rows: list[dict[str, Any]] | None = None,
+    display_currency: str = "original",
 ) -> dict[str, Any]:
     periods = amazon_periods(start_date, end_date, comparison)
-    selected_sites = [site] if site else list(AMAZON_SITE_CODES)
+    if isinstance(site, str):
+        selected_sites = [site] if site else list(AMAZON_SITE_CODES)
+    else:
+        selected_sites = list(site or AMAZON_SITE_CODES)
+    selected_sites = list(dict.fromkeys(item for item in selected_sites if item in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
+    is_multi_site = len(selected_sites) > 1
+    requested_currency = str(display_currency or "original").upper()
+    if requested_currency == "ORIGINAL":
+        requested_currency = "original"
+    if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
+        raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
-    cache_key = ("periodic-dashboard-v3", comparison, start_date.isoformat(), end_date.isoformat(), site or "", tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v4", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -1223,6 +1418,8 @@ async def amazon_dashboard_periodic(
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
             if not accounts:
                 return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), []
+            native_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
+            query_currency = native_currency if requested_currency == "original" else requested_currency
             # Translate the UI's product selection back to the site's mapped
             # ASINs so LingXing can filter at the source. Keep a full request
             # for "all products"; an empty mapped result intentionally yields
@@ -1244,7 +1441,7 @@ async def amazon_dashboard_periodic(
                     for period_label, period_start, period_end in periods:
                         period_rows = await fetch_product_performance(
                             int(sid_value), period_start, period_end, comparison,
-                            client, semaphore, asin_filter,
+                            client, semaphore, asin_filter, query_currency,
                         )
                         for period_row in period_rows:
                             if isinstance(period_row, dict):
@@ -1259,15 +1456,12 @@ async def amazon_dashboard_periodic(
                         raise
                 for row in performance_rows:
                     row["_source"] = "performance"
-                ad_report_rows = await fetch_ad_reports_range(
-                    int(sid_value), start_date, end_date, client, semaphore
-                )
-                all_rows.extend(performance_rows + ad_report_rows)
-            return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), all_rows
+                all_rows.extend(performance_rows)
+            return site_name, site_code, query_currency, all_rows
 
         results = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
-    aggregate: dict[tuple[str, str, str], dict[str, Any]] = {}
+    aggregate: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     def row_date(raw: dict[str, Any]) -> date | None:
         if raw.get("_dashboard_date"):
             try:
@@ -1310,25 +1504,33 @@ async def amazon_dashboard_periodic(
             group = amazon_series(product)
             if not group or group not in selected_series or product not in selected_products:
                 continue
-            key = (period_label, group, product)
-            item = aggregate.setdefault(key, {"period": period_label, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency, "asins": set()})
+            row_currency = str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency
+            key = (period_label, site_name, group, product)
+            item = aggregate.setdefault(key, {"period": period_label, "site": site_name, "site_code": site_code, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": row_currency, "asins": set(), "ad_breakdown": {ad_type: {metric: 0.0 for metric in fields} for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items()}})
             item["asins"].update(amazon_asins_for_product(site_code, product))
             source = raw.get("_source", "performance")
             if source not in AMAZON_SOURCE_FIELDS:
                 continue
             fields = AMAZON_SOURCE_FIELDS[source]
             source_fields = AMAZON_SOURCE_RATIOS[source]
+            breakdown = product_performance_ad_breakdown(raw)
+            breakdown_totals = product_performance_ad_totals(raw)
             for field, names in fields.items():
                 value = optional_metric(raw, *names)
+                if field in breakdown_totals:
+                    value = breakdown_totals[field]
                 if value is not None:
                     item[field] = (item.get(field) or 0) + value
             for field, names in source_fields.items():
                 value = optional_metric(raw, *names)
                 if value is not None:
                     item[field] = value
+            for ad_type, metrics in breakdown.items():
+                for metric, value in metrics.items():
+                    item["ad_breakdown"][ad_type][metric] += value
 
     rows: list[dict[str, Any]] = []
-    for (period_label, group, product), item in aggregate.items():
+    for (period_label, site_name, group, product), item in aggregate.items():
         units = item.get("units")
         net_sales = item.get("net_sales")
         orders = item.get("orders")
@@ -1347,7 +1549,7 @@ async def amazon_dashboard_periodic(
         calculated_acoas = (ad_cost / net_sales) if ad_cost is not None and net_sales else None
         rows.append({
             "period": item["period"], "period_start": item["period_start"], "period_end": item["period_end"],
-            "series": group, "product": product, "asin": ", ".join(sorted(item.get("asins") or [])) or None, "currency": item.get("currency", "USD"),
+            "site": site_name, "site_code": item.get("site_code"), "series": group, "product": product, "asin": ", ".join(sorted(item.get("asins") or [])) or None, "currency": item.get("currency", "USD"),
             "units": int(units) if units is not None else None, "net_sales": net_sales, "orders": int(orders) if orders is not None else None,
             "b2b_units": int(item["b2b_units"]) if item.get("b2b_units") is not None else None, "b2b_orders": int(item["b2b_orders"]) if item.get("b2b_orders") is not None else None,
             "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
@@ -1356,12 +1558,15 @@ async def amazon_dashboard_periodic(
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
             "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
-            "sessions": int(sessions) if sessions is not None else None,
+            "sessions": int(sessions) if sessions is not None else None, "ad_breakdown": item.get("ad_breakdown", {}),
         })
+    output_currency = requested_currency if requested_currency != "original" else (AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD") if len(selected_sites) == 1 else "original")
     response = {
         "period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()},
-        "currency": AMAZON_CURRENCY_CODES.get(site, "USD") if site else "MIXED",
-        "filters": {"site": site or "全部站点", "series": list(selected_series), "products": list(selected_products)},
+        "currency": output_currency,
+        "currency_mode": requested_currency,
+        "selected_sites": selected_sites,
+        "filters": {"site": selected_sites, "series": list(selected_series), "products": list(selected_products)},
         "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods],
         "rows": rows,
         "mapping": {
@@ -1377,19 +1582,194 @@ async def amazon_dashboard_periodic(
     return response
 
 
+async def amazon_strategy_board_payload(
+    start_date: date,
+    end_date: date,
+    selected_sites: list[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Aggregate campaigns from LingXing's advertising backend by strategy.
+
+    Strategy assignments are keyed by site and campaign id and therefore live
+    independently from the selected date range.  The report itself remains a
+    date-scoped snapshot, and campaigns with zero clicks are omitted.
+    """
+    selected_sites = list(dict.fromkeys(selected_sites))
+    cache_key = ("amazon-strategy-board-v1", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites))
+    if refresh:
+        _amazon_cache.pop(cache_key, None)
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=45) as client:
+        async def fetch_site(site_name: str):
+            site_code = strategy_site_code(site_name)
+            accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
+            rows: list[dict[str, Any]] = []
+            for account in accounts:
+                try:
+                    rows.extend(await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore))
+                except RuntimeError as exc:
+                    if "白名单" in str(exc) or "ip not permit" in str(exc).lower():
+                        continue
+                    raise
+            return site_name, site_code, rows
+
+        fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
+
+    assignments: dict[tuple[str, str], str] = {}
+    notes: dict[tuple[str, str], str] = {}
+    with session_factory() as db:
+        for item in db.scalars(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
+            assignments[(item.site_code, item.campaign_id)] = normalize_strategy(item.strategy)
+        for item in db.scalars(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
+            notes[(item.site_code, normalize_strategy(item.strategy))] = item.note
+
+    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    for site_name, site_code, raw_rows in fetched:
+        for raw in raw_rows:
+            campaign_id = strategy_campaign_id(raw)
+            campaign_name = strategy_campaign_name(raw)
+            if not campaign_id or not campaign_name:
+                continue
+            metrics = strategy_metrics(raw)
+            key = (site_code, campaign_id)
+            item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "campaign_id": campaign_id, "campaign_name": campaign_name, "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": str(raw.get("currency") or raw.get("currency_code") or AMAZON_CURRENCY_CODES.get(site_name, "USD"))})
+            if campaign_name != "未命名广告活动":
+                item["campaign_name"] = campaign_name
+            for name, value in metrics.items():
+                item["metrics"][name] += value
+
+    metric_names = ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")
+    strategies: dict[tuple[str, str], dict[str, Any]] = {
+        (strategy_site_code(site), name): {"strategy": name, "note": notes.get((strategy_site_code(site), name), ""), "metrics": {metric: 0.0 for metric in metric_names}, "campaigns": [], "sites": []}
+        for site in selected_sites for name in AMAZON_STRATEGY_OPTIONS
+    }
+    for (site_code, campaign_id), item in aggregate.items():
+        if item["metrics"]["clicks"] <= 0:
+            continue
+        strategy = assignments.get((site_code, campaign_id), "/")
+        if strategy not in AMAZON_STRATEGY_OPTIONS:
+            strategy = "/"
+        # Keep a separate site row when multiple marketplaces are selected, so
+        # native currencies never get added together.
+        group_key = (site_code, strategy)
+        group = strategies.get(group_key)
+        if group is None:
+            group = {"strategy": strategy, "note": notes.get((site_code, strategy), ""), "metrics": {name: 0.0 for name in metric_names}, "campaigns": [], "sites": []}
+            strategies[group_key] = group
+        group["sites"] = [item["site"]]
+        for name, value in item["metrics"].items():
+            group["metrics"][name] += value
+        group["campaigns"].append({"campaign_id": campaign_id, "campaign_name": item["campaign_name"], "site": item["site"], "site_code": site_code, "currency": item["currency"], **finalize_strategy_metrics(item["metrics"])})
+
+    output = []
+    for site_name in selected_sites:
+        site_code = strategy_site_code(site_name)
+        for strategy in AMAZON_STRATEGY_OPTIONS:
+            group = strategies[(site_code, strategy)]
+            group["campaigns"].sort(key=lambda campaign: (-campaign["clicks"], campaign["campaign_name"]))
+            group["metrics"] = finalize_strategy_metrics(group["metrics"])
+            group["site"] = site_name
+            group["site_code"] = site_code
+            group["currency"] = AMAZON_CURRENCY_CODES.get(site_name, "USD")
+            output.append(group)
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "selected_sites": selected_sites}
+    _amazon_cache[cache_key] = (time.monotonic(), response)
+    return response
+
+
+@app.get("/api/amazon/strategy-board")
+async def amazon_strategy_board(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    site: list[str] = Query(default=[]),
+    refresh: bool = Query(default=False),
+):
+    start_date, end_date = strategy_date_range(start_date, end_date)
+    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
+    if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+        raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+    try:
+        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+    store_rows = await lingxing_store_rows() if any(site_name == "日本" for site_name in selected_sites) or not sid_map else []
+    try:
+        return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, refresh)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"广告报表请求失败：HTTP {exc.response.status_code}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="广告策略数据获取失败") from exc
+
+
+@app.post("/api/amazon/strategy-board/campaign-strategy")
+def save_campaign_strategy(payload: dict[str, Any] = Body(...)):
+    site_code = str(payload.get("site_code") or "").strip().upper()
+    campaign_id = str(payload.get("campaign_id") or "").strip()
+    strategy = normalize_strategy(payload.get("strategy"))
+    if site_code not in AMAZON_SITE_CODES.values() or not campaign_id or strategy not in AMAZON_STRATEGY_OPTIONS:
+        raise HTTPException(status_code=422, detail="广告活动策略参数无效")
+    with session_factory() as db:
+        item = db.scalar(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code == site_code, AmazonCampaignStrategy.campaign_id == campaign_id))
+        if item is None:
+            item = AmazonCampaignStrategy(site_code=site_code, campaign_id=campaign_id)
+            db.add(item)
+        item.campaign_name = str(payload.get("campaign_name") or "")[:500]
+        item.strategy = strategy
+        item.updated_at = utcnow()
+        db.commit()
+    _amazon_cache.clear()
+    return {"ok": True, "site_code": site_code, "campaign_id": campaign_id, "strategy": strategy}
+
+
+@app.post("/api/amazon/strategy-board/note")
+def save_strategy_note(payload: dict[str, Any] = Body(...)):
+    site_code = str(payload.get("site_code") or "").strip().upper()
+    strategy = normalize_strategy(payload.get("strategy"))
+    note = str(payload.get("note") or "")
+    if site_code not in AMAZON_SITE_CODES.values() or strategy not in AMAZON_STRATEGY_OPTIONS:
+        raise HTTPException(status_code=422, detail="策略备注参数无效")
+    with session_factory() as db:
+        item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.strategy == strategy))
+        if item is None:
+            item = AmazonStrategyNote(site_code=site_code, strategy=strategy)
+            db.add(item)
+        item.note = note
+        item.updated_at = utcnow()
+        db.commit()
+    _amazon_cache.clear()
+    return {"ok": True, "site_code": site_code, "strategy": strategy, "note": note}
+
+
 @app.get("/api/amazon/dashboard")
 async def amazon_dashboard(
     comparison: str = Query(default="周", pattern="^(日|周|月)$"),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
-    site: str | None = Query(default=None),
+    site: list[str] = Query(default=[]),
+    currency: str = Query(default="original"),
     refresh: bool = Query(default=False),
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
-    timezone_name = AMAZON_SITE_TIMEZONES.get(site or "", DEFAULT_TIMEZONE)
-    today = datetime.now(ZoneInfo(timezone_name)).date()
+    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
+    if not selected_sites:
+        selected_sites = list(AMAZON_SITE_CODES)
+    today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in selected_sites
+    )
+    requested_currency = str(currency or "original").strip().upper()
+    if requested_currency == "ORIGINAL":
+        requested_currency = "original"
+    if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=422, detail="不支持的货币")
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
     if start_date is None:
@@ -1407,7 +1787,6 @@ async def amazon_dashboard(
         raise HTTPException(status_code=422, detail=f"日期范围无效，最多支持 {AMAZON_MAX_DATE_RANGE_DAYS} 天")
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
-    selected_sites = [site] if site else list(AMAZON_SITE_CODES)
     selected_series = set(series or AMAZON_SERIES)
     selected_products = {re.sub(r"-(黑|银|橙)$", r"-\1色", str(value)) for value in (products or AMAZON_PRODUCTS)}
     try:
@@ -1421,11 +1800,21 @@ async def amazon_dashboard(
             if country and sid and int(store_item.get("status") or 0) == 1:
                 sid_map.setdefault(country, {"sid": sid})
     store_rows = []
-    if site == "日本" or not sid_map:
+    if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
         store_rows = await lingxing_store_rows()
     if refresh:
         _amazon_cache.clear()
-    return await amazon_dashboard_periodic(comparison, start_date, end_date, site, selected_series, selected_products, sid_map, store_rows)
+    return await amazon_dashboard_periodic(
+        comparison,
+        start_date,
+        end_date,
+        selected_sites,
+        selected_series,
+        selected_products,
+        sid_map,
+        store_rows,
+        requested_currency,
+    )
 
 
 @app.get("/api/amazon/stores")
@@ -1456,16 +1845,21 @@ async def amazon_stores(
 
 @app.get("/api/amazon/date-context")
 async def amazon_date_context(
-    site: str = Query(default="美国"),
+    site: list[str] = Query(default=["美国"]),
 ):
     """Return the current calendar date for the selected marketplace site."""
-    if site not in AMAZON_SITE_CODES:
+    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
+    if not selected_sites:
         raise HTTPException(status_code=422, detail="不支持的 Amazon 站点")
-    timezone_name = AMAZON_SITE_TIMEZONES.get(site, DEFAULT_TIMEZONE)
+    dates = {
+        site_name: datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date().isoformat()
+        for site_name in selected_sites
+    }
     return {
-        "site": site,
-        "timezone": timezone_name,
-        "today": datetime.now(ZoneInfo(timezone_name)).date().isoformat(),
+        "site": selected_sites,
+        "timezone": {site_name: AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE) for site_name in selected_sites},
+        "today": min(dates.values()),
+        "today_by_site": dates,
     }
 
 
