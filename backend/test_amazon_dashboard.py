@@ -23,7 +23,7 @@ from app import (
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
-    def test_business_access_never_trusts_origin_header(self):
+    def test_business_access_requires_configured_key(self):
         with patch.dict("os.environ", {"DASHBOARD_API_KEY": "test-dashboard-key", "SYNC_API_KEY": "test-sync-key"}, clear=False):
             with self.assertRaises(Exception):
                 require_business_access(None)

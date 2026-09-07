@@ -1385,10 +1385,8 @@ async def amazon_dashboard(
     refresh: bool = Query(default=False),
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
-    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
-    require_business_access(x_sync_key)
     timezone_name = AMAZON_SITE_TIMEZONES.get(site or "", DEFAULT_TIMEZONE)
     today = datetime.now(ZoneInfo(timezone_name)).date()
     if (start_date is None) != (end_date is None):
@@ -1431,10 +1429,8 @@ async def amazon_dashboard(
 
 @app.get("/api/amazon/stores")
 async def amazon_stores(
-    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon stores without exposing credentials."""
-    require_business_access(x_sync_key)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:

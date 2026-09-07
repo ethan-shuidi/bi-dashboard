@@ -234,6 +234,18 @@ function selectQuickDate(key) {
   load()
 }
 
+function selectOnlySeries(value) {
+  selectedSeries.value = [value]
+  load()
+}
+
+function selectOnlyProduct(value) {
+  selectedProducts.value = [value]
+  load()
+}
+
+const showPeriodTotals = computed(() => selectedSeries.value.length !== 1)
+
 const displayRows = computed(() => {
   const grouped = new Map()
   for (const row of rows.value) {
@@ -279,7 +291,9 @@ const displayRows = computed(() => {
       periodRows.push({ type: "group", key, period, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails) })
       if (expanded.value.has(key)) orderedDetails.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, series, product: item.product, metrics: item }))
     }
-    periodRows.push({ type: "period-total", key: `${period}|total`, period, series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
+    if (showPeriodTotals.value) {
+      periodRows.push({ type: "period-total", key: `${period}|total`, period, series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
+    }
     if (periodRows.length) periodRows[0].periodFirst = true
     result.push(...periodRows)
   }
@@ -488,8 +502,8 @@ onBeforeUnmount(() => resizeCleanup?.())
       <label><span>开始日期（选择）</span><el-date-picker v-model="startDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'start')" @change="handleDateChange"/></label>
       <label><span>结束日期（选择）</span><el-date-picker v-model="endDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'end')" @change="handleDateChange"/></label>
       <label><span>站点（单选）</span><el-select v-model="site" @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
-      <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"/></el-select></label>
-      <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"/></el-select></label>
+      <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displaySeries(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlySeries(item)">仅筛选此项</button></template></el-option></el-select></label>
+      <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displayProduct(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlyProduct(item)">仅筛选此项</button></template></el-option></el-select></label>
     </section>
     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ site }} · {{ comparison }}汇总</small><button class="column-config-button" type="button" @click="columnConfigOpen = !columnConfigOpen" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel" role="dialog" aria-label="列配置"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></div></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
