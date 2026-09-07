@@ -66,13 +66,18 @@ app.add_middleware(
 def require_business_access(
     x_sync_key: str | None,
 ) -> None:
-    """Allow read-only dashboard queries on the company-internal network.
+    """Require the configured dashboard credential for business APIs.
 
-    Write-capable sync endpoints keep their separate ``SYNC_API_KEY`` check.
-    The header argument remains for backwards-compatible clients and future
-    re-enablement without changing every route signature.
+    The dashboard key is intentionally supplied through IdeaDock Secret
+    configuration and is never stored in source control.  Keep the sync key
+    as a backwards-compatible fallback for existing deployments.
     """
-    return
+    configured_key = (
+        os.environ.get("DASHBOARD_API_KEY", "").strip()
+        or os.environ.get("SYNC_API_KEY", "").strip()
+    )
+    if not configured_key or not x_sync_key or not hmac.compare_digest(x_sync_key, configured_key):
+        raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
 
 Base = declarative_base()
 _engine = None
@@ -1689,7 +1694,9 @@ async def amazon_strategy_board(
     end_date: date | None = Query(default=None),
     site: list[str] = Query(default=[]),
     refresh: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
+    require_business_access(x_sync_key)
     start_date, end_date = strategy_date_range(start_date, end_date)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
@@ -1708,7 +1715,11 @@ async def amazon_strategy_board(
 
 
 @app.post("/api/amazon/strategy-board/campaign-strategy")
-def save_campaign_strategy(payload: dict[str, Any] = Body(...)):
+def save_campaign_strategy(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key)
     site_code = str(payload.get("site_code") or "").strip().upper()
     campaign_id = str(payload.get("campaign_id") or "").strip()
     strategy = normalize_strategy(payload.get("strategy"))
@@ -1728,7 +1739,11 @@ def save_campaign_strategy(payload: dict[str, Any] = Body(...)):
 
 
 @app.post("/api/amazon/strategy-board/note")
-def save_strategy_note(payload: dict[str, Any] = Body(...)):
+def save_strategy_note(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key)
     site_code = str(payload.get("site_code") or "").strip().upper()
     strategy = normalize_strategy(payload.get("strategy"))
     note = str(payload.get("note") or "")
@@ -1756,8 +1771,10 @@ async def amazon_dashboard(
     refresh: bool = Query(default=False),
     series: list[str] = Query(default=[]),
     products: list[str] = Query(default=[]),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
+    require_business_access(x_sync_key)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
     if not selected_sites:
         selected_sites = list(AMAZON_SITE_CODES)
@@ -1819,7 +1836,9 @@ async def amazon_dashboard(
 
 @app.get("/api/amazon/stores")
 async def amazon_stores(
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
+    require_business_access(x_sync_key)
     """Return read-only Amazon stores without exposing credentials."""
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
@@ -1846,8 +1865,10 @@ async def amazon_stores(
 @app.get("/api/amazon/date-context")
 async def amazon_date_context(
     site: list[str] = Query(default=["美国"]),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return the current calendar date for the selected marketplace site."""
+    require_business_access(x_sync_key)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
     if not selected_sites:
         raise HTTPException(status_code=422, detail="不支持的 Amazon 站点")

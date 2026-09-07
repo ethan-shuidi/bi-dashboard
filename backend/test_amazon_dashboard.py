@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from datetime import date
 from unittest.mock import AsyncMock, patch
+from fastapi import HTTPException
 
 from app import (
     AMAZON_PRODUCTS,
@@ -26,8 +27,10 @@ from app import (
 class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_business_access_requires_configured_key(self):
         with patch.dict("os.environ", {"DASHBOARD_API_KEY": "test-dashboard-key", "SYNC_API_KEY": "test-sync-key"}, clear=False):
-            self.assertIsNone(require_business_access(None))
-            self.assertIsNone(require_business_access("wrong-key"))
+            with self.assertRaises(HTTPException):
+                require_business_access(None)
+            with self.assertRaises(HTTPException):
+                require_business_access("wrong-key")
             self.assertIsNone(require_business_access("test-dashboard-key"))
 
     def test_japan_uses_both_named_shops(self):
