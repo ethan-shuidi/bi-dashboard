@@ -31,6 +31,7 @@ const configOpen = ref(false)
 const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr" }
 const columnOrder = ref(columns.map((column) => column.key))
 const visibleColumns = computed(() => columnOrder.value.map((key) => columns.find((column) => column.key === key)).filter((column) => column && visible.value[column.key]))
+const tableHeight = ref(null)
 const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })))
 
 function compare(left, right, direction) {
@@ -77,6 +78,16 @@ function startResize(event, column) {
   const move = (moveEvent) => { widths.value[column.key] = Math.max(76, Math.min(300, Math.round(startWidth + moveEvent.clientX - startX))) }
   const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); resizeCleanup = null }
   resizeCleanup = stop; window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true })
+}
+function startTableResize(event) {
+  event.preventDefault(); event.stopPropagation(); resizeCleanup?.()
+  const wrap = event.currentTarget?.previousElementSibling
+  const startY = event.clientY
+  const startHeight = tableHeight.value || Math.max(280, wrap?.getBoundingClientRect().height || 520)
+  const move = (moveEvent) => { tableHeight.value = Math.max(220, Math.min(window.innerHeight - 180, Math.round(startHeight + moveEvent.clientY - startY))) }
+  const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); document.body.classList.remove("resizing-amazon-table"); resizeCleanup = null }
+  resizeCleanup = stop; document.body.classList.add("resizing-amazon-table")
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true })
 }
 function noteKey(row) { return groupKey(row) }
 function noteValue(row) { return noteDrafts.value[noteKey(row)] ?? row.note ?? "" }
@@ -129,10 +140,10 @@ onBeforeUnmount(() => resizeCleanup?.())
     </div>
     <div v-if="error" class="strategy-board-error">{{ error }}</div>
     <div v-else-if="loading" class="strategy-board-loading">正在同步广告后台数据…</div>
-    <div v-else class="strategy-table-wrap">
+    <div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined">
       <table class="strategy-table"><thead><tr><th class="strategy-name-column">策略</th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)" :style="{ width: `${widths[column.key]}px` }"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)" :aria-label="`${column.label}排序`">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column">优化方向</th></tr></thead>
         <tbody><template v-for="row in groups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ row.site }} · {{ row.campaigns.length }} 个活动</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(row.metrics?.[column.key], column, row.currency) }}</td><td class="strategy-note-cell"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…"></textarea><button type="button" class="strategy-note-save" :disabled="saving === `note:${noteKey(row)}`" @click="saveNote(row)">保存</button></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${groupKey(row)}:${campaign.campaign_id}`" class="strategy-campaign-row"><td class="strategy-name-column"><el-select :model-value="row.strategy" size="small" @change="saveCampaign(row, campaign, $event)"><el-option v-for="option in ['品类词', '品牌防御', '竞品词', '自动', 'SB/SBV', 'SD', 'B2B', '/']" :key="option" :label="option" :value="option" /></el-select><span class="campaign-name" :title="campaign.campaign_id">{{ campaign.campaign_name }}</span></td><td v-for="column in visibleColumns" :key="column.key">{{ display(campaign[column.key], column, campaign.currency) }}</td><td></td></tr></template></template></tbody>
       </table>
-    </div>
+    </div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
   </section>
 </template>

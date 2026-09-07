@@ -218,7 +218,7 @@
 
 /* Final fixes for the product interaction and grouped-table stacking. */
 .amazon-copy-toast{position:fixed;top:84px;left:50%;right:auto;bottom:auto;z-index:1200;transform:translateX(-50%);padding:9px 14px;border:1px solid #bfe4d6;border-radius:8px;color:#08704f;background:#effaf6;box-shadow:0 10px 24px rgba(20,91,70,.16);font-size:12px;font-weight:750;pointer-events:none}
-.amazon-table-wrap{height:auto!important;min-height:0!important;align-self:flex-start}
+.amazon-table-wrap{align-self:flex-start}
 .amazon-table tr.detail td.series-cell{z-index:52!important}
 .amazon-table tr.detail .series-content{z-index:auto!important}
 .ad-breakdown-button{width:14px;height:14px;border:0;border-radius:0;background:transparent;color:#7896b8;font-size:0;line-height:0}
@@ -239,3 +239,28 @@
 .strategy-config-panel{position:absolute;top:40px;right:0;z-index:20;width:180px;padding:8px;border:1px solid #d7e3f1;border-radius:10px;background:#fff;box-shadow:0 14px 32px rgba(27,66,112,.18)}.strategy-config-panel button{width:100%;min-height:32px;padding:0 5px;display:flex;justify-content:space-between;border:0;border-bottom:1px solid #f0f4f8;background:transparent;color:#425f80;font-size:12px;cursor:pointer}
 .strategy-table-wrap{max-height:560px;overflow:auto}.strategy-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;font-size:12px}.strategy-table th,.strategy-table td{height:48px;padding:7px 10px;border-right:1px solid #e4ebf3;border-bottom:1px solid #edf2f7;text-align:center;vertical-align:middle;color:#385575;white-space:nowrap}.strategy-table th{position:sticky;top:0;z-index:3;background:#f8fbff;color:#5e728b;font-weight:750}.strategy-table th:last-child,.strategy-table td:last-child{border-right:0}.strategy-table th{position:relative}.strategy-name-column{width:270px!important;min-width:270px!important;text-align:left!important}.strategy-note-column{width:290px!important;min-width:290px!important}.strategy-group-row td{background:#eef5ff;color:#173f7c;font-weight:700}.strategy-campaign-row td{background:#fff}.strategy-campaign-row .strategy-name-column{padding-left:26px}.strategy-campaign-row .el-select{width:92px;margin-right:7px}.campaign-name{display:inline-block;max-width:205px;overflow:hidden;vertical-align:middle;text-overflow:ellipsis;white-space:nowrap;text-align:left}.strategy-expand-button{width:22px;height:22px;margin-right:8px;padding:0;border:1px solid #bcd2f1;border-radius:6px;color:#2563eb;background:#fff;font-size:16px;line-height:1}.strategy-name-column small{margin-left:8px;color:#71839a;font-weight:500}.strategy-column-drag-label{cursor:grab}.strategy-sort-button{width:18px;height:22px;margin-left:5px;padding:0;border:0;color:#a3b2c3;background:transparent;cursor:pointer}.strategy-sort-button.active{color:#2563eb}.strategy-resize-handle{position:absolute;top:0;right:-1px;bottom:0;width:9px;cursor:col-resize;touch-action:none}.strategy-resize-handle:hover{background:rgba(77,143,214,.14);border-right:1px solid #4d8fd6}.strategy-note-cell{display:flex;align-items:center;gap:7px;white-space:normal!important}.strategy-note-cell textarea{width:210px;min-height:30px;padding:5px 7px;resize:vertical;border:1px solid #d5e2f1;border-radius:6px;color:#31577f;background:#fff;font-size:12px;line-height:1.4}.strategy-board-error,.strategy-board-loading{padding:34px;text-align:center;color:#71839a}.strategy-board-error{color:#b52e45;background:#fff4f6}
 @media(max-width:760px){.strategy-board-head{display:block}.strategy-board-actions{margin-top:12px;justify-content:flex-end}.strategy-name-column{width:230px!important;min-width:230px!important}.strategy-note-column{width:250px!important;min-width:250px!important}}
+
+/* Final table interaction pass: frozen identity columns remain independent,
+   and both boards expose a bottom height grip without affecting column widths. */
+.amazon-table-wrap,.strategy-table-wrap{position:relative;min-height:220px;max-height:calc(100vh - 325px);overflow:auto;overscroll-behavior:contain}
+.table-height-resize-handle{position:relative;display:block;width:52px;height:10px;margin:4px auto 0;border-radius:8px;background:linear-gradient(#c1d4e9,#c1d4e9) center/28px 3px no-repeat;cursor:ns-resize;z-index:150;opacity:.8;touch-action:none}
+.table-height-resize-handle:hover,.resizing-amazon-table .table-height-resize-handle{background-color:#eef5ff;opacity:1}
+.resizing-amazon-table,.resizing-amazon-table *{cursor:ns-resize!important;user-select:none!important}
+
+.amazon-table th.period-header,.amazon-table td.period-cell{left:0!important;width:var(--amazon-period-width)!important;min-width:var(--amazon-period-width)!important;max-width:var(--amazon-period-width)!important;text-align:center!important}
+.amazon-table th.site-header,.amazon-table td.site-cell{left:var(--amazon-period-width)!important;width:var(--amazon-site-width)!important;min-width:var(--amazon-site-width)!important;max-width:var(--amazon-site-width)!important;text-align:center!important}
+.amazon-table th.series-header,.amazon-table td.series-cell{left:calc(var(--amazon-period-width) + var(--amazon-site-width))!important;width:var(--amazon-series-width)!important;min-width:var(--amazon-series-width)!important;max-width:var(--amazon-series-width)!important;text-align:center!important}
+.amazon-table th.period-header,.amazon-table th.site-header,.amazon-table th.series-header{z-index:90!important}
+.amazon-table td.period-cell,.amazon-table td.site-cell,.amazon-table td.series-cell{z-index:55!important}
+.amazon-table .period-cell,.amazon-table .site-cell,.amazon-table .series-cell{overflow:hidden!important;text-overflow:ellipsis;white-space:nowrap}
+.amazon-table .series-content{display:inline-flex;align-items:center;justify-content:center;max-width:100%;vertical-align:middle}
+.amazon-table tr.detail .series-content{overflow:visible!important}
+
+.ad-breakdown-popover-floating{position:fixed!important;top:auto;right:auto;bottom:auto;left:auto;z-index:2147483000!important;display:grid!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;transform:none!important;width:154px}
+.ad-breakdown-popover-floating::before{display:none}
+.amazon-table-panel,.strategy-board-panel{isolation:isolate}
+.amazon-table-panel:has(.ad-breakdown-popover-floating),.strategy-board-panel:has(.ad-breakdown-popover-floating){z-index:1}
+
+.strategy-table-wrap{max-height:560px}
+.strategy-table th{z-index:20}
+.strategy-config-panel{z-index:200!important}

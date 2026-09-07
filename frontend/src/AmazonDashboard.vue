@@ -100,6 +100,10 @@ const adBreakdownMetricMap = {
   ad_orders: "ad_orders",
 }
 const breakdownOpenKey = ref("")
+const breakdownRow = ref(null)
+const breakdownColumn = ref(null)
+const breakdownPosition = ref({ top: 0, left: 0 })
+const breakdownAnchor = ref(null)
 const copiedProductKey = ref("")
 const copyMessage = ref("")
 let copyMessageTimer = null
@@ -116,6 +120,8 @@ const columnStyle = (column) => ({ "--amazon-column-width": `${column.width}px` 
 const columnStorageKey = "ideadock.amazon-dashboard.columns.v1"
 const draggedColumnKey = ref("")
 let resizeCleanup = null
+const tableHeight = ref(null)
+let breakdownCloseTimer = null
 
 const displaySeries = (value) => ({
   "TN10系列（主链接）汇总": "TN10（主）",
@@ -164,9 +170,46 @@ function breakdownKey(row, column) {
   return `${row.key}|${column.key}`
 }
 
-function toggleBreakdown(row, column) {
+function updateBreakdownPosition() {
+  if (!breakdownAnchor.value) return
+  const rect = breakdownAnchor.value.getBoundingClientRect()
+  const width = 170
+  const gap = 8
+  const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width))
+  const top = rect.top >= 178 ? rect.top - 178 : rect.bottom + gap
+  breakdownPosition.value = { top: Math.max(8, top), left }
+}
+
+function openBreakdown(row, column, event) {
+  if (breakdownCloseTimer) window.clearTimeout(breakdownCloseTimer)
+  breakdownOpenKey.value = breakdownKey(row, column)
+  breakdownRow.value = row
+  breakdownColumn.value = column
+  breakdownAnchor.value = event?.currentTarget || null
+  requestAnimationFrame(updateBreakdownPosition)
+}
+
+function scheduleCloseBreakdown() {
+  if (breakdownCloseTimer) window.clearTimeout(breakdownCloseTimer)
+  breakdownCloseTimer = window.setTimeout(() => {
+    breakdownOpenKey.value = ""
+    breakdownRow.value = null
+    breakdownColumn.value = null
+    breakdownAnchor.value = null
+  }, 140)
+}
+
+function keepBreakdownOpen() {
+  if (breakdownCloseTimer) window.clearTimeout(breakdownCloseTimer)
+}
+
+function toggleBreakdown(row, column, event) {
   const key = breakdownKey(row, column)
-  breakdownOpenKey.value = breakdownOpenKey.value === key ? "" : key
+  if (breakdownOpenKey.value === key) {
+    scheduleCloseBreakdown()
+    return
+  }
+  openBreakdown(row, column, event)
 }
 
 function amazonDomain(siteCode) {
@@ -425,7 +468,7 @@ const displayRows = computed(() => {
       }
     }
     if (showPeriodTotals.value) {
-      periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "全部站点", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
+      periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
     }
     if (periodRows.length) periodRows[0].periodFirst = true
     result.push(...periodRows)
@@ -587,6 +630,29 @@ function startResize(event, column) {
   window.addEventListener("pointerup", stop, { once: true })
 }
 
+function startTableResize(event) {
+  event.preventDefault()
+  event.stopPropagation()
+  resizeCleanup?.()
+  const wrap = event.currentTarget?.previousElementSibling
+  const startY = event.clientY
+  const startHeight = tableHeight.value || Math.max(280, wrap?.getBoundingClientRect().height || 520)
+  const move = (moveEvent) => {
+    tableHeight.value = Math.max(220, Math.min(window.innerHeight - 180, Math.round(startHeight + moveEvent.clientY - startY)))
+  }
+  const stop = () => {
+    window.removeEventListener("pointermove", move)
+    window.removeEventListener("pointerup", stop)
+    document.body.classList.remove("resizing-amazon-table")
+    resizeCleanup = null
+    saveColumnPreferences()
+  }
+  resizeCleanup = stop
+  document.body.classList.add("resizing-amazon-table")
+  window.addEventListener("pointermove", move)
+  window.addEventListener("pointerup", stop, { once: true })
+}
+
 function toggle(row) {
   const next = new Set(expanded.value)
   next.has(row.key) ? next.delete(row.key) : next.add(row.key)
@@ -658,6 +724,8 @@ async function loadSites() {
 }
 watch([fixedColumns, dataColumns], saveColumnPreferences, { deep: true })
 onMounted(async () => {
+  window.addEventListener("scroll", updateBreakdownPosition, true)
+  window.addEventListener("resize", updateBreakdownPosition)
   loadColumnPreferences()
   await loadRuntime()
   await loadSites()
@@ -670,6 +738,9 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   resizeCleanup?.()
+  window.removeEventListener("scroll", updateBreakdownPosition, true)
+  window.removeEventListener("resize", updateBreakdownPosition)
+  if (breakdownCloseTimer) window.clearTimeout(breakdownCloseTimer)
   if (copyMessageTimer) window.clearTimeout(copyMessageTimer)
 })
 </script>
@@ -689,7 +760,8 @@ onBeforeUnmount(() => {
     </section>
      <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><button class="column-config-button" type="button" @click="columnConfigOpen = !columnConfigOpen" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel" role="dialog" aria-label="列配置"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></div></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
-        <div v-else class="amazon-table-wrap"><table class="amazon-table" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.site || (site.length === 1 ? site[0] : "—") }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column)"><i aria-hidden="true"></i></button><span class="ad-breakdown-popover" role="tooltip"><strong>{{ column.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(row.metrics, column.key, adType.key) }}</em></span><small v-if="!breakdownHasData(row.metrics)">暂无四类广告明细</small></span></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div>
+        <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
+      <Teleport to="body"><div v-if="breakdownOpenKey && breakdownRow && breakdownColumn" class="ad-breakdown-popover ad-breakdown-popover-floating" role="tooltip" :style="{ top: `${breakdownPosition.top}px`, left: `${breakdownPosition.left}px` }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><strong>{{ breakdownColumn.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(breakdownRow.metrics, breakdownColumn.key, adType.key) }}</em></span><small v-if="!breakdownHasData(breakdownRow.metrics)">暂无四类广告明细</small></div></Teleport>
     </section>
     <AmazonStrategyBoard :api-base="apiBase" :start-date="startDate" :end-date="endDate" :sites="site" />
      <div v-if="copyMessage" class="amazon-copy-toast" role="status" aria-live="polite">{{ copyMessage }}</div>
