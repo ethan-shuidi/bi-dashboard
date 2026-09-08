@@ -6,7 +6,6 @@ import os
 import re
 import base64
 import hashlib
-import hmac
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
@@ -66,18 +65,8 @@ app.add_middleware(
 def require_business_access(
     x_sync_key: str | None,
 ) -> None:
-    """Require the configured dashboard credential for business APIs.
-
-    The dashboard key is intentionally supplied through IdeaDock Secret
-    configuration and is never stored in source control.  Keep the sync key
-    as a backwards-compatible fallback for existing deployments.
-    """
-    configured_key = (
-        os.environ.get("DASHBOARD_API_KEY", "").strip()
-        or os.environ.get("SYNC_API_KEY", "").strip()
-    )
-    if not configured_key or not x_sync_key or not hmac.compare_digest(x_sync_key, configured_key):
-        raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
+    """Company-internal deployment: business APIs do not require a key."""
+    return None
 
 Base = declarative_base()
 _engine = None
@@ -1889,9 +1878,6 @@ async def sync(
     trigger: str = Query(default="button", pattern="^(button|dashboard)$"),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    configured_key = os.environ.get("SYNC_API_KEY", "").strip()
-    if not configured_key or x_sync_key != configured_key:
-        raise HTTPException(status_code=401, detail="同步接口需要有效的 X-Sync-Key")
     try:
         return await run_sync(trigger)
     except RuntimeError as exc:
@@ -1928,9 +1914,6 @@ async def dashboard(
             period_start = period_end - timedelta(days=days)
         factory = session_factory()
         if auto_sync:
-            configured_key = os.environ.get("SYNC_API_KEY", "").strip()
-            if not configured_key or x_sync_key != configured_key:
-                raise HTTPException(status_code=401, detail="自动同步需要有效的 X-Sync-Key")
             await run_sync("dashboard")
         with factory() as db:
             return dashboard_payload(db, period_start, period_end, store)
