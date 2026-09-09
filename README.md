@@ -20,6 +20,9 @@ Amazon 运营数据看板项目，已与 Shopify 数据看板拆分。项目包�
 - `ACoAS = 广告花费 / 净销售额`；`广告销量占比 = 广告销量 / 销量`；`广告订单占比 = 广告订单量 / 订单量`。
 - `广告销量占比` 与原列保持不变，不能使用 `adv_rate` 代替；`广告订单占比` 为新增列。
 - 系列和周期汇总行分别汇总产品表现与广告报表明细；比例类指标按对应分子、分母汇总后计算。
+- 广告策略看板独立按周、站点、店铺和系列筛选；店铺不选时查询该站点下全部店铺。
+- 广告活动归类使用站点 + 店铺 SID + Campaign ID 保存，支持系列、产品和策略打标；Campaign ID 可在前端悬停查看并点击复制。
+- 广告计划按周 + 站点 + 系列保存上周复盘和本周计划文本，内容写入云端供所有用户共享。
 
 ## Shopify 看板
 
@@ -70,6 +73,10 @@ python3 -m uvicorn app:app --app-dir backend --reload --port 8000
 - `GET /api/status`
 - `GET /api/amazon/stores`
 - `GET /api/amazon/dashboard`
+- `GET /api/amazon/strategy-board`
+- `POST /api/amazon/strategy-board/campaign-strategy`
+- `POST /api/amazon/strategy-board/note`
+- `GET/POST /api/amazon/ad-plan`
 - `POST /api/sync`
 
 ## 发布前检查

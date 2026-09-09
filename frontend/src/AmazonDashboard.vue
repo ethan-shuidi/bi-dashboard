@@ -37,6 +37,8 @@ const currencyOptions = [
   { value: "CAD", label: "加元 CAD" },
   { value: "AUD", label: "澳元 AUD" },
   { value: "SEK", label: "瑞典克朗 SEK" },
+  { value: "MXN", label: "墨西哥比索 MXN" },
+  { value: "PLN", label: "波兰兹罗提 PLN" },
 ]
 const expanded = ref(new Set())
 const quickDatePreset = ref("previous-week")
@@ -58,6 +60,7 @@ const quickDateOptions = [
 const seriesOptions = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
 const productOptions = ["TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色", "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色", "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红", "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红"]
 const sites = ref(["美国"])
+const siteOrder = ["美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
 
 const fixedColumns = ref([
   { key: "period", label: "时间", width: 185 },
@@ -411,6 +414,11 @@ function selectOnlyProduct(value) {
   load()
 }
 
+function selectOnlySite(value) {
+  site.value = [value]
+  handleSiteChange()
+}
+
 const showPeriodTotals = computed(() => selectedSeries.value.length !== 1 && (site.value.length <= 1 || currency.value !== "original"))
 
 const displayRows = computed(() => {
@@ -715,11 +723,9 @@ async function loadSites() {
     const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/stores`)
     const data = await response.json()
     const values = (data.stores || []).filter((x) => x.status === 1).map((x) => x.country).filter(Boolean)
-    if (values.length) {
-      sites.value = [...new Set(values)]
-      site.value = site.value.filter((siteName) => sites.value.includes(siteName))
-      if (!site.value.length) site.value = [sites.value[0]]
-    }
+    sites.value = [...new Set([...siteOrder, ...values])].sort((left, right) => (siteOrder.indexOf(left) < 0 ? 999 : siteOrder.indexOf(left)) - (siteOrder.indexOf(right) < 0 ? 999 : siteOrder.indexOf(right)) || left.localeCompare(right, "zh-CN"))
+    site.value = site.value.filter((siteName) => sites.value.includes(siteName))
+    if (!site.value.length) site.value = ["美国"]
   } catch {}
 }
 watch([fixedColumns, dataColumns], saveColumnPreferences, { deep: true })
@@ -753,7 +759,7 @@ onBeforeUnmount(() => {
       <label><span>快速选择日期</span><el-select v-model="quickDatePreset" placeholder="请选择" @change="selectQuickDate"><el-option v-for="item in quickDateOptions" :key="item.key" :label="item.label" :value="item.key"/></el-select></label>
       <label><span>开始日期（选择）</span><el-date-picker v-model="startDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'start')" @change="handleDateChange"/></label>
       <label><span>结束日期（选择）</span><el-date-picker v-model="endDate" type="date" value-format="YYYY-MM-DD" format="YYYY/MM/DD" :clearable="false" :disabled-date="(date) => dateDisabled(date, 'end')" @change="handleDateChange"/></label>
-      <label><span>站点（多选）</span><el-select v-model="site" multiple collapse-tags collapse-tags-tooltip @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"/></el-select></label>
+      <label><span>站点（多选）</span><el-select v-model="site" multiple collapse-tags collapse-tags-tooltip @change="handleSiteChange"><el-option v-for="item in sites" :key="item" :label="item" :value="item"><template #default><span class="amazon-filter-option-label">{{ item }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlySite(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label><span>币种</span><el-select v-model="currency" @change="handleCurrencyChange"><el-option v-for="item in currencyOptions" :key="item.value" :label="item.label" :value="item.value"/></el-select></label>
       <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displaySeries(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlySeries(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displayProduct(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlyProduct(item)">仅筛选此项</button></template></el-option></el-select></label>
@@ -763,7 +769,7 @@ onBeforeUnmount(() => {
         <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
       <Teleport to="body"><div v-if="breakdownOpenKey && breakdownRow && breakdownColumn" class="ad-breakdown-popover ad-breakdown-popover-floating" role="tooltip" :style="{ top: `${breakdownPosition.top}px`, left: `${breakdownPosition.left}px` }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><strong>{{ breakdownColumn.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(breakdownRow.metrics, breakdownColumn.key, adType.key) }}</em></span><small v-if="!breakdownHasData(breakdownRow.metrics)">暂无四类广告明细</small></div></Teleport>
     </section>
-    <AmazonStrategyBoard :api-base="apiBase" :start-date="startDate" :end-date="endDate" :sites="site" />
+    <AmazonStrategyBoard :api-base="apiBase" />
      <div v-if="copyMessage" class="amazon-copy-toast" role="status" aria-live="polite">{{ copyMessage }}</div>
    </div>
  </template>

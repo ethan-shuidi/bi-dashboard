@@ -92,9 +92,10 @@ AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
     "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
     "英国": "GBP", "德国": "EUR", "法国": "EUR", "意大利": "EUR",
-    "西班牙": "EUR", "荷兰": "EUR", "比利时": "EUR", "瑞典": "SEK",
+    "西班牙": "EUR", "荷兰": "EUR", "比利时": "EUR", "墨西哥": "MXN",
+    "爱尔兰": "EUR", "波兰": "PLN", "瑞典": "SEK",
 }
-AMAZON_SUPPORTED_CURRENCIES = ("USD", "CNY", "JPY", "EUR", "GBP", "CAD", "AUD", "SEK")
+AMAZON_SUPPORTED_CURRENCIES = ("USD", "CNY", "JPY", "EUR", "GBP", "CAD", "AUD", "SEK", "MXN", "PLN")
 
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_API_VERSION = "2026-07"
@@ -115,7 +116,8 @@ AMAZON_PRODUCTS = [
     "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红",
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
-AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "加拿大": "CA", "澳洲": "AU", "德国": "DE", "法国": "FR", "意大利": "IT", "西班牙": "ES", "英国": "UK", "荷兰": "NL", "比利时": "BE", "瑞典": "SE"}
+AMAZON_SITE_ORDER = ("美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典")
+AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "德国": "DE", "英国": "UK", "法国": "FR", "加拿大": "CA", "澳洲": "AU", "西班牙": "ES", "意大利": "IT", "荷兰": "NL", "比利时": "BE", "墨西哥": "MX", "爱尔兰": "IE", "波兰": "PL", "瑞典": "SE"}
 AMAZON_SITE_TIMEZONES = {
     "美国": "America/Los_Angeles",
     "日本": "Asia/Tokyo",
@@ -128,6 +130,9 @@ AMAZON_SITE_TIMEZONES = {
     "英国": "Europe/London",
     "荷兰": "Europe/Amsterdam",
     "比利时": "Europe/Brussels",
+    "墨西哥": "America/Mexico_City",
+    "爱尔兰": "Europe/Dublin",
+    "波兰": "Europe/Warsaw",
     "瑞典": "Europe/Stockholm",
 }
 AMAZON_MAX_DATE_RANGE_DAYS = 400
@@ -249,15 +254,54 @@ class AmazonCampaignStrategy(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
-class AmazonStrategyNote(Base):
-    __tablename__ = "amazon_strategy_notes"
+class AmazonCampaignAssignment(Base):
+    __tablename__ = "amazon_campaign_assignments"
     __table_args__ = (
-        UniqueConstraint("site_code", "strategy", name="uq_amazon_strategy_note"),
-        Index("ix_amazon_strategy_note_site", "site_code"),
+        UniqueConstraint("site_code", "store_sid", "campaign_id", name="uq_amazon_campaign_assignment"),
+        Index("ix_amazon_campaign_assignment_lookup", "site_code", "store_sid"),
     )
 
     id = Column(Integer, primary_key=True)
     site_code = Column(String(12), nullable=False)
+    store_sid = Column(String(64), nullable=False)
+    store_name = Column(String(255), nullable=False, default="")
+    campaign_id = Column(String(255), nullable=False)
+    campaign_name = Column(String(500), nullable=False, default="")
+    strategy = Column(String(80), nullable=False, default="/")
+    series = Column(String(160), nullable=False, default="")
+    product = Column(String(160), nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AmazonAdPlan(Base):
+    __tablename__ = "amazon_ad_plans"
+    __table_args__ = (
+        UniqueConstraint("week_start", "site_code", "series", name="uq_amazon_ad_plan_scope"),
+        Index("ix_amazon_ad_plan_scope", "week_start", "site_code"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    week_start = Column(Date, nullable=False)
+    site_code = Column(String(12), nullable=False)
+    series = Column(String(160), nullable=False)
+    review = Column(Text, nullable=False, default="")
+    plan = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AmazonStrategyNote(Base):
+    # Versioned table keeps legacy site+strategy notes from leaking into the
+    # new week+site+series scope and avoids an unsafe in-place constraint change.
+    __tablename__ = "amazon_strategy_notes_v2"
+    __table_args__ = (
+        UniqueConstraint("week_start", "site_code", "series", "strategy", name="uq_amazon_strategy_note_v2_scope"),
+        Index("ix_amazon_strategy_note_v2_scope", "week_start", "site_code", "series"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    week_start = Column(Date, nullable=False)
+    site_code = Column(String(12), nullable=False)
+    series = Column(String(160), nullable=False)
     strategy = Column(String(80), nullable=False)
     note = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime(timezone=True), nullable=False)
@@ -441,14 +485,14 @@ def amazon_sid_accounts(
             candidates.append({"sid": value, "name": name})
 
     add(raw)
-    if site_code == "JP":
-        # Always supplement configured values with the authoritative store
-        # list, because older configurations may contain only one JP sid.
-        for row in store_rows or []:
-            country = str(row.get("country") or "")
-            name = str(row.get("name") or row.get("account_name") or "")
-            if country in {"日本", "JP"} and name in {"Comu-JP", "Comulytic-JP"}:
-                add(row.get("sid"), name)
+    # Supplement configured values with the authoritative store list. This
+    # also makes a missing LINGXING_SIDS_JSON entry recoverable for every site,
+    # while retaining the two-shop Japan behavior.
+    for row in store_rows or []:
+        country = str(row.get("country") or "")
+        name = str(row.get("name") or row.get("account_name") or "")
+        if country in {site_name, site_code}:
+            add(row.get("sid"), name)
 
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -488,9 +532,10 @@ async def fetch_ad_report(
     report_date: date,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Read LingXing's dated advertising report for one store."""
-    cache_key = ("ads", sid, report_date.isoformat())
+    cache_key = ("ads-v2", sid, report_date.isoformat(), offset)
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -508,7 +553,7 @@ async def fetch_ad_report(
                 "sid": sid,
                 "report_date": report_date.isoformat(),
                 "show_detail": 1,
-                "offset": 0,
+                "offset": offset,
                 "length": 500,
             },
             client=client,
@@ -537,7 +582,7 @@ async def fetch_ad_reports_range(
     while cursor <= end_date:
         async with _lingxing_ad_report_lock:
             try:
-                daily = await fetch_ad_report(sid, cursor, client, semaphore)
+                daily = await fetch_ad_report(sid, cursor, client, semaphore, 0)
             except RuntimeError as exc:
                 if "频繁" not in str(exc) and "too frequent" not in str(exc).lower():
                     raise
@@ -545,19 +590,32 @@ async def fetch_ad_reports_range(
                 for attempt in range(5):
                     await asyncio.sleep(2 ** attempt)
                     try:
-                        daily = await fetch_ad_report(sid, cursor, client, semaphore)
+                        daily = await fetch_ad_report(sid, cursor, client, semaphore, 0)
                         break
                     except RuntimeError as retry_exc:
                         if "频繁" not in str(retry_exc) and "too frequent" not in str(retry_exc).lower():
                             raise
                 if daily is None:
                     raise
-        for row in daily:
-            if isinstance(row, dict):
-                tagged = dict(row)
-                tagged["_source"] = "ad_report"
-                tagged["_dashboard_date"] = cursor.isoformat()
-                rows.append(tagged)
+        offset = 0
+        page_signatures: set[str] = set()
+        while daily:
+            signature = json.dumps(daily[:3], ensure_ascii=False, sort_keys=True, default=str)
+            if signature in page_signatures:
+                break
+            page_signatures.add(signature)
+            for row in daily:
+                if isinstance(row, dict):
+                    tagged = dict(row)
+                    tagged["_source"] = "ad_report"
+                    tagged["_dashboard_date"] = cursor.isoformat()
+                    tagged["_store_sid"] = str(sid)
+                    rows.append(tagged)
+            if len(daily) < 500:
+                break
+            offset += len(daily)
+            async with _lingxing_ad_report_lock:
+                daily = await fetch_ad_report(sid, cursor, client, semaphore, offset)
         cursor += timedelta(days=1)
     return rows
 
@@ -567,6 +625,62 @@ def ad_report_campaign_id(row: dict[str, Any]) -> str:
         value = row.get(key)
         if value not in (None, "") and not isinstance(value, (dict, list)):
             return str(value).strip()
+    return ""
+
+
+def ad_report_store_sid(row: dict[str, Any]) -> str:
+    for key in ("_store_sid", "store_sid", "storeSid", "sid", "store_id", "storeId", "seller_id", "sellerId"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            return str(value).strip()
+    return str(row.get("_store_sid") or "").strip()
+
+
+def ad_report_store_name(row: dict[str, Any]) -> str:
+    for key in ("store_name", "storeName", "shop_name", "shopName", "seller_name", "sellerName", "account_name", "accountName"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            return str(value).strip()
+    for key in ("store", "shop", "account", "profile"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("name", "store_name", "storeName", "shop_name", "shopName", "account_name", "accountName"):
+                nested = value.get(nested_key)
+                if nested not in (None, "") and not isinstance(nested, (dict, list)):
+                    return str(nested).strip()
+    return ""
+
+
+def ad_report_type(row: dict[str, Any]) -> str:
+    for key in ("ad_type", "adType", "ads_type", "adsType", "advertising_type", "advertisingType", "type", "product_type", "productType"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            text = str(value).strip().upper()
+            if text in {"SBV", "VIDEO", "SPONSORED_BRANDS_VIDEO"} or text.startswith("SBV"):
+                return "SBV"
+            if text in {"SP", "SPONSORED_PRODUCTS"} or text.startswith("SP"):
+                return "SP"
+            if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS"} or text.startswith("SB"):
+                return "SB"
+            if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"):
+                return "SD"
+    for key in ("campaign_type", "campaignType", "ad_product", "adProduct"):
+        value = row.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            text = str(value).strip().upper()
+            if text in {"SBV", "VIDEO", "SPONSORED_BRANDS_VIDEO"} or text.startswith("SBV"):
+                return "SBV"
+            if text in {"SP", "SPONSORED_PRODUCTS"} or text.startswith("SP"):
+                return "SP"
+            if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS"} or text.startswith("SB"):
+                return "SB"
+            if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"):
+                return "SD"
+    sponsored = str(row.get("sponsored_type") or "").strip().upper()
+    if sponsored in {"SP", "SB", "SBV", "SD"}:
+        return sponsored
+    if sponsored in {"HSA", "SB2"}:
+        return "SBV" if str(row.get("creative_type") or "").upper() == "VIDEO" else "SB"
     return ""
 
 
@@ -607,11 +721,11 @@ def strategy_metrics(row: dict[str, Any]) -> dict[str, float]:
 
 def strategy_campaign_id(row: dict[str, Any]) -> str:
     value = ad_report_campaign_id(row)
-    return value or f"name:{strategy_campaign_name(row)}"
+    return value or f"name:{ad_report_store_sid(row)}:{strategy_campaign_name(row)}"
 
 
 def strategy_campaign_name(row: dict[str, Any]) -> str:
-    for key in ("campaign_name", "campaignName", "name", "campaign", "ads_name", "adsName", "ad_name"):
+    for key in ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "name", "campaign", "ads_name", "adsName", "ad_name"):
         value = row.get(key)
         if value not in (None, "") and not isinstance(value, (dict, list)):
             return str(value).strip()
@@ -1394,13 +1508,16 @@ AMAZON_AD_BREAKDOWN_FIELDS = {
 }
 
 
-def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str, float]]:
+def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str, float | None]]:
     """Normalize LingXing's product-performance advertising dimensions."""
     result: dict[str, dict[str, float]] = {}
     for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items():
         result[ad_type] = {}
         for metric, names in fields.items():
-            result[ad_type][metric] = optional_metric(raw, *names) or 0.0
+            # Keep an absent upstream field as null. Filling missing fields
+            # with zero makes the frontend mistake an incomplete breakdown for
+            # a complete zero-valued breakdown and overwrite the generic total.
+            result[ad_type][metric] = optional_metric(raw, *names)
     return result
 
 
@@ -1631,6 +1748,8 @@ async def amazon_strategy_board_payload(
     selected_sites: list[str],
     sid_map: dict[str, Any],
     store_rows: list[dict[str, Any]] | None = None,
+    selected_store_sids: set[str] | None = None,
+    selected_series: set[str] | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
     """Aggregate campaigns from LingXing's advertising backend by strategy.
@@ -1640,7 +1759,9 @@ async def amazon_strategy_board_payload(
     date-scoped snapshot, and campaigns with zero clicks are omitted.
     """
     selected_sites = list(dict.fromkeys(selected_sites))
-    cache_key = ("amazon-strategy-board-v1", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites))
+    selected_store_sids = {str(value) for value in (selected_store_sids or set()) if str(value).strip()}
+    series_filter = None if selected_series is None else set(selected_series)
+    cache_key = ("amazon-strategy-board-v3-no-product", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), tuple(sorted(selected_store_sids)), tuple(sorted(series_filter or set())))
     if refresh:
         _amazon_cache.pop(cache_key, None)
     cached = _amazon_cache.get(cache_key)
@@ -1654,74 +1775,116 @@ async def amazon_strategy_board_payload(
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
             rows: list[dict[str, Any]] = []
             for account in accounts:
+                account_sid = str(account["sid"])
                 try:
-                    rows.extend(await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore))
+                    account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
                 except RuntimeError as exc:
                     if "白名单" in str(exc) or "ip not permit" in str(exc).lower():
                         continue
                     raise
+                for row in account_rows:
+                    row["_store_sid"] = str(row.get("_store_sid") or account_sid)
+                    row["_store_name"] = str(ad_report_store_name(row) or account.get("name") or account.get("account_name") or "未命名店铺")
+                    row["_site_name"] = site_name
+                    row["_ad_type"] = ad_report_type(row)
+                rows.extend(account_rows)
+            store_lookup = {str(item.get("sid")): item for item in (store_rows or []) if item.get("sid") is not None}
+            for row in rows:
+                row["_store_sid"] = str(row.get("_store_sid") or "")
+                store = store_lookup.get(row["_store_sid"], {})
+                row["_store_name"] = str(row.get("_store_name") or ad_report_store_name(row) or store.get("name") or store.get("account_name") or "未命名店铺")
+                row["_site_name"] = site_name
+                row["_ad_type"] = ad_report_type(row)
+            if selected_store_sids:
+                rows = [row for row in rows if str(row.get("_store_sid") or "") in selected_store_sids]
             return site_name, site_code, rows
 
         fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
-    assignments: dict[tuple[str, str], str] = {}
-    notes: dict[tuple[str, str], str] = {}
+    assignments: dict[tuple[str, str, str], dict[str, str]] = {}
+    notes: dict[tuple[date, str, str, str], str] = {}
     with session_factory()() as db:
+        for item in db.scalars(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
+            assignments[(item.site_code, str(item.store_sid), item.campaign_id)] = {
+                "strategy": normalize_strategy(item.strategy),
+                "series": item.series or "",
+                "product": item.product or "",
+                "campaign_name": item.campaign_name or "",
+                "store_name": item.store_name or "",
+            }
         for item in db.scalars(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
-            assignments[(item.site_code, item.campaign_id)] = normalize_strategy(item.strategy)
+            assignments.setdefault((item.site_code, "", item.campaign_id), {
+                "strategy": normalize_strategy(item.strategy), "series": "", "product": "", "campaign_name": item.campaign_name or "", "store_name": "",
+            })
         for item in db.scalars(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
-            notes[(item.site_code, normalize_strategy(item.strategy))] = item.note
+            notes[(item.week_start, item.site_code, item.series, normalize_strategy(item.strategy))] = item.note
 
-    aggregate: dict[tuple[str, str], dict[str, Any]] = {}
+    aggregate: dict[tuple[str, str, str], dict[str, Any]] = {}
     for site_name, site_code, raw_rows in fetched:
         for raw in raw_rows:
             campaign_id = strategy_campaign_id(raw)
             campaign_name = strategy_campaign_name(raw)
             if not campaign_id or not campaign_name:
                 continue
+            if campaign_name == "未命名广告活动":
+                campaign_name = f"未命名广告活动 · {campaign_id}"
             metrics = strategy_metrics(raw)
-            key = (site_code, campaign_id)
-            item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "campaign_id": campaign_id, "campaign_name": campaign_name, "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": str(raw.get("currency") or raw.get("currency_code") or AMAZON_CURRENCY_CODES.get(site_name, "USD"))})
+            store_sid = ad_report_store_sid(raw)
+            store_name = str(raw.get("_store_name") or "未命名店铺")
+            key = (site_code, store_sid, campaign_id)
+            item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "store_sid": store_sid, "store_name": store_name, "campaign_id": campaign_id, "campaign_name": campaign_name, "ad_type": ad_report_type(raw), "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": str(raw.get("currency") or raw.get("currency_code") or AMAZON_CURRENCY_CODES.get(site_name, "USD"))})
             if campaign_name != "未命名广告活动":
                 item["campaign_name"] = campaign_name
+            if item["ad_type"] == "" and ad_report_type(raw):
+                item["ad_type"] = ad_report_type(raw)
             for name, value in metrics.items():
                 item["metrics"][name] += value
 
     metric_names = ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")
-    strategies: dict[tuple[str, str], dict[str, Any]] = {
-        (strategy_site_code(site), name): {"strategy": name, "note": notes.get((strategy_site_code(site), name), ""), "metrics": {metric: 0.0 for metric in metric_names}, "campaigns": [], "sites": []}
+    week_scope = normalize_week_start(start_date)
+    strategies: dict[tuple[str, str, str, str], dict[str, Any]] = {
+        (strategy_site_code(site), name, "", ""): {"strategy": name, "series": "", "product": "", "note": notes.get((week_scope, strategy_site_code(site), "", name), ""), "metrics": {metric: 0.0 for metric in metric_names}, "campaigns": [], "sites": []}
         for site in selected_sites for name in AMAZON_STRATEGY_OPTIONS
     }
-    for (site_code, campaign_id), item in aggregate.items():
+    for (site_code, store_sid, campaign_id), item in aggregate.items():
         if item["metrics"]["clicks"] <= 0:
             continue
-        strategy = assignments.get((site_code, campaign_id), "/")
+        assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
+        strategy = assignment.get("strategy", "/")
         if strategy not in AMAZON_STRATEGY_OPTIONS:
             strategy = "/"
+        series = assignment.get("series", "") if assignment.get("series", "") in AMAZON_SERIES else ""
+        # Product-level classification is no longer part of the strategy board.
+        # Keep the database column for backward compatibility, but collapse old
+        # product assignments into the strategy + series group.
+        product = ""
+        if series_filter is not None and series not in series_filter:
+            continue
         # Keep a separate site row when multiple marketplaces are selected, so
         # native currencies never get added together.
-        group_key = (site_code, strategy)
+        group_key = (site_code, strategy, series, product)
         group = strategies.get(group_key)
         if group is None:
-            group = {"strategy": strategy, "note": notes.get((site_code, strategy), ""), "metrics": {name: 0.0 for name in metric_names}, "campaigns": [], "sites": []}
+            group = {"strategy": strategy, "series": series, "product": product, "note": notes.get((week_scope, site_code, series, strategy), ""), "metrics": {name: 0.0 for name in metric_names}, "campaigns": [], "sites": []}
             strategies[group_key] = group
         group["sites"] = [item["site"]]
         for name, value in item["metrics"].items():
             group["metrics"][name] += value
-        group["campaigns"].append({"campaign_id": campaign_id, "campaign_name": item["campaign_name"], "site": item["site"], "site_code": site_code, "currency": item["currency"], **finalize_strategy_metrics(item["metrics"])})
+        group["campaigns"].append({"campaign_id": campaign_id, "campaign_name": item["campaign_name"], "site": item["site"], "site_code": site_code, "store_sid": store_sid, "store_name": item["store_name"], "ad_type": item["ad_type"], "series": series, "product": product, "strategy": strategy, "currency": item["currency"], **finalize_strategy_metrics(item["metrics"])})
 
     output = []
     for site_name in selected_sites:
         site_code = strategy_site_code(site_name)
-        for strategy in AMAZON_STRATEGY_OPTIONS:
-            group = strategies[(site_code, strategy)]
+        site_groups = [group for key, group in strategies.items() if key[0] == site_code]
+        for group in site_groups:
             group["campaigns"].sort(key=lambda campaign: (-campaign["clicks"], campaign["campaign_name"]))
             group["metrics"] = finalize_strategy_metrics(group["metrics"])
             group["site"] = site_name
             group["site_code"] = site_code
             group["currency"] = AMAZON_CURRENCY_CODES.get(site_name, "USD")
             output.append(group)
-    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "selected_sites": selected_sites}
+    output.sort(key=lambda group: (selected_sites.index(group["site"]), AMAZON_STRATEGY_OPTIONS.index(group["strategy"]), group.get("series") or "", group.get("product") or ""))
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites}
     _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
 
@@ -1731,6 +1894,8 @@ async def amazon_strategy_board(
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
     site: list[str] = Query(default=[]),
+    store_sid: list[str] = Query(default=[]),
+    series: list[str] = Query(default=[]),
     refresh: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
@@ -1743,9 +1908,9 @@ async def amazon_strategy_board(
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-    store_rows = await lingxing_store_rows() if any(site_name == "日本" for site_name in selected_sites) or not sid_map else []
+    store_rows = await lingxing_store_rows()
     try:
-        return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, refresh)
+        return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, set(store_sid), set(series) if series else None, refresh)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"广告报表请求失败：HTTP {exc.response.status_code}") from exc
     except RuntimeError as exc:
@@ -1765,21 +1930,31 @@ def save_campaign_strategy(
 ):
     require_business_access(x_sync_key, allow_public=True)
     site_code = str(payload.get("site_code") or "").strip().upper()
+    store_sid = str(payload.get("store_sid") or "").strip()
     campaign_id = str(payload.get("campaign_id") or "").strip()
     strategy = normalize_strategy(payload.get("strategy"))
-    if site_code not in AMAZON_SITE_CODES.values() or not campaign_id or strategy not in AMAZON_STRATEGY_OPTIONS:
+    series = str(payload.get("series") or "").strip()
+    product = str(payload.get("product") or "").strip()
+    if site_code not in AMAZON_SITE_CODES.values() or not store_sid or not campaign_id or strategy not in AMAZON_STRATEGY_OPTIONS:
         raise HTTPException(status_code=422, detail="广告活动策略参数无效")
+    if series and series not in AMAZON_SERIES:
+        raise HTTPException(status_code=422, detail="广告活动系列参数无效")
+    if product and product not in AMAZON_PRODUCTS:
+        raise HTTPException(status_code=422, detail="广告活动产品参数无效")
     with session_factory()() as db:
-        item = db.scalar(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code == site_code, AmazonCampaignStrategy.campaign_id == campaign_id))
+        item = db.scalar(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code == site_code, AmazonCampaignAssignment.store_sid == store_sid, AmazonCampaignAssignment.campaign_id == campaign_id))
         if item is None:
-            item = AmazonCampaignStrategy(site_code=site_code, campaign_id=campaign_id)
+            item = AmazonCampaignAssignment(site_code=site_code, store_sid=store_sid, campaign_id=campaign_id)
             db.add(item)
         item.campaign_name = str(payload.get("campaign_name") or "")[:500]
+        item.store_name = str(payload.get("store_name") or "")[:255]
         item.strategy = strategy
+        item.series = series
+        item.product = product
         item.updated_at = utcnow()
         db.commit()
     _amazon_cache.clear()
-    return {"ok": True, "site_code": site_code, "campaign_id": campaign_id, "strategy": strategy}
+    return {"ok": True, "site_code": site_code, "store_sid": store_sid, "campaign_id": campaign_id, "strategy": strategy, "series": series, "product": product}
 
 
 @app.post("/api/amazon/strategy-board/note")
@@ -1789,20 +1964,78 @@ def save_strategy_note(
 ):
     require_business_access(x_sync_key, allow_public=True)
     site_code = str(payload.get("site_code") or "").strip().upper()
+    try:
+        week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="策略备注周格式无效") from exc
+    series = str(payload.get("series") or "").strip()
     strategy = normalize_strategy(payload.get("strategy"))
     note = str(payload.get("note") or "")
-    if site_code not in AMAZON_SITE_CODES.values() or strategy not in AMAZON_STRATEGY_OPTIONS:
+    if site_code not in AMAZON_SITE_CODES.values() or series not in ("", *AMAZON_SERIES) or strategy not in AMAZON_STRATEGY_OPTIONS:
         raise HTTPException(status_code=422, detail="策略备注参数无效")
     with session_factory()() as db:
-        item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.strategy == strategy))
+        item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.week_start == week_start, AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.series == series, AmazonStrategyNote.strategy == strategy))
         if item is None:
-            item = AmazonStrategyNote(site_code=site_code, strategy=strategy)
+            item = AmazonStrategyNote(week_start=week_start, site_code=site_code, series=series, strategy=strategy)
             db.add(item)
         item.note = note
         item.updated_at = utcnow()
         db.commit()
     _amazon_cache.clear()
-    return {"ok": True, "site_code": site_code, "strategy": strategy, "note": note}
+    return {"ok": True, "week_start": week_start.isoformat(), "site_code": site_code, "series": series, "strategy": strategy, "note": note}
+
+
+def normalize_week_start(value: date | None) -> date:
+    selected = value or datetime.now(timezone.utc).date()
+    return selected - timedelta(days=selected.weekday())
+
+
+@app.get("/api/amazon/ad-plan")
+def get_ad_plan(
+    week_start: date | None = Query(default=None),
+    site: str = Query(default="美国"),
+    series: str = Query(default=""),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    site_code = AMAZON_SITE_CODES.get(site, site.strip().upper())
+    if site_code not in AMAZON_SITE_CODES.values() or series not in AMAZON_SERIES:
+        raise HTTPException(status_code=422, detail="广告计划筛选条件无效")
+    week = normalize_week_start(week_start)
+    with session_factory()() as db:
+        item = db.scalar(select(AmazonAdPlan).where(AmazonAdPlan.week_start == week, AmazonAdPlan.site_code == site_code, AmazonAdPlan.series == series))
+        if item is None:
+            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": ""}
+        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, "updated_at": item.updated_at.isoformat() if item.updated_at else None}
+
+
+@app.post("/api/amazon/ad-plan")
+def save_ad_plan(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    site = str(payload.get("site") or "美国").strip()
+    site_code = AMAZON_SITE_CODES.get(site, str(payload.get("site_code") or "").strip().upper())
+    series = str(payload.get("series") or "").strip()
+    if site_code not in AMAZON_SITE_CODES.values() or series not in AMAZON_SERIES:
+        raise HTTPException(status_code=422, detail="广告计划筛选条件无效")
+    try:
+        week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="广告计划周格式无效") from exc
+    review = str(payload.get("review") or "")[:20000]
+    plan = str(payload.get("plan") or "")[:20000]
+    with session_factory()() as db:
+        item = db.scalar(select(AmazonAdPlan).where(AmazonAdPlan.week_start == week_start, AmazonAdPlan.site_code == site_code, AmazonAdPlan.series == series))
+        if item is None:
+            item = AmazonAdPlan(week_start=week_start, site_code=site_code, series=series)
+            db.add(item)
+        item.review = review
+        item.plan = plan
+        item.updated_at = utcnow()
+        db.commit()
+    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan}
 
 
 @app.get("/api/amazon/dashboard")
@@ -1890,15 +2123,18 @@ async def amazon_stores(
         raw_stores = await lingxing_store_rows()
         stores = []
         for item in raw_stores:
+            country = str(item.get("country") or "未知站点")
             stores.append({
                 "sid": int(item.get("sid")) if item.get("sid") is not None else None,
                 "name": str(item.get("name") or item.get("account_name") or "未命名店铺"),
-                "country": str(item.get("country") or "未知站点"),
+                "country": country,
+                "site_code": AMAZON_SITE_CODES.get(country, ""),
                 "region": str(item.get("region") or ""),
                 "seller_id": str(item.get("seller_id") or ""),
                 "has_ads_setting": int(item.get("has_ads_setting") or 0),
                 "status": int(item.get("status") or 0),
             })
+        stores.sort(key=lambda item: (AMAZON_SITE_ORDER.index(item["country"]) if item["country"] in AMAZON_SITE_ORDER else len(AMAZON_SITE_ORDER), item["name"], str(item["sid"] or "")))
         return {"stores": stores, "count": len(stores)}
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}") from exc

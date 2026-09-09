@@ -1,149 +1,99 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from "vue"
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import zhCn from "element-plus/es/locale/lang/zh-cn"
+import WeekPicker from "./WeekPicker.vue"
 
-const props = defineProps({
-  apiBase: { type: String, default: "" },
-  startDate: { type: String, default: "" },
-  endDate: { type: String, default: "" },
-  sites: { type: Array, default: () => [] },
-})
-
-const rows = ref([])
-const loading = ref(false)
-const error = ref("")
-const expanded = ref(new Set())
-const saving = ref("")
-const noteDrafts = ref({})
-const columns = [
-  { key: "clicks", label: "点击量", width: 100 },
-  { key: "cpc", label: "CPC", width: 110, money: true },
-  { key: "ad_cost", label: "广告花费", width: 130, money: true },
-  { key: "ad_sales", label: "广告销售额", width: 135, money: true },
-  { key: "acos", label: "ACOS", width: 105, percent: true },
-  { key: "roas", label: "ROAS", width: 105 },
-  { key: "ad_cvr", label: "广告CVR", width: 115, percent: true },
-]
-const widths = ref(Object.fromEntries(columns.map((column) => [column.key, column.width])))
-const visible = ref(Object.fromEntries(columns.map((column) => [column.key, true])))
-const sort = ref({ key: "clicks", direction: "desc" })
-const configOpen = ref(false)
-const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr" }
-const columnOrder = ref(columns.map((column) => column.key))
+const props = defineProps({ apiBase: { type: String, default: "" } })
+const SITE_ORDER = ["美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
+const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
+const STRATEGIES = ["品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "/"]
+const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr", MXN: "MX$", PLN: "zł" }
+const rows = ref([]); const stores = ref([]); const seriesOptions = ref([...DEFAULT_SERIES])
+const loading = ref(false); const error = ref(""); const saving = ref(""); const toast = ref(""); const expanded = ref(new Set()); const noteDrafts = ref({}); const campaignDrafts = ref({})
+const strategySite = ref("美国"); const strategyStore = ref(""); const strategySeries = ref(""); const strategyWeekStart = ref("")
+const planSite = ref("美国"); const planSeries = ref(DEFAULT_SERIES[0]); const planWeekStart = ref(""); const planDraft = ref({ review: "", plan: "" }); const planLoading = ref(false); const planSaving = ref(false)
+const planReviewEditor = ref(null); const planPlanEditor = ref(null); const planEditorHeight = ref(172)
+const configOpen = ref(false); const configPosition = ref({ top: 0, left: 0 }); const configButton = ref(null)
+const columns = [{ key: "clicks", label: "点击量", width: 100 }, { key: "cpc", label: "CPC", width: 110, money: true }, { key: "ad_cost", label: "广告花费", width: 130, money: true }, { key: "ad_sales", label: "广告销售额", width: 135, money: true }, { key: "acos", label: "ACOS", width: 105, percent: true }, { key: "roas", label: "ROAS", width: 105 }, { key: "ad_cvr", label: "广告CVR", width: 115, percent: true }]
+const widths = ref(Object.fromEntries(columns.map((column) => [column.key, column.width]))); const visible = ref(Object.fromEntries(columns.map((column) => [column.key, true]))); const columnOrder = ref(columns.map((column) => column.key)); const sort = ref({ key: "clicks", direction: "desc" }); const draggingColumn = ref(""); const tableHeight = ref(null)
+let resizeCleanup = null; let toastTimer = null; let planResizeObserver = null
+const orderedSites = computed(() => [...new Set([...SITE_ORDER, ...stores.value.map((item) => item.country).filter(Boolean)])].sort((a, b) => (SITE_ORDER.indexOf(a) < 0 ? 999 : SITE_ORDER.indexOf(a)) - (SITE_ORDER.indexOf(b) < 0 ? 999 : SITE_ORDER.indexOf(b)) || a.localeCompare(b, "zh-CN")))
 const visibleColumns = computed(() => columnOrder.value.map((key) => columns.find((column) => column.key === key)).filter((column) => column && visible.value[column.key]))
-const tableHeight = ref(null)
+const availableStores = computed(() => stores.value.filter((item) => item.country === strategySite.value && item.status !== 0))
+function formatLocalDate(date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}` }
+function formatDotDate(value) { return String(value || "").replaceAll("-", ".") }
+const weekEnd = (start) => { const date = new Date(`${monday(start || previousWeekStart())}T00:00:00`); date.setDate(date.getDate() + 6); return formatLocalDate(date) }
+const strategyEndDate = computed(() => weekEnd(strategyWeekStart.value)); const planEndDate = computed(() => weekEnd(planWeekStart.value))
+function weekNumber(value) { const date = new Date(`${monday(value)}T00:00:00`); const thursday = new Date(date); thursday.setDate(date.getDate() + 3); const firstThursday = new Date(thursday.getFullYear(), 0, 4); const firstMonday = new Date(firstThursday); firstMonday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7)); return Math.floor((date - firstMonday) / 604800000) + 1 }
+const strategyWeekRangeLabel = computed(() => `${formatDotDate(strategyWeekStart.value)}~${formatDotDate(strategyEndDate.value)}`); const planWeekRangeLabel = computed(() => `${formatDotDate(planWeekStart.value)}~${formatDotDate(planEndDate.value)}`)
 const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })))
-
-function compare(left, right, direction) {
-  const a = Number(left)
-  const b = Number(right)
-  if (Number.isNaN(a) && Number.isNaN(b)) return 0
-  if (Number.isNaN(a)) return 1
-  if (Number.isNaN(b)) return -1
-  return direction === "asc" ? a - b : b - a
-}
-function display(value, column, currency) {
-  if (value == null) return "—"
-  if (column.percent) return `${(Number(value) * 100).toFixed(2)}%`
-  if (column.money) return `${currencySymbols[currency] || currency || ""} ${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`
-  return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })
-}
-function groupKey(row) { return `${row.site_code}:${row.strategy}` }
-function toggle(row) {
-  const key = groupKey(row)
-  const next = new Set(expanded.value)
-  next.has(key) ? next.delete(key) : next.add(key)
-  expanded.value = next
-}
-function cycleSort(column) {
-  if (sort.value.key !== column.key) sort.value = { key: column.key, direction: "desc" }
-  else sort.value.direction = sort.value.direction === "desc" ? "asc" : "desc"
-}
+function previousWeekStart() { const date = new Date(); date.setHours(0, 0, 0, 0); date.setDate(date.getDate() - ((date.getDay() + 6) % 7) - 7); return formatLocalDate(date) }
+function monday(value) { const date = new Date(`${value}T00:00:00`); if (Number.isNaN(date.getTime())) return previousWeekStart(); date.setDate(date.getDate() - ((date.getDay() + 6) % 7)); return formatLocalDate(date) }
+function compare(left, right, direction) { const a = Number(left); const b = Number(right); if (Number.isNaN(a) && Number.isNaN(b)) return 0; if (Number.isNaN(a)) return 1; if (Number.isNaN(b)) return -1; return direction === "asc" ? a - b : b - a }
+function display(value, column, currency) { if (value == null) return "—"; if (column.percent) return `${(Number(value) * 100).toFixed(2)}%`; if (column.money) return `${currencySymbols[currency] || currency || ""} ${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`; return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 }) }
+function displaySeries(value) { return ({ "TN10系列（主链接）汇总": "TN10（主）", "TN10系列（小链接）汇总": "TN10（小）", "TN20系列（主链接）汇总": "TN20（主）" }[value] || value || "未设置系列") }
+function groupKey(row) { return `${row.site_code}:${row.strategy}:${row.series || ""}:${row.product || ""}` }; function noteKey(row) { return `${strategyWeekStart.value}:${groupKey(row)}` }
+function toggle(row) { const next = new Set(expanded.value); const key = groupKey(row); next.has(key) ? next.delete(key) : next.add(key); expanded.value = next }
+function cycleSort(column) { sort.value = sort.value.key !== column.key ? { key: column.key, direction: "desc" } : { key: column.key, direction: sort.value.direction === "desc" ? "asc" : "desc" } }
 function toggleColumn(column) { visible.value[column.key] = !visible.value[column.key] }
-const draggingColumn = ref("")
 function startDrag(column) { draggingColumn.value = column.key }
-function dropColumn(column) {
-  if (!draggingColumn.value || draggingColumn.value === column.key) return
-  const sourceIndex = columnOrder.value.indexOf(draggingColumn.value)
-  const targetIndex = columnOrder.value.indexOf(column.key)
-  if (sourceIndex < 0 || targetIndex < 0) return
-  const [moved] = columnOrder.value.splice(sourceIndex, 1)
-  columnOrder.value.splice(targetIndex, 0, moved)
-  draggingColumn.value = ""
+function dropColumn(column) { if (!draggingColumn.value || draggingColumn.value === column.key) return; const source = columnOrder.value.indexOf(draggingColumn.value); const target = columnOrder.value.indexOf(column.key); if (source < 0 || target < 0) return; const [moved] = columnOrder.value.splice(source, 1); columnOrder.value.splice(target, 0, moved); draggingColumn.value = "" }
+function startResize(event, column) { event.preventDefault(); event.stopPropagation(); resizeCleanup?.(); const startX = event.clientX; const startWidth = widths.value[column.key]; const move = (moveEvent) => { widths.value[column.key] = Math.max(76, Math.min(320, Math.round(startWidth + moveEvent.clientX - startX))) }; const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); resizeCleanup = null }; resizeCleanup = stop; window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true }) }
+function startTableResize(event) { event.preventDefault(); event.stopPropagation(); resizeCleanup?.(); const wrap = event.currentTarget?.previousElementSibling; const startY = event.clientY; const startHeight = tableHeight.value || Math.max(280, wrap?.getBoundingClientRect().height || 520); const move = (moveEvent) => { tableHeight.value = Math.max(240, Math.min(window.innerHeight - 180, Math.round(startHeight + moveEvent.clientY - startY))) }; const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); resizeCleanup = null }; resizeCleanup = stop; window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true }) }
+function updateConfigPosition() { const rect = configButton.value?.getBoundingClientRect(); if (rect) configPosition.value = { top: rect.bottom + 8, left: Math.max(8, rect.right - 190) } }
+function toggleConfig() { configOpen.value = !configOpen.value; if (configOpen.value) requestAnimationFrame(updateConfigPosition) }
+function showToast(message) { toast.value = message; if (toastTimer) window.clearTimeout(toastTimer); toastTimer = window.setTimeout(() => { toast.value = ""; toastTimer = null }, 1600) }
+function fitNoteEditor(textarea) {
+  textarea.style.height = "auto"
+  const style = getComputedStyle(textarea)
+  const borders = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth)
+  textarea.style.height = `${Math.max(30, textarea.scrollHeight + borders)}px`
 }
-let resizeCleanup = null
-function startResize(event, column) {
-  event.preventDefault(); event.stopPropagation(); resizeCleanup?.()
-  const startX = event.clientX; const startWidth = widths.value[column.key]
-  const move = (moveEvent) => { widths.value[column.key] = Math.max(76, Math.min(300, Math.round(startWidth + moveEvent.clientX - startX))) }
-  const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); resizeCleanup = null }
-  resizeCleanup = stop; window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true })
-}
-function startTableResize(event) {
-  event.preventDefault(); event.stopPropagation(); resizeCleanup?.()
-  const wrap = event.currentTarget?.previousElementSibling
-  const startY = event.clientY
-  const startHeight = tableHeight.value || Math.max(280, wrap?.getBoundingClientRect().height || 520)
-  const move = (moveEvent) => { tableHeight.value = Math.max(220, Math.min(window.innerHeight - 180, Math.round(startHeight + moveEvent.clientY - startY))) }
-  const stop = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); document.body.classList.remove("resizing-amazon-table"); resizeCleanup = null }
-  resizeCleanup = stop; document.body.classList.add("resizing-amazon-table")
-  window.addEventListener("pointermove", move); window.addEventListener("pointerup", stop, { once: true })
-}
-function noteKey(row) { return groupKey(row) }
+function resizeNote(event) { fitNoteEditor(event.target) }
+function resizeAllNotes() { document.querySelectorAll(".strategy-note-cell textarea").forEach(fitNoteEditor) }
+async function copyCampaignId(campaign) { try { if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(String(campaign.campaign_id)); else { const input = document.createElement("textarea"); input.value = String(campaign.campaign_id); input.style.position = "fixed"; input.style.opacity = "0"; document.body.appendChild(input); input.select(); document.execCommand("copy"); input.remove() }; showToast(`Campaign ID ${campaign.campaign_id} 已复制`) } catch { showToast("复制失败，请检查浏览器剪贴板权限") } }
+function campaignKey(campaign) { return `${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}` }
+function campaignDraftFor(row, campaign) { return campaignDrafts.value[campaignKey(campaign)] || { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } }
+function setCampaignDraft(campaign, field, value) { const draft = campaignDrafts.value[campaignKey(campaign)]; if (draft) draft[field] = value || "" }
 function noteValue(row) { return noteDrafts.value[noteKey(row)] ?? row.note ?? "" }
-async function saveNote(row) {
-  const key = noteKey(row)
-  saving.value = `note:${key}`
-  try {
-    const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board/note`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ site_code: row.site_code, strategy: row.strategy, note: noteValue(row) }) })
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    row.note = noteValue(row)
-  } catch (e) { error.value = e.message || "备注保存失败" }
-  finally { saving.value = "" }
-}
-async function saveCampaign(row, campaign, strategy) {
-  saving.value = `campaign:${campaign.campaign_id}`
-  try {
-    const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board/campaign-strategy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ site_code: row.site_code, campaign_id: campaign.campaign_id, campaign_name: campaign.campaign_name, strategy }) })
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    await load()
-  } catch (e) { error.value = e.message || "策略保存失败" }
-  finally { saving.value = "" }
-}
-async function load() {
-  if (!props.apiBase || !props.startDate || !props.endDate || !props.sites.length) return
-  loading.value = true; error.value = ""
-  try {
-    const query = new URLSearchParams({ start_date: props.startDate, end_date: props.endDate })
-    props.sites.forEach((site) => query.append("site", site))
-    const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board?${query}`)
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
-    rows.value = data.strategies || []
-    const nextDrafts = {}
-    rows.value.forEach((row) => { nextDrafts[noteKey(row)] = row.note || "" })
-    noteDrafts.value = nextDrafts
-  } catch (e) { error.value = e.message || "广告策略看板加载失败" }
-  finally { loading.value = false }
-}
-watch(() => [props.apiBase, props.startDate, props.endDate, props.sites.join(",")], load, { immediate: true })
-onBeforeUnmount(() => resizeCleanup?.())
+async function saveNote(row) { saving.value = `note:${noteKey(row)}`; try { const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board/note`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ week_start: strategyWeekStart.value, site_code: row.site_code, series: row.series || "", strategy: row.strategy, note: noteValue(row) }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); row.note = noteValue(row); showToast("优化方向已保存") } catch (e) { error.value = e.message || "备注保存失败" } finally { saving.value = "" } }
+async function saveCampaign(row, campaign) { const draft = campaignDraftFor(row, campaign); saving.value = `campaign:${campaignKey(campaign)}`; try { const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board/campaign-strategy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ site_code: campaign.site_code, store_sid: campaign.store_sid, store_name: campaign.store_name, campaign_id: campaign.campaign_id, campaign_name: campaign.campaign_name, strategy: draft.strategy, series: draft.series, product: "" }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); showToast("广告活动归类已保存到云端"); await load() } catch (e) { error.value = e.message || "广告活动归类保存失败" } finally { saving.value = "" } }
+async function loadStores() { try { const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/stores`); const data = await response.json(); stores.value = data.stores || [] } catch {} }
+async function load() { if (!props.apiBase || !strategyWeekStart.value) return; loading.value = true; error.value = ""; try { const query = new URLSearchParams({ start_date: strategyWeekStart.value, end_date: strategyEndDate.value, site: strategySite.value }); if (strategyStore.value) query.append("store_sid", strategyStore.value); if (strategySeries.value) query.append("series", strategySeries.value); const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board?${query}`); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); rows.value = data.strategies || []; seriesOptions.value = data.series_options || DEFAULT_SERIES; const nextDrafts = {}; const nextCampaignDrafts = {}; rows.value.forEach((row) => { nextDrafts[noteKey(row)] = row.note || ""; (row.campaigns || []).forEach((campaign) => { nextCampaignDrafts[campaignKey(campaign)] = { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } }) }); noteDrafts.value = nextDrafts; campaignDrafts.value = nextCampaignDrafts } catch (e) { error.value = e.message || "广告策略看板加载失败" } finally { loading.value = false; await nextTick(); resizeAllNotes() } }
+async function loadPlan() { if (!props.apiBase || !planWeekStart.value || !planSite.value || !planSeries.value) return; planLoading.value = true; try { const query = new URLSearchParams({ week_start: planWeekStart.value, site: planSite.value, series: planSeries.value }); const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/ad-plan?${query}`); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); planDraft.value = { review: data.review || "", plan: data.plan || "" } } catch (e) { error.value = e.message || "广告计划加载失败" } finally { planLoading.value = false } }
+async function savePlan() { planSaving.value = true; try { const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/ad-plan`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ week_start: planWeekStart.value, site: planSite.value, series: planSeries.value, ...planDraft.value }) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); showToast("广告计划已保存到云端") } catch (e) { error.value = e.message || "广告计划保存失败" } finally { planSaving.value = false } }
+function onStrategySiteChange() { if (!availableStores.value.some((item) => String(item.sid) === strategyStore.value)) strategyStore.value = ""; load() }
+function onWeekChange() { strategyWeekStart.value = monday(strategyWeekStart.value); load() }
+function onPlanWeekChange() { planWeekStart.value = monday(planWeekStart.value); loadPlan() }
+watch(() => [props.apiBase, strategyWeekStart.value, strategySite.value, strategyStore.value, strategySeries.value], load)
+watch(() => [props.apiBase, planWeekStart.value, planSite.value, planSeries.value], loadPlan)
+onMounted(async () => {
+  strategyWeekStart.value = previousWeekStart()
+  planWeekStart.value = strategyWeekStart.value
+  window.addEventListener("scroll", updateConfigPosition, true)
+  window.addEventListener("resize", updateConfigPosition)
+  await nextTick()
+  if (typeof ResizeObserver !== "undefined") {
+    planResizeObserver = new ResizeObserver((entries) => {
+      const changed = entries.find((entry) => Math.abs(entry.target.getBoundingClientRect().height - planEditorHeight.value) > 1)
+      if (changed) planEditorHeight.value = Math.max(150, Math.round(changed.target.getBoundingClientRect().height))
+    })
+    ;[planReviewEditor.value, planPlanEditor.value].filter(Boolean).forEach((editor) => planResizeObserver.observe(editor, { box: "border-box" }))
+  }
+  await loadStores()
+  await Promise.all([load(), loadPlan()])
+})
+onBeforeUnmount(() => { resizeCleanup?.(); planResizeObserver?.disconnect(); window.removeEventListener("scroll", updateConfigPosition, true); window.removeEventListener("resize", updateConfigPosition); if (toastTimer) window.clearTimeout(toastTimer) })
 </script>
 
 <template>
-  <section class="strategy-board-panel">
-    <div class="strategy-board-head">
-      <div><span class="section-label">广告后台数据</span><h2>广告策略看板</h2><p>按策略汇总广告活动；仅展示统计期间点击量大于 0 的活动。</p></div>
-      <div class="strategy-board-actions"><button class="strategy-config-button" type="button" @click="configOpen = !configOpen">列配置</button><button class="strategy-refresh-button" type="button" :disabled="loading" @click="load">刷新</button><div v-if="configOpen" class="strategy-config-panel"><button v-for="column in columns" :key="column.key" type="button" @click="toggleColumn(column)"><span>{{ column.label }}</span><span>{{ visible[column.key] ? "◉" : "○" }}</span></button></div></div>
-    </div>
-    <div v-if="error" class="strategy-board-error">{{ error }}</div>
-    <div v-else-if="loading" class="strategy-board-loading">正在同步广告后台数据…</div>
-    <div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined">
-      <table class="strategy-table"><thead><tr><th class="strategy-name-column">策略</th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)" :style="{ width: `${widths[column.key]}px` }"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)" :aria-label="`${column.label}排序`">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column">优化方向</th></tr></thead>
-        <tbody><template v-for="row in groups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ row.site }} · {{ row.campaigns.length }} 个活动</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(row.metrics?.[column.key], column, row.currency) }}</td><td class="strategy-note-cell"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…"></textarea><button type="button" class="strategy-note-save" :disabled="saving === `note:${noteKey(row)}`" @click="saveNote(row)">保存</button></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${groupKey(row)}:${campaign.campaign_id}`" class="strategy-campaign-row"><td class="strategy-name-column"><el-select :model-value="row.strategy" size="small" @change="saveCampaign(row, campaign, $event)"><el-option v-for="option in ['品类词', '品牌防御', '竞品词', '自动', 'SB/SBV', 'SD', 'B2B', '/']" :key="option" :label="option" :value="option" /></el-select><span class="campaign-name" :title="campaign.campaign_id">{{ campaign.campaign_name }}</span></td><td v-for="column in visibleColumns" :key="column.key">{{ display(campaign[column.key], column, campaign.currency) }}</td><td></td></tr></template></template></tbody>
-      </table>
-    </div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
-  </section>
+  <el-config-provider :locale="zhCn"><section class="strategy-board-panel">
+    <div class="strategy-board-head"><div><span class="section-label">广告后台数据</span><h2>广告策略看板</h2><p>按周、站点、店铺和系列筛选；展开后可给每条广告活动设置策略和系列。</p></div><div class="strategy-board-actions"><button ref="configButton" class="strategy-config-button" type="button" @click="toggleConfig">列配置</button><button class="strategy-refresh-button" type="button" :disabled="loading" @click="load">刷新</button></div></div>
+    <div class="strategy-filter-bar"><label class="week-filter"><span>周 <b class="week-filter-code">{{ strategyWeekRangeLabel }}</b></span><div class="week-picker-control"><WeekPicker v-model="strategyWeekStart" @change="onWeekChange"/></div></label><label><span>站点</span><el-select v-model="strategySite" @change="onStrategySiteChange"><el-option v-for="item in orderedSites" :key="item" :label="item" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>店铺（可不选）</span><el-select v-model="strategyStore" clearable placeholder="全部店铺"><el-option v-for="item in availableStores" :key="item.sid" :label="`${item.name}（${item.sid}）`" :value="String(item.sid)" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>系列</span><el-select v-model="strategySeries" clearable placeholder="全部系列"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label></div>
+    <Teleport to="body"><div v-if="configOpen" class="strategy-config-panel strategy-config-panel-floating" role="dialog" aria-label="广告策略列配置" :style="{ top: `${configPosition.top}px`, left: `${configPosition.left}px` }"><button v-for="column in columns" :key="column.key" type="button" @click="toggleColumn(column)"><span>{{ column.label }}</span><span>{{ visible[column.key] ? "◉" : "○" }}</span></button></div></Teleport>
+    <div v-if="error" class="strategy-board-error">{{ error }}</div><div v-else-if="loading" class="strategy-board-loading">正在同步广告后台数据…</div><div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="strategy-table"><thead><tr><th class="strategy-name-column">策略 / 系列</th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)" :style="{ width: `${widths[column.key]}px` }"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column">优化方向</th></tr></thead><tbody><template v-for="row in groups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ row.series ? displaySeries(row.series) : "未设置系列" }} · {{ row.site }} · {{ row.campaigns.length }} 个活动</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(row.metrics?.[column.key], column, row.currency) }}</td><td class="strategy-note-cell"><div class="strategy-note-editor"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…" @input="resizeNote"></textarea><button type="button" class="strategy-note-save" :disabled="saving === `note:${noteKey(row)}`" @click="saveNote(row)">保存</button></div></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}`" class="strategy-campaign-row"><td class="strategy-name-column campaign-assignment-cell"><div class="campaign-selectors"><el-select :model-value="campaignDraftFor(row, campaign).strategy" size="small" @change="setCampaignDraft(campaign, 'strategy', $event)"><el-option v-for="option in STRATEGIES" :key="option" :label="option" :value="option" /></el-select><el-select :model-value="campaignDraftFor(row, campaign).series" size="small" clearable placeholder="系列" @change="setCampaignDraft(campaign, 'series', $event)"><el-option v-for="option in seriesOptions" :key="option" :label="displaySeries(option)" :value="option" /></el-select><button type="button" class="campaign-save-button" :disabled="saving === `campaign:${campaignKey(campaign)}`" @click="saveCampaign(row, campaign)">保存</button></div><button type="button" class="campaign-name" :title="`Campaign ID：${campaign.campaign_id}，点击复制`" @click="copyCampaignId(campaign)">{{ campaign.campaign_name || `未命名广告活动 · ${campaign.campaign_id}` }}</button><small class="campaign-meta">{{ campaign.store_name || (campaign.store_sid ? `店铺 ${campaign.store_sid}` : "店铺信息缺失") }} · {{ campaign.ad_type || "广告活动" }} · ID {{ campaign.campaign_id }}</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(campaign[column.key], column, campaign.currency) }}</td><td></td></tr></template></template></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
+    <div class="ad-plan-panel"><div class="ad-plan-head"><div><span class="section-label">共享编辑</span><h2>广告计划</h2><p>计划内容按周、站点和系列保存，所有用户共享同一份云端内容。</p></div><button class="strategy-note-save" type="button" :disabled="planSaving || planLoading" @click="savePlan">{{ planSaving ? "保存中" : "保存到云端" }}</button></div><div class="ad-plan-filters"><label class="week-filter"><span>周 <b class="week-filter-code">{{ planWeekRangeLabel }}</b></span><div class="week-picker-control"><WeekPicker v-model="planWeekStart" @change="onPlanWeekChange"/></div></label><label><span>站点</span><el-select v-model="planSite"><el-option v-for="item in orderedSites" :key="item" :label="item" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>系列</span><el-select v-model="planSeries"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label></div><div class="ad-plan-grid"><label><span>上周复盘</span><textarea ref="planReviewEditor" v-model="planDraft.review" :style="{ height: `${planEditorHeight}px` }" :disabled="planLoading" placeholder="填写上周复盘…"></textarea></label><label><span>本周计划</span><textarea ref="planPlanEditor" v-model="planDraft.plan" :style="{ height: `${planEditorHeight}px` }" :disabled="planLoading" placeholder="填写本周计划…"></textarea></label></div></div>
+    <div v-if="toast" class="amazon-copy-toast" role="status" aria-live="polite">{{ toast }}</div>
+  </section></el-config-provider>
 </template>

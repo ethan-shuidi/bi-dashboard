@@ -15,7 +15,8 @@
     { "path": "/api/amazon/date-context", "methods": ["GET"] },
     { "path": "/api/amazon/strategy-board", "methods": ["GET"] },
     { "path": "/api/amazon/strategy-board/campaign-strategy", "methods": ["POST"] },
-    { "path": "/api/amazon/strategy-board/note", "methods": ["POST"] }
+    { "path": "/api/amazon/strategy-board/note", "methods": ["POST"] },
+    { "path": "/api/amazon/ad-plan", "methods": ["GET", "POST"] }
   ],
   "resources": {
     "cpu": "500m",
