@@ -1763,7 +1763,7 @@ def save_campaign_strategy(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key, allow_public=False)
+    require_business_access(x_sync_key, allow_public=True)
     site_code = str(payload.get("site_code") or "").strip().upper()
     campaign_id = str(payload.get("campaign_id") or "").strip()
     strategy = normalize_strategy(payload.get("strategy"))
@@ -1787,7 +1787,7 @@ def save_strategy_note(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key, allow_public=False)
+    require_business_access(x_sync_key, allow_public=True)
     site_code = str(payload.get("site_code") or "").strip().upper()
     strategy = normalize_strategy(payload.get("strategy"))
     note = str(payload.get("note") or "")
