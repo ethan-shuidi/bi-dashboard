@@ -6,6 +6,7 @@ import os
 import re
 import base64
 import hashlib
+import hmac
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
@@ -64,9 +65,15 @@ app.add_middleware(
 
 def require_business_access(
     x_sync_key: str | None,
+    *,
+    allow_public: bool = True,
 ) -> None:
-    """Company-internal deployment: business APIs do not require a key."""
-    return None
+    """Allow public read-only access while protecting state-changing APIs."""
+    if allow_public:
+        return None
+    expected = os.environ.get("SYNC_API_KEY")
+    if not expected or not x_sync_key or not hmac.compare_digest(x_sync_key, expected):
+        raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
 
 Base = declarative_base()
 _engine = None
@@ -76,8 +83,11 @@ _lingxing_token_lock = asyncio.Lock()
 _lingxing_performance_lock = asyncio.Lock()
 _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
+_lingxing_ad_report_last_call = 0.0
+_lingxing_store_lock = asyncio.Lock()
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
 AMAZON_CACHE_TTL_SECONDS = 600
+LINGXING_STORE_CACHE_TTL_SECONDS = 900
 AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
     "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
@@ -375,8 +385,31 @@ def amazon_series(product: str | None) -> str | None:
 
 
 async def lingxing_store_rows() -> list[dict[str, Any]]:
-    body = await lingxing_get("/erp/sc/data/seller/lists")
-    return list(body.get("data") or [])
+    cache_key = ("lingxing-stores",)
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
+        return list(cached[1])
+    async with _lingxing_store_lock:
+        cached = _amazon_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
+            return list(cached[1])
+        last_error: RuntimeError | None = None
+        for attempt in range(5):
+            try:
+                body = await lingxing_get("/erp/sc/data/seller/lists")
+                rows = lingxing_rows(body)
+                _amazon_cache[cache_key] = (time.monotonic(), rows)
+                return rows
+            except RuntimeError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "频繁" not in str(exc) and "too frequent" not in message:
+                    raise
+                if attempt < 4:
+                    await asyncio.sleep(2 ** attempt)
+        if last_error:
+            raise last_error
+        return []
 
 
 def amazon_sid_accounts(
@@ -461,7 +494,14 @@ async def fetch_ad_report(
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
+    global _lingxing_ad_report_last_call
     async with semaphore:
+        # LingXing advertising endpoints use a one-token bucket. Keep a
+        # minimum spacing between requests even when several dashboard
+        # periods are being loaded back-to-back.
+        wait_for = 1.2 - (time.monotonic() - _lingxing_ad_report_last_call)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
         body = await lingxing_post(
             "/pb/openapi/newad/spProductAdReports",
             {
@@ -473,6 +513,7 @@ async def fetch_ad_report(
             },
             client=client,
         )
+        _lingxing_ad_report_last_call = time.monotonic()
     data = body.get("data") or []
     rows = data if isinstance(data, list) else (
         data.get("list") or data.get("rows") or data.get("data") or []
@@ -498,10 +539,18 @@ async def fetch_ad_reports_range(
             try:
                 daily = await fetch_ad_report(sid, cursor, client, semaphore)
             except RuntimeError as exc:
-                if "频繁" in str(exc) or "too frequent" in str(exc).lower():
-                    await asyncio.sleep(2)
-                    daily = await fetch_ad_report(sid, cursor, client, semaphore)
-                else:
+                if "频繁" not in str(exc) and "too frequent" not in str(exc).lower():
+                    raise
+                daily = None
+                for attempt in range(5):
+                    await asyncio.sleep(2 ** attempt)
+                    try:
+                        daily = await fetch_ad_report(sid, cursor, client, semaphore)
+                        break
+                    except RuntimeError as retry_exc:
+                        if "频繁" not in str(retry_exc) and "too frequent" not in str(retry_exc).lower():
+                            raise
+                if daily is None:
                     raise
         for row in daily:
             if isinstance(row, dict):
@@ -1617,7 +1666,7 @@ async def amazon_strategy_board_payload(
 
     assignments: dict[tuple[str, str], str] = {}
     notes: dict[tuple[str, str], str] = {}
-    with session_factory() as db:
+    with session_factory()() as db:
         for item in db.scalars(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
             assignments[(item.site_code, item.campaign_id)] = normalize_strategy(item.strategy)
         for item in db.scalars(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
@@ -1685,7 +1734,7 @@ async def amazon_strategy_board(
     refresh: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=True)
     start_date, end_date = strategy_date_range(start_date, end_date)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
@@ -1699,8 +1748,14 @@ async def amazon_strategy_board(
         return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, refresh)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"广告报表请求失败：HTTP {exc.response.status_code}") from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        if "频繁" in message or "too frequent" in message.lower():
+            raise HTTPException(status_code=429, detail="领星广告接口限流，请稍后重试") from exc
+        raise HTTPException(status_code=502, detail=f"广告策略数据获取失败：{message}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="广告策略数据获取失败") from exc
+        print(f"strategy-board error: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"广告策略数据获取失败：{type(exc).__name__}") from exc
 
 
 @app.post("/api/amazon/strategy-board/campaign-strategy")
@@ -1708,13 +1763,13 @@ def save_campaign_strategy(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=False)
     site_code = str(payload.get("site_code") or "").strip().upper()
     campaign_id = str(payload.get("campaign_id") or "").strip()
     strategy = normalize_strategy(payload.get("strategy"))
     if site_code not in AMAZON_SITE_CODES.values() or not campaign_id or strategy not in AMAZON_STRATEGY_OPTIONS:
         raise HTTPException(status_code=422, detail="广告活动策略参数无效")
-    with session_factory() as db:
+    with session_factory()() as db:
         item = db.scalar(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code == site_code, AmazonCampaignStrategy.campaign_id == campaign_id))
         if item is None:
             item = AmazonCampaignStrategy(site_code=site_code, campaign_id=campaign_id)
@@ -1732,13 +1787,13 @@ def save_strategy_note(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=False)
     site_code = str(payload.get("site_code") or "").strip().upper()
     strategy = normalize_strategy(payload.get("strategy"))
     note = str(payload.get("note") or "")
     if site_code not in AMAZON_SITE_CODES.values() or strategy not in AMAZON_STRATEGY_OPTIONS:
         raise HTTPException(status_code=422, detail="策略备注参数无效")
-    with session_factory() as db:
+    with session_factory()() as db:
         item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.strategy == strategy))
         if item is None:
             item = AmazonStrategyNote(site_code=site_code, strategy=strategy)
@@ -1763,7 +1818,7 @@ async def amazon_dashboard(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=True)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
     if not selected_sites:
         selected_sites = list(AMAZON_SITE_CODES)
@@ -1827,7 +1882,7 @@ async def amazon_dashboard(
 async def amazon_stores(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=True)
     """Return read-only Amazon stores without exposing credentials."""
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
@@ -1857,7 +1912,7 @@ async def amazon_date_context(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return the current calendar date for the selected marketplace site."""
-    require_business_access(x_sync_key)
+    require_business_access(x_sync_key, allow_public=True)
     selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
     if not selected_sites:
         raise HTTPException(status_code=422, detail="不支持的 Amazon 站点")
@@ -1878,6 +1933,7 @@ async def sync(
     trigger: str = Query(default="button", pattern="^(button|dashboard)$"),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
+    require_business_access(x_sync_key, allow_public=False)
     try:
         return await run_sync(trigger)
     except RuntimeError as exc:
@@ -1898,7 +1954,7 @@ async def dashboard(
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     try:
-        require_business_access(x_sync_key)
+        require_business_access(x_sync_key, allow_public=True)
         if (start_date is None) != (end_date is None):
             raise HTTPException(status_code=422, detail="自定义日期需要同时提供开始日期和结束日期")
         if start_date is not None and end_date is not None:
