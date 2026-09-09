@@ -1,5 +1,6 @@
 export function dashboardHeaders() {
-  return {}
+  const key = String(import.meta.env.VITE_DASHBOARD_API_KEY || "").trim()
+  return key ? { "X-Sync-Key": key } : {}
 }
 
 export function clearDashboardKey() {
