@@ -504,14 +504,49 @@ def amazon_sid_accounts(
     return unique
 
 
+def _normalized_field_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _nested_field_value(value: Any, wanted: set[str]) -> Any:
+    """Find a scalar field in LingXing's occasionally nested response objects."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if _normalized_field_name(key) in wanted and nested not in (None, "", [], {}):
+                if not isinstance(nested, (dict, list, tuple, set)):
+                    return nested
+                found = _nested_field_value(nested, wanted)
+                if found not in (None, ""):
+                    return found
+        for nested in value.values():
+            found = _nested_field_value(nested, wanted)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, (list, tuple, set)):
+        for nested in value:
+            found = _nested_field_value(nested, wanted)
+            if found not in (None, ""):
+                return found
+    return None
+
+
 def optional_value(row: dict[str, Any], *names: str) -> float | None:
-    """Read a metric only when the upstream response actually contains it."""
+    """Read a metric from top-level or nested LingXing response fields."""
     for name in names:
-        if name in row and row.get(name) is not None and row.get(name) != "":
+        value = _nested_field_value(row, {_normalized_field_name(name)})
+        if value not in (None, ""):
             try:
-                return float(row.get(name) or 0)
+                return float(value or 0)
             except (TypeError, ValueError):
                 return None
+    return None
+
+
+def _first_nested_field_value(value: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        found = _nested_field_value(value, {_normalized_field_name(name)})
+        if found not in (None, ""):
+            return found
     return None
 
 
@@ -685,11 +720,8 @@ def ad_report_type(row: dict[str, Any]) -> str:
 
 
 def ad_report_campaign_name(row: dict[str, Any]) -> str:
-    for key in ("name", "campaign_name", "campaignName", "campaign"):
-        value = row.get(key)
-        if value not in (None, "") and not isinstance(value, (dict, list)):
-            return str(value).strip()
-    return ""
+    value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
+    return str(value).strip() if value not in (None, "") else ""
 
 
 def ad_report_number(row: dict[str, Any], *names: str) -> float:
@@ -725,11 +757,8 @@ def strategy_campaign_id(row: dict[str, Any]) -> str:
 
 
 def strategy_campaign_name(row: dict[str, Any]) -> str:
-    for key in ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "name", "campaign", "ads_name", "adsName", "ad_name"):
-        value = row.get(key)
-        if value not in (None, "") and not isinstance(value, (dict, list)):
-            return str(value).strip()
-    return "未命名广告活动"
+    value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
+    return str(value).strip() if value not in (None, "") else "未命名广告活动"
 
 
 def strategy_site_code(value: str) -> str:
@@ -1456,12 +1485,12 @@ AMAZON_SOURCE_FIELDS = {
         "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
         "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
         "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
-        "impressions": ("impressions",),
-        "clicks": ("clicks",),
+        "impressions": ("impressions", "ad_impressions", "adImpressions", "total_ad_impressions", "totalAdImpressions"),
+        "clicks": ("clicks", "ad_clicks", "adClicks", "ads_clicks", "adsClicks", "total_ad_clicks", "totalAdClicks", "ad_click_quantity", "adClickQuantity"),
         "ad_sales": ("ad_sales_amount", "ads_sales_amount", "adSalesAmount"),
         "ad_cost": ("spend", "ad_cost", "advertising_spend"),
         "ad_units": ("ads_sales_volume_quantity", "ad_sales_volume_quantity", "adUnits"),
-        "ad_orders": ("ad_order_quantity", "ad_orders", "adOrders"),
+        "ad_orders": ("ad_order_quantity", "ad_orders", "adOrders", "ads_orders", "adsOrders", "ad_order_num", "adOrderNum", "ad_order_quantity_total", "adOrderQuantityTotal"),
     },
 }
 AMAZON_SOURCE_RATIOS = {
@@ -1474,35 +1503,35 @@ AMAZON_METRIC_SOURCES = {
 
 AMAZON_AD_BREAKDOWN_FIELDS = {
     "sp": {
-        "impressions": ("ad_impressions_sp", "adImpressionsSp", "impressions_sp"),
-        "clicks": ("ad_clicks_sp", "adClicksSp", "clicks_sp"),
+        "impressions": ("ad_impressions_sp", "adImpressionsSp", "impressions_sp", "sp_impressions", "spImpressions"),
+        "clicks": ("ad_clicks_sp", "adClicksSp", "clicks_sp", "sp_clicks", "spClicks"),
         "ad_cost": ("ads_sp_cost", "adSpendSp", "spend_sp"),
         "ad_units": ("ads_sp_sales_volume_quantity", "adSalesVolumeQuantitySp", "ad_units_sp"),
-        "ad_orders": ("ad_order_quantity_sp", "adOrderQuantitySp", "ad_orders_sp"),
+        "ad_orders": ("ad_order_quantity_sp", "adOrderQuantitySp", "ad_orders_sp", "sp_orders", "spOrders", "ad_order_num_sp", "adOrderNumSp"),
         "ad_sales": ("ads_sp_sales", "adsSpSales", "ad_sales_sp"),
     },
     "sb": {
-        "impressions": ("shared_ad_impressions_sb", "sharedAdImpressionsSb", "ad_impressions_sb"),
-        "clicks": ("shared_ad_clicks_sb", "sharedAdClicksSb", "ad_clicks_sb"),
+        "impressions": ("shared_ad_impressions_sb", "sharedAdImpressionsSb", "ad_impressions_sb", "sb_impressions", "sbImpressions"),
+        "clicks": ("shared_ad_clicks_sb", "sharedAdClicksSb", "ad_clicks_sb", "sb_clicks", "sbClicks"),
         "ad_cost": ("shared_ads_sb_cost", "sharedAdsSbCost", "ad_spend_sb"),
         "ad_units": ("shared_ads_sb_sales_volume_quantity", "sharedAdsSbSalesVolumeQuantity", "ad_units_sb"),
-        "ad_orders": ("shared_ad_order_quantity_sb", "sharedAdOrderQuantitySb", "ad_orders_sb"),
+        "ad_orders": ("shared_ad_order_quantity_sb", "sharedAdOrderQuantitySb", "ad_orders_sb", "sb_orders", "sbOrders", "ad_order_num_sb", "adOrderNumSb"),
         "ad_sales": ("shared_ads_sb_sales", "sharedAdsSbSales", "ad_sales_sb"),
     },
     "sbv": {
-        "impressions": ("shared_ad_impressions_sbv", "sharedAdImpressionsSbv", "ad_impressions_sbv"),
-        "clicks": ("shared_ad_clicks_sbv", "sharedAdClicksSbv", "ad_clicks_sbv"),
+        "impressions": ("shared_ad_impressions_sbv", "sharedAdImpressionsSbv", "ad_impressions_sbv", "sbv_impressions", "sbvImpressions"),
+        "clicks": ("shared_ad_clicks_sbv", "sharedAdClicksSbv", "ad_clicks_sbv", "sbv_clicks", "sbvClicks"),
         "ad_cost": ("shared_ads_sbv_cost", "sharedAdsSbvCost", "ad_spend_sbv"),
         "ad_units": ("shared_ads_sbv_sales_volume_quantity", "sharedAdsSbvSalesVolumeQuantity", "ad_units_sbv"),
-        "ad_orders": ("shared_ad_order_quantity_sbv", "sharedAdOrderQuantitySbv", "ad_orders_sbv"),
+        "ad_orders": ("shared_ad_order_quantity_sbv", "sharedAdOrderQuantitySbv", "ad_orders_sbv", "sbv_orders", "sbvOrders", "ad_order_num_sbv", "adOrderNumSbv"),
         "ad_sales": ("shared_ads_sbv_sales", "sharedAdsSbvSales", "ad_sales_sbv"),
     },
     "sd": {
-        "impressions": ("ad_impressions_sd", "adImpressionsSd", "impressions_sd"),
-        "clicks": ("ad_clicks_sd", "adClicksSd", "clicks_sd"),
+        "impressions": ("ad_impressions_sd", "adImpressionsSd", "impressions_sd", "sd_impressions", "sdImpressions"),
+        "clicks": ("ad_clicks_sd", "adClicksSd", "clicks_sd", "sd_clicks", "sdClicks"),
         "ad_cost": ("ads_sd_cost", "adSpendSd", "spend_sd"),
         "ad_units": ("ads_sd_sales_volume_quantity", "adSalesVolumeQuantitySd", "ad_units_sd"),
-        "ad_orders": ("ad_order_quantity_sd", "adOrderQuantitySd", "ad_orders_sd"),
+        "ad_orders": ("ad_order_quantity_sd", "adOrderQuantitySd", "ad_orders_sd", "sd_orders", "sdOrders", "ad_order_num_sd", "adOrderNumSd"),
         "ad_sales": ("ads_sd_sales", "adsSdSales", "ad_sales_sd"),
     },
 }
@@ -1535,9 +1564,10 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
         total = 0.0
         for fields in AMAZON_AD_BREAKDOWN_FIELDS.values():
             names = fields[metric]
-            if any(name in raw and raw.get(name) not in (None, "") for name in names):
+            value = optional_metric(raw, *names)
+            if value is not None:
                 present = True
-            total += optional_metric(raw, *names) or 0.0
+                total += value
         if present:
             totals[metric] = total
     return totals
@@ -1687,7 +1717,8 @@ async def amazon_dashboard_periodic(
                     item[field] = value
             for ad_type, metrics in breakdown.items():
                 for metric, value in metrics.items():
-                    item["ad_breakdown"][ad_type][metric] += value
+                    if value is not None:
+                        item["ad_breakdown"][ad_type][metric] += value
 
     rows: list[dict[str, Any]] = []
     for (period_label, site_name, group, product), item in aggregate.items():
