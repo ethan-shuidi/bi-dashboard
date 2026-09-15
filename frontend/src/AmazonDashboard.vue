@@ -151,7 +151,10 @@ function breakdownTotal(item, columnKey) {
   const metricKey = adBreakdownMetricMap[columnKey]
   const values = adBreakdownTypes.map(({ key }) => item.ad_breakdown?.[key]?.[metricKey])
   if (!values.some((value) => value !== undefined && value !== null)) return null
-  return values.reduce((sum, value) => sum + Number(value || 0), 0)
+  const typedTotal = values.reduce((sum, value) => sum + Number(value || 0), 0)
+  const genericTotal = item?.[columnKey]
+  if (typedTotal === 0 && Number(genericTotal || 0) !== 0) return null
+  return typedTotal
 }
 
 function metricValue(item, columnKey) {

@@ -18,11 +18,23 @@ from app import (
     amazon_series,
     amazon_sid_accounts,
     optional_metric,
+    strategy_campaign_name,
     require_business_access,
 )
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
+    def test_campaign_name_reads_nested_campaign_objects(self):
+        self.assertEqual(
+            strategy_campaign_name({"campaign": {"details": {"campaignTitle": "真实活动名称"}}}),
+            "真实活动名称",
+        )
+
+    def test_zero_typed_breakdown_does_not_replace_generic_totals(self):
+        raw = {"clicks": 4227, "ad_order_quantity": 200}
+        totals = product_performance_ad_totals(raw)
+        self.assertNotIn("clicks", totals)
+        self.assertNotIn("ad_orders", totals)
     def test_business_access_does_not_require_key_for_internal_app(self):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))

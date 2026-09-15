@@ -550,6 +550,36 @@ def _first_nested_field_value(value: Any, names: tuple[str, ...]) -> Any:
     return None
 
 
+def _campaign_name_from_nested(value: Any) -> Any:
+    """Find a human campaign name in versioned/nested LingXing ad rows."""
+    exact_names = {_normalized_field_name(name) for name in (
+        "campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn",
+        "campaign_name_en", "campaignNameEn", "campaign_title", "campaignTitle",
+        "ads_name", "adsName", "ads_campaign_name", "adsCampaignName",
+        "ad_name", "adName", "display_name", "displayName", "title", "label",
+    )}
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized = _normalized_field_name(key)
+            if any(token in normalized for token in ("campaign", "advert", "ads")):
+                found = _campaign_name_from_nested(nested)
+                if found not in (None, "") and not isinstance(found, (dict, list, tuple, set)):
+                    return found
+        for key, nested in value.items():
+            if _normalized_field_name(key) in exact_names and nested not in (None, "") and not isinstance(nested, (dict, list, tuple, set)):
+                return nested
+        for nested in value.values():
+            found = _campaign_name_from_nested(nested)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, (list, tuple, set)):
+        for nested in value:
+            found = _campaign_name_from_nested(nested)
+            if found not in (None, ""):
+                return found
+    return None
+
+
 def lingxing_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
     data = body.get("data") or []
     if isinstance(data, list):
@@ -720,7 +750,9 @@ def ad_report_type(row: dict[str, Any]) -> str:
 
 
 def ad_report_campaign_name(row: dict[str, Any]) -> str:
-    value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
+    value = _campaign_name_from_nested(row)
+    if value in (None, ""):
+        value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
     return str(value).strip() if value not in (None, "") else ""
 
 
@@ -757,7 +789,9 @@ def strategy_campaign_id(row: dict[str, Any]) -> str:
 
 
 def strategy_campaign_name(row: dict[str, Any]) -> str:
-    value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
+    value = _campaign_name_from_nested(row)
+    if value in (None, ""):
+        value = _first_nested_field_value(row, ("campaign_name", "campaignName", "campaign_name_cn", "campaignNameCn", "ads_name", "adsName", "ad_name", "name", "campaign"))
     return str(value).strip() if value not in (None, "") else "未命名广告活动"
 
 
@@ -1707,7 +1741,7 @@ async def amazon_dashboard_periodic(
             breakdown_totals = product_performance_ad_totals(raw)
             for field, names in fields.items():
                 value = optional_metric(raw, *names)
-                if field in breakdown_totals:
+                if field in breakdown_totals and (breakdown_totals[field] != 0 or value in (None, 0)):
                     value = breakdown_totals[field]
                 if value is not None:
                     item[field] = (item.get(field) or 0) + value
@@ -1855,12 +1889,15 @@ async def amazon_strategy_board_payload(
         for raw in raw_rows:
             campaign_id = strategy_campaign_id(raw)
             campaign_name = strategy_campaign_name(raw)
+            store_sid = ad_report_store_sid(raw)
+            assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
+            if campaign_name == "未命名广告活动" and assignment.get("campaign_name"):
+                campaign_name = str(assignment["campaign_name"]).strip()
             if not campaign_id or not campaign_name:
                 continue
             if campaign_name == "未命名广告活动":
                 campaign_name = f"未命名广告活动 · {campaign_id}"
             metrics = strategy_metrics(raw)
-            store_sid = ad_report_store_sid(raw)
             store_name = str(raw.get("_store_name") or "未命名店铺")
             key = (site_code, store_sid, campaign_id)
             item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "store_sid": store_sid, "store_name": store_name, "campaign_id": campaign_id, "campaign_name": campaign_name, "ad_type": ad_report_type(raw), "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": str(raw.get("currency") or raw.get("currency_code") or AMAZON_CURRENCY_CODES.get(site_name, "USD"))})
