@@ -729,35 +729,23 @@ def ad_report_store_name(row: dict[str, Any]) -> str:
 
 
 def ad_report_type(row: dict[str, Any]) -> str:
-    for key in ("ad_type", "adType", "ads_type", "adsType", "advertising_type", "advertisingType", "type", "product_type", "productType"):
-        value = row.get(key)
-        if value not in (None, "") and not isinstance(value, (dict, list)):
-            text = str(value).strip().upper()
-            if text in {"SBV", "VIDEO", "SPONSORED_BRANDS_VIDEO"} or text.startswith("SBV"):
-                return "SBV"
-            if text in {"SP", "SPONSORED_PRODUCTS"} or text.startswith("SP"):
-                return "SP"
-            if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS"} or text.startswith("SB"):
-                return "SB"
-            if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"):
-                return "SD"
-    for key in ("campaign_type", "campaignType", "ad_product", "adProduct"):
-        value = row.get(key)
-        if value not in (None, "") and not isinstance(value, (dict, list)):
-            text = str(value).strip().upper()
-            if text in {"SBV", "VIDEO", "SPONSORED_BRANDS_VIDEO"} or text.startswith("SBV"):
-                return "SBV"
-            if text in {"SP", "SPONSORED_PRODUCTS"} or text.startswith("SP"):
-                return "SP"
-            if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS"} or text.startswith("SB"):
-                return "SB"
-            if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"):
-                return "SD"
-    sponsored = str(row.get("sponsored_type") or "").strip().upper()
-    if sponsored in {"SP", "SB", "SBV", "SD"}:
-        return sponsored
+    def classify(value: Any) -> str:
+        text = str(value or "").strip().upper().replace("-", "_")
+        if not text: return ""
+        if text in {"SBV", "VIDEO", "SPONSORED_BRANDS_VIDEO"} or text.startswith("SBV") or "VIDEO" in text: return "SBV"
+        if text in {"SP", "SPONSORED_PRODUCTS"} or text.startswith("SP"): return "SP"
+        if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS", "PRODUCT_COLLECTION"} or text.startswith("SB"): return "SB"
+        if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"): return "SD"
+        return ""
+    keys = ("ad_type", "adType", "ads_type", "adsType", "advertising_type", "advertisingType", "type", "product_type", "productType", "campaign_type", "campaignType", "ad_product", "adProduct", "campaign_type_name", "campaignTypeName", "ad_format", "adFormat", "ad_type_name", "adTypeName", "sponsored_type", "sponsoredType")
+    for key in keys:
+        value = _first_nested_field_value(row, (key,))
+        classified = classify(value)
+        if classified: return classified
+    sponsored = str(_first_nested_field_value(row, ("sponsored_type", "sponsoredType")) or "").strip().upper()
     if sponsored in {"HSA", "SB2"}:
-        return "SBV" if str(row.get("creative_type") or "").upper() == "VIDEO" else "SB"
+        creative = str(_first_nested_field_value(row, ("creative_type", "creativeType")) or "").upper()
+        return "SBV" if "VIDEO" in creative else "SB"
     return ""
 
 
@@ -1436,8 +1424,8 @@ async def fetch_product_performance(
         try:
             return await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
         except (RuntimeError, httpx.HTTPError):
-            # Keep the existing OpenAPI path available during MCP outages or
-            # while a new Secret revision is propagating through the runtime.
+            # Product performance OpenAPI retains the typed SP/SB/SBV/SD fields;
+            # use it as a bounded fallback when the MCP endpoint is unavailable.
             pass
     # LingXing limits this endpoint to a maximum 92-day date range.  The
     # dashboard allows a wider range for quick presets such as "去年", so split
@@ -1555,7 +1543,7 @@ AMAZON_SOURCE_FIELDS = {
         "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
         "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
         "impressions": ("impressions", "ad_impressions", "adImpressions", "total_ad_impressions", "totalAdImpressions"),
-        "clicks": ("clicks", "ad_clicks", "adClicks", "ads_clicks", "adsClicks", "total_ad_clicks", "totalAdClicks", "ad_click_quantity", "adClickQuantity"),
+        "clicks": ("clicks", "ad_clicks", "adClicks", "ads_clicks", "adsClicks", "total_ad_clicks", "totalAdClicks", "ad_click_quantity", "adClickQuantity", "ad_clicks_total"),
         "ad_sales": ("ad_sales_amount", "ads_sales_amount", "adSalesAmount"),
         "ad_cost": ("spend", "ad_cost", "advertising_spend"),
         "ad_units": ("ads_sales_volume_quantity", "ad_sales_volume_quantity", "adUnits"),
@@ -1572,36 +1560,36 @@ AMAZON_METRIC_SOURCES = {
 
 AMAZON_AD_BREAKDOWN_FIELDS = {
     "sp": {
-        "impressions": ("ad_impressions_sp", "adImpressionsSp", "impressions_sp", "sp_impressions", "spImpressions"),
-        "clicks": ("ad_clicks_sp", "adClicksSp", "clicks_sp", "sp_clicks", "spClicks"),
+        "impressions": ("ad_impressions_sp", "adImpressionsSp", "impressions_sp", "sp_impressions", "spImpressions", "ads_sp_impressions"),
+        "clicks": ("ad_clicks_sp", "adClicksSp", "clicks_sp", "sp_clicks", "spClicks", "ads_sp_clicks"),
         "ad_cost": ("ads_sp_cost", "adSpendSp", "spend_sp"),
         "ad_units": ("ads_sp_sales_volume_quantity", "adSalesVolumeQuantitySp", "ad_units_sp"),
         "ad_orders": ("ad_order_quantity_sp", "adOrderQuantitySp", "ad_orders_sp", "sp_orders", "spOrders", "ad_order_num_sp", "adOrderNumSp"),
-        "ad_sales": ("ads_sp_sales", "adsSpSales", "ad_sales_sp"),
+        "ad_sales": ("ads_sp_sales", "adsSpSales", "ad_sales_sp", "ad_direct_sales_amount_sp"),
     },
     "sb": {
-        "impressions": ("shared_ad_impressions_sb", "sharedAdImpressionsSb", "ad_impressions_sb", "sb_impressions", "sbImpressions"),
-        "clicks": ("shared_ad_clicks_sb", "sharedAdClicksSb", "ad_clicks_sb", "sb_clicks", "sbClicks"),
-        "ad_cost": ("shared_ads_sb_cost", "sharedAdsSbCost", "ad_spend_sb"),
+        "impressions": ("shared_ad_impressions_sb", "sharedAdImpressionsSb", "ad_impressions_sb", "sb_impressions", "sbImpressions", "shared_ads_sb_impressions"),
+        "clicks": ("shared_ad_clicks_sb", "sharedAdClicksSb", "ad_clicks_sb", "sb_clicks", "sbClicks", "shared_ad_clicks_brand", "ad_clicks_brand", "shared_ads_sb_clicks"),
+        "ad_cost": ("shared_ads_sb_cost", "sharedAdsSbCost", "ad_spend_sb", "shared_cost_of_advertising_sb"),
         "ad_units": ("shared_ads_sb_sales_volume_quantity", "sharedAdsSbSalesVolumeQuantity", "ad_units_sb"),
         "ad_orders": ("shared_ad_order_quantity_sb", "sharedAdOrderQuantitySb", "ad_orders_sb", "sb_orders", "sbOrders", "ad_order_num_sb", "adOrderNumSb"),
-        "ad_sales": ("shared_ads_sb_sales", "sharedAdsSbSales", "ad_sales_sb"),
+        "ad_sales": ("shared_ads_sb_sales", "sharedAdsSbSales", "ad_sales_sb", "shared_ad_direct_sales_amount_sb"),
     },
     "sbv": {
-        "impressions": ("shared_ad_impressions_sbv", "sharedAdImpressionsSbv", "ad_impressions_sbv", "sbv_impressions", "sbvImpressions"),
-        "clicks": ("shared_ad_clicks_sbv", "sharedAdClicksSbv", "ad_clicks_sbv", "sbv_clicks", "sbvClicks"),
-        "ad_cost": ("shared_ads_sbv_cost", "sharedAdsSbvCost", "ad_spend_sbv"),
+        "impressions": ("shared_ad_impressions_sbv", "sharedAdImpressionsSbv", "ad_impressions_sbv", "sbv_impressions", "sbvImpressions", "shared_ads_sbv_impressions"),
+        "clicks": ("shared_ad_clicks_sbv", "sharedAdClicksSbv", "ad_clicks_sbv", "sbv_clicks", "sbvClicks", "shared_ad_clicks_video", "ad_clicks_video", "shared_ads_sbv_clicks"),
+        "ad_cost": ("shared_ads_sbv_cost", "sharedAdsSbvCost", "ad_spend_sbv", "shared_cost_of_advertising_sbv"),
         "ad_units": ("shared_ads_sbv_sales_volume_quantity", "sharedAdsSbvSalesVolumeQuantity", "ad_units_sbv"),
         "ad_orders": ("shared_ad_order_quantity_sbv", "sharedAdOrderQuantitySbv", "ad_orders_sbv", "sbv_orders", "sbvOrders", "ad_order_num_sbv", "adOrderNumSbv"),
-        "ad_sales": ("shared_ads_sbv_sales", "sharedAdsSbvSales", "ad_sales_sbv"),
+        "ad_sales": ("shared_ads_sbv_sales", "sharedAdsSbvSales", "ad_sales_sbv", "shared_ad_direct_sales_amount_sbv"),
     },
     "sd": {
-        "impressions": ("ad_impressions_sd", "adImpressionsSd", "impressions_sd", "sd_impressions", "sdImpressions"),
-        "clicks": ("ad_clicks_sd", "adClicksSd", "clicks_sd", "sd_clicks", "sdClicks"),
+        "impressions": ("ad_impressions_sd", "adImpressionsSd", "impressions_sd", "sd_impressions", "sdImpressions", "ads_sd_impressions"),
+        "clicks": ("ad_clicks_sd", "adClicksSd", "clicks_sd", "sd_clicks", "sdClicks", "ads_sd_clicks"),
         "ad_cost": ("ads_sd_cost", "adSpendSd", "spend_sd"),
         "ad_units": ("ads_sd_sales_volume_quantity", "adSalesVolumeQuantitySd", "ad_units_sd"),
         "ad_orders": ("ad_order_quantity_sd", "adOrderQuantitySd", "ad_orders_sd", "sd_orders", "sdOrders", "ad_order_num_sd", "adOrderNumSd"),
-        "ad_sales": ("ads_sd_sales", "adsSdSales", "ad_sales_sd"),
+        "ad_sales": ("ads_sd_sales", "adsSdSales", "ad_sales_sd", "ad_direct_sales_amount_sd"),
     },
 }
 
@@ -2069,15 +2057,13 @@ def amazon_strategy_board_groups(
     metric_names = ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")
     strategies: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for (site_code, store_sid, campaign_id), item in aggregate.items():
-        if item["metrics"]["clicks"] <= 0:
-            continue
+        # Keep campaigns with zero clicks so the board remains a complete activity inventory.
         assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
         strategy = assignment.get("strategy", "/")
         if strategy not in AMAZON_STRATEGY_OPTIONS:
             strategy = "/"
         series = assignment.get("series", "") if assignment.get("series", "") in AMAZON_SERIES else ""
-        if strategy != "/" and not series:
-            continue
+        # Unassigned campaigns remain visible under the all-series view.
         if selected_series is not None and series not in selected_series:
             continue
         group_key = (site_code, strategy, series, "")
@@ -2173,22 +2159,14 @@ async def amazon_strategy_board_payload(
                         metadata_rows = []
                     else:
                         account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
-                        # The detail report is metric-complete but often omits
-                        # campaign metadata. The same LingXing report endpoint
-                        # exposes a campaign-level shape when show_detail=0;
-                        # merge those names/types by campaign id before grouping.
-                        metadata_rows = await fetch_ad_reports_range(
-                            int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0
-                        )
+                        metadata_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0)
 
                 except RuntimeError as exc:
                     if "白名单" in str(exc) or "ip not permit" in str(exc).lower():
                         continue
                     if lingxing_mcp_key():
                         account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
-                        metadata_rows = await fetch_ad_reports_range(
-                            int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0
-                        )
+                        metadata_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0)
                     else:
                         raise
                 metadata_by_id: dict[str, dict[str, Any]] = {}
@@ -2266,7 +2244,7 @@ async def amazon_strategy_board_payload(
 
     week_scope = normalize_week_start(start_date)
     output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
-    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites}
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": {"campaign_inventory_complete": bool(lingxing_mcp_key()), "unassigned_campaigns_included": True}}
     _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
 
@@ -2399,6 +2377,39 @@ def save_campaign_strategies(
         db.commit()
     _amazon_cache.clear()
     return {"ok": True, "saved": len(normalized)}
+
+
+@app.post("/api/amazon/strategy-board/notes/batch")
+def save_strategy_notes_batch(payload: dict[str, Any] = Body(...), x_sync_key: str | None = Header(default=None, alias="X-Sync-Key")):
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="策略备注周格式无效") from exc
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) > 500:
+        raise HTTPException(status_code=422, detail="策略备注批量参数无效")
+    normalized = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="策略备注批量参数无效")
+        site_code = str(raw.get("site_code") or "").strip().upper()
+        series = str(raw.get("series") or "").strip()
+        strategy = normalize_strategy(raw.get("strategy"))
+        if site_code not in AMAZON_SITE_CODES.values() or series not in ("", *AMAZON_SERIES) or strategy not in AMAZON_STRATEGY_OPTIONS:
+            raise HTTPException(status_code=422, detail="策略备注参数无效")
+        normalized.append((site_code, series, strategy, str(raw.get("note") or "")))
+    with session_factory()() as db:
+        for site_code, series, strategy, note in normalized:
+            item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.week_start == week_start, AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.series == series, AmazonStrategyNote.strategy == strategy))
+            if item is None:
+                item = AmazonStrategyNote(week_start=week_start, site_code=site_code, series=series, strategy=strategy)
+                db.add(item)
+            item.note = note
+            item.updated_at = utcnow()
+        db.commit()
+    _amazon_cache.clear()
+    return {"ok": True, "saved": len(normalized), "week_start": week_start.isoformat()}
 
 
 @app.post("/api/amazon/strategy-board/note")

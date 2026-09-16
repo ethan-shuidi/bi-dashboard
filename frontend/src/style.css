@@ -286,3 +286,6 @@
 .strategy-name-column{width:var(--strategy-name-width)!important;min-width:var(--strategy-name-width)!important;max-width:var(--strategy-name-width)!important}
 .strategy-note-column{width:var(--strategy-note-width)!important;min-width:var(--strategy-note-width)!important;max-width:var(--strategy-note-width)!important}
 .strategy-note-editor textarea{flex:1 1 auto;width:100%;min-width:0}
+.column-config-panel-floating{position:fixed!important;top:auto;right:auto;bottom:auto;left:auto;z-index:2147483647!important;max-height:min(420px,calc(100vh - 24px));overflow:auto}
+.strategy-save-all-notes{min-height:34px;white-space:nowrap}
+.strategy-note-editor textarea{flex:1;min-width:0}

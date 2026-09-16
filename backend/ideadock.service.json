@@ -6,18 +6,85 @@
   "start": "uvicorn app:app --host 0.0.0.0 --port $PORT",
   "health_path": "/health",
   "routes": [
-    { "path": "/health", "methods": ["GET"] },
-    { "path": "/api/status", "methods": ["GET"] },
-    { "path": "/api/sync", "methods": ["POST"] },
-    { "path": "/api/dashboard", "methods": ["GET"] },
-    { "path": "/api/amazon/dashboard", "methods": ["GET"] },
-    { "path": "/api/amazon/stores", "methods": ["GET"] },
-    { "path": "/api/amazon/date-context", "methods": ["GET"] },
-    { "path": "/api/amazon/strategy-board", "methods": ["GET"] },
-    { "path": "/api/amazon/strategy-board/campaign-strategy", "methods": ["POST"] },
-    { "path": "/api/amazon/strategy-board/campaign-strategy/batch", "methods": ["POST"] },
-    { "path": "/api/amazon/strategy-board/note", "methods": ["POST"] },
-    { "path": "/api/amazon/ad-plan", "methods": ["GET", "POST"] }
+    {
+      "path": "/health",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/status",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/sync",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/dashboard",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/dashboard",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/stores",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/date-context",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/strategy-board",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/strategy-board/campaign-strategy",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/strategy-board/campaign-strategy/batch",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/strategy-board/notes/batch",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/strategy-board/note",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/ad-plan",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    }
   ],
   "resources": {
     "cpu": "500m",

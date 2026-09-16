@@ -137,7 +137,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         with self.assertRaises(Exception):
             validate_strategy_series("/", "TN10系列（主链接）汇总")
 
-    def test_strategy_groups_omit_placeholder_and_empty_series_rows(self):
+    def test_strategy_groups_keep_unassigned_campaigns_visible(self):
         series = AMAZON_SERIES[0]
         week = date(2026, 9, 7)
         metrics = lambda clicks: {"impressions": clicks * 10, "clicks": clicks, "ad_cost": clicks * 0.5, "ad_sales": clicks * 2, "ad_units": clicks, "ad_orders": clicks}
@@ -153,8 +153,8 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         notes = {(week, "US", series, "品类词"): "Keep the note"}
         groups = amazon_strategy_board_groups(aggregate, assignments, notes, ["美国"], None, week)
 
-        self.assertEqual([(group["strategy"], group["series"]) for group in groups], [("品类词", series), ("/", "")])
-        self.assertEqual([len(group["campaigns"]) for group in groups], [1, 1])
+        self.assertEqual([(group["strategy"], group["series"]) for group in groups], [("品类词", series), ("竞品词", ""), ("/", "")])
+        self.assertEqual([len(group["campaigns"]) for group in groups], [1, 1, 1])
         self.assertEqual(groups[0]["note"], "Keep the note")
 
     def test_strategy_order_and_unit_counts_reach_groups_and_campaigns(self):
