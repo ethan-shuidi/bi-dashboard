@@ -22,6 +22,7 @@ from app import (
     amazon_series,
     amazon_sid_accounts,
     amazon_strategy_board_groups,
+    finalize_strategy_metrics,
     optional_metric,
     strategy_campaign_name,
     require_business_access,
@@ -155,6 +156,29 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual([(group["strategy"], group["series"]) for group in groups], [("品类词", series), ("/", "")])
         self.assertEqual([len(group["campaigns"]) for group in groups], [1, 1])
         self.assertEqual(groups[0]["note"], "Keep the note")
+
+    def test_strategy_order_and_unit_counts_reach_groups_and_campaigns(self):
+        series = AMAZON_SERIES[0]
+        aggregate = {}
+        assignments = {}
+        for campaign_id, orders, units in [("one", 2, 5), ("two", 3, 7)]:
+            key = ("US", "100", campaign_id)
+            aggregate[key] = {
+                "site": "美国", "store_name": "Shop", "campaign_name": campaign_id,
+                "ad_type": "SP", "currency": "USD",
+                "metrics": {"clicks": 10, "ad_cost": 20, "ad_sales": 100,
+                            "ad_orders": orders, "ad_units": units},
+            }
+            assignments[key] = {"strategy": "品类词", "series": series}
+        groups = amazon_strategy_board_groups(aggregate, assignments, {}, ["美国"], {series}, date(2026, 9, 7))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["metrics"]["ad_orders"], 5)
+        self.assertEqual(groups[0]["metrics"]["ad_units"], 12)
+        self.assertEqual(groups[0]["metrics"]["ad_cvr"], 0.25)
+        self.assertEqual([(item["ad_orders"], item["ad_units"]) for item in groups[0]["campaigns"]], [(2, 5), (3, 7)])
+        empty = finalize_strategy_metrics({})
+        self.assertEqual((empty["ad_orders"], empty["ad_units"]), (0, 0))
+        self.assertIsNone(empty["ad_cvr"])
 
     def test_japan_uses_both_named_shops(self):
         accounts = amazon_sid_accounts("日本", {"JP": {"sid": 100}}, [
@@ -291,6 +315,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["ad_cost"], 2)
         self.assertEqual(row["ad_units"], 3)
         self.assertEqual(row["ad_orders"], 2)
+        self.assertEqual(row["cpo"], 1)
         self.assertEqual(row["ad_order_share"], 0.4)
         self.assertEqual(row["asin"], asin)
         self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)

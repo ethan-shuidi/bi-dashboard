@@ -844,6 +844,8 @@ def finalize_strategy_metrics(total: dict[str, float]) -> dict[str, float | None
         "cpc": ad_cost / clicks if clicks else None,
         "ad_cost": ad_cost,
         "ad_sales": ad_sales,
+        "ad_orders": int(ad_orders),
+        "ad_units": int(total.get("ad_units", 0)),
         "acos": ad_cost / ad_sales if ad_sales else None,
         "roas": ad_sales / ad_cost if ad_cost else None,
         "ad_cvr": ad_orders / clicks if clicks else None,
@@ -1384,7 +1386,7 @@ def status():
 
 
 def amazon_empty_row(series: str, product: str | None = None) -> dict[str, Any]:
-    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "ad_order_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
+    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "ad_order_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "cpo": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
 
 
 def amazon_periods(start_date: date, end_date: date, comparison: str) -> list[tuple[str, date, date]]:
@@ -1686,7 +1688,7 @@ async def amazon_dashboard_periodic(
     if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
-    cache_key = ("periodic-dashboard-v4", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v5-cpo", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -1836,6 +1838,7 @@ async def amazon_dashboard_periodic(
             "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
             "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks else item.get("source_cpc"),
             "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else item.get("source_ad_cvr"),
+            "cpo": ad_cost / ad_orders if ad_cost is not None and ad_orders else None,
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
             "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
@@ -2147,7 +2150,7 @@ async def amazon_strategy_board_payload(
     selected_sites = list(dict.fromkeys(selected_sites))
     selected_store_sids = {str(value) for value in (selected_store_sids or set()) if str(value).strip()}
     series_filter = None if selected_series is None else set(selected_series)
-    cache_key = ("amazon-strategy-board-v3-no-product", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), tuple(sorted(selected_store_sids)), tuple(sorted(series_filter or set())))
+    cache_key = ("amazon-strategy-board-v4-orders-units", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), tuple(sorted(selected_store_sids)), tuple(sorted(series_filter or set())))
     if refresh:
         _amazon_cache.pop(cache_key, None)
     cached = _amazon_cache.get(cache_key)

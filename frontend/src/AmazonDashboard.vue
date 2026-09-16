@@ -80,6 +80,7 @@ const dataColumns = ref([
   { key: "ctr", label: "CTR", width: 92, visible: true },
   { key: "clicks", label: "点击", width: 92, visible: true },
   { key: "cpc", label: "CPC", width: 108, visible: true },
+  { key: "cpo", label: "CPO", width: 108, visible: true },
   { key: "ad_cost", label: "广告花费", width: 128, visible: true },
   { key: "ad_cvr", label: "广告CVR", width: 108, visible: true },
   { key: "ad_units", label: "广告销量", width: 100, visible: true },
@@ -532,6 +533,7 @@ function aggregate(items) {
   out.acoas = out.net_sales && out.ad_cost != null ? out.ad_cost / out.net_sales : null
   out.ad_sales_share = out.units && out.ad_units != null ? out.ad_units / out.units : null
   out.ad_order_share = out.orders && out.ad_orders != null ? out.ad_orders / out.orders : null
+  out.cpo = out.ad_orders && out.ad_cost != null ? out.ad_cost / out.ad_orders : null
   const weighted = (metric, weight) => {
     let numerator = 0
     let denominator = 0
@@ -558,7 +560,7 @@ function cells(item) {
 function cellValue(item, column) {
   const value = metricValue(item, column.key)
   if (["acoas", "ad_sales_share", "ad_order_share", "ctr", "ad_cvr", "cvr", "acos"].includes(column.key)) return percent(value)
-  if (["net_sales", "cpc", "ad_cost"].includes(column.key)) return money(value, item.currency)
+  if (["net_sales", "cpc", "cpo", "ad_cost"].includes(column.key)) return money(value, item.currency)
   return number(value)
 }
 
