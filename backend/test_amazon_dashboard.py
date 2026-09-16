@@ -1,9 +1,13 @@
 import asyncio
+import json
+import os
 import unittest
 from datetime import date
 from unittest.mock import AsyncMock, patch
+import httpx
 from app import (
     AMAZON_PRODUCTS,
+    AMAZON_STRATEGY_OPTIONS,
     AMAZON_METRIC_SOURCES,
     AMAZON_SERIES,
     AMAZON_SOURCE_FIELDS,
@@ -20,10 +24,82 @@ from app import (
     optional_metric,
     strategy_campaign_name,
     require_business_access,
+    _lingxing_mcp_result,
+    fetch_mcp_product_performance,
+    fetch_mcp_campaign_report,
+    validate_strategy_series,
 )
 
 
 class AmazonDashboardPeriodTests(unittest.TestCase):
+    def test_lingxing_mcp_result_decodes_text_business_payload(self):
+        payload = {
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"success": True, "data": [{"clicks": 3239}]})
+                }]
+            }
+        }
+        self.assertEqual(_lingxing_mcp_result(payload), [{"clicks": 3239}])
+
+    def test_mcp_product_performance_preserves_ad_type_clicks(self):
+        response = httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://example.test/mcp"),
+            json={
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "success": True,
+                            "data": {"list": [{
+                                "asin": "B0TEST",
+                                "clicks": 4226,
+                                "ad_clicks_sp": 3239,
+                                "ad_clicks_sb": 417,
+                                "ad_clicks_sbv": 100,
+                                "ad_clicks_sd": 470,
+                            }]},
+                        }),
+                    }]
+                }
+            },
+        )
+        client = AsyncMock()
+        client.post.return_value = response
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            rows = asyncio.run(fetch_mcp_product_performance(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+        self.assertEqual(product_performance_ad_breakdown(rows[0])["sp"]["clicks"], 3239)
+        self.assertEqual(product_performance_ad_breakdown(rows[0])["sb"]["clicks"], 417)
+        self.assertEqual(product_performance_ad_breakdown(rows[0])["sbv"]["clicks"], 100)
+        self.assertEqual(product_performance_ad_breakdown(rows[0])["sd"]["clicks"], 470)
+
+    def test_mcp_campaign_report_resolves_profile_and_keeps_real_name(self):
+        shops_response = httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://example.test/mcp"),
+            json={"result": {"content": [{"type": "text", "text": json.dumps({
+                "success": True,
+                "data": [{"sid": 14292, "profile_id": "2815938091388375"}],
+            })}]}}
+        )
+        campaign_response = httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://example.test/mcp"),
+            json={"result": {"content": [{"type": "text", "text": json.dumps({
+                "success": True,
+                "data": {"data": [{"campaign_id": "123", "name": "真实活动名称", "ads_type": "SP"}]},
+            })}]}}
+        )
+        client = AsyncMock()
+        client.post.side_effect = [shops_response, campaign_response]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            rows = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+        self.assertEqual(rows[0]["name"], "真实活动名称")
+        self.assertEqual(rows[0]["campaign_id"], "123")
+        self.assertEqual(client.post.call_count, 2)
+
     def test_campaign_name_reads_nested_campaign_objects(self):
         self.assertEqual(
             strategy_campaign_name({"campaign": {"details": {"campaignTitle": "真实活动名称"}}}),
@@ -35,9 +111,29 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         totals = product_performance_ad_totals(raw)
         self.assertNotIn("clicks", totals)
         self.assertNotIn("ad_orders", totals)
+
+    def test_zero_filled_typed_breakdown_is_marked_unavailable(self):
+        raw = {
+            "clicks": 4227,
+            "ad_clicks_sp": 0,
+            "shared_ad_clicks_sb": 0,
+            "shared_ad_clicks_sbv": 0,
+            "ad_clicks_sd": 0,
+        }
+        breakdown = product_performance_ad_breakdown(raw)
+        self.assertTrue(all(breakdown[key]["clicks"] is None for key in ("sp", "sb", "sbv", "sd")))
     def test_business_access_does_not_require_key_for_internal_app(self):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))
+
+    def test_strategy_and_series_must_be_set_together(self):
+        self.assertIn("bundle", AMAZON_STRATEGY_OPTIONS)
+        validate_strategy_series("/", "")
+        validate_strategy_series("品类词", "TN10系列（主链接）汇总")
+        with self.assertRaises(Exception):
+            validate_strategy_series("品类词", "")
+        with self.assertRaises(Exception):
+            validate_strategy_series("/", "TN10系列（主链接）汇总")
 
     def test_japan_uses_both_named_shops(self):
         accounts = amazon_sid_accounts("日本", {"JP": {"sid": 100}}, [

@@ -102,9 +102,17 @@ DEFAULT_API_VERSION = "2026-07"
 DEFAULT_INITIAL_SYNC_DAYS = 90
 DEFAULT_SYNC_COOLDOWN_SECONDS = 600
 
-AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "/")
+AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/")
 
 LINGXING_API_BASE = "https://openapi.lingxing.com"
+LINGXING_MCP_URL = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
+LINGXING_MCP_CATALOG_VERSION = "lingxing-mcp-20260915-v1"
+LINGXING_MCP_PRODUCT_SCHEMA = "query_product_performance_asin_lists-v1-c500-20260907"
+LINGXING_MCP_CAMPAIGN_SCHEMA = "ad_campaign_report-260914-v1"
+LINGXING_MCP_SHOPS_SCHEMA = "ad_auth_shops-v1-c500-20260907"
+LINGXING_MCP_PRODUCT_VERSION = 288
+LINGXING_MCP_CAMPAIGN_VERSION = 180068
+LINGXING_MCP_SHOPS_VERSION = 199
 AMAZON_SERIES = [
     "TN10系列（主链接）汇总",
     "TN10系列（小链接）汇总",
@@ -598,9 +606,11 @@ async def fetch_ad_report(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     offset: int = 0,
+    *,
+    show_detail: int = 1,
 ) -> list[dict[str, Any]]:
     """Read LingXing's dated advertising report for one store."""
-    cache_key = ("ads-v2", sid, report_date.isoformat(), offset)
+    cache_key = ("ads-v3", sid, report_date.isoformat(), offset, show_detail)
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -617,7 +627,7 @@ async def fetch_ad_report(
             {
                 "sid": sid,
                 "report_date": report_date.isoformat(),
-                "show_detail": 1,
+                "show_detail": show_detail,
                 "offset": offset,
                 "length": 500,
             },
@@ -640,6 +650,8 @@ async def fetch_ad_reports_range(
     end_date: date,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    *,
+    show_detail: int = 1,
 ) -> list[dict[str, Any]]:
     """Read dated advertising reports, serializing requests for LingXing's rate limit."""
     rows: list[dict[str, Any]] = []
@@ -647,7 +659,7 @@ async def fetch_ad_reports_range(
     while cursor <= end_date:
         async with _lingxing_ad_report_lock:
             try:
-                daily = await fetch_ad_report(sid, cursor, client, semaphore, 0)
+                daily = await fetch_ad_report(sid, cursor, client, semaphore, 0, show_detail=show_detail)
             except RuntimeError as exc:
                 if "频繁" not in str(exc) and "too frequent" not in str(exc).lower():
                     raise
@@ -655,7 +667,7 @@ async def fetch_ad_reports_range(
                 for attempt in range(5):
                     await asyncio.sleep(2 ** attempt)
                     try:
-                        daily = await fetch_ad_report(sid, cursor, client, semaphore, 0)
+                        daily = await fetch_ad_report(sid, cursor, client, semaphore, 0, show_detail=show_detail)
                         break
                     except RuntimeError as retry_exc:
                         if "频繁" not in str(retry_exc) and "too frequent" not in str(retry_exc).lower():
@@ -680,7 +692,7 @@ async def fetch_ad_reports_range(
                 break
             offset += len(daily)
             async with _lingxing_ad_report_lock:
-                daily = await fetch_ad_report(sid, cursor, client, semaphore, offset)
+                daily = await fetch_ad_report(sid, cursor, client, semaphore, offset, show_detail=show_detail)
         cursor += timedelta(days=1)
     return rows
 
@@ -764,6 +776,14 @@ def ad_report_number(row: dict[str, Any], *names: str) -> float:
 def normalize_strategy(value: Any) -> str:
     strategy = str(value or "/").strip()
     return strategy or "/"
+
+
+def validate_strategy_series(strategy: str, series: str) -> None:
+    """Keep campaign classification atomic: a real strategy requires a series."""
+    if strategy == "/" and series:
+        raise HTTPException(status_code=422, detail="策略为“/”时不能选择系列")
+    if strategy != "/" and not series:
+        raise HTTPException(status_code=422, detail="已选择策略时必须同时选择系列")
 
 
 def strategy_metrics(row: dict[str, Any]) -> dict[str, float]:
@@ -1410,6 +1430,13 @@ async def fetch_product_performance(
     # mapped for this site; avoid issuing an unfiltered request in that case.
     if asin_list == []:
         return []
+    if lingxing_mcp_key():
+        try:
+            return await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
+        except (RuntimeError, httpx.HTTPError):
+            # Keep the existing OpenAPI path available during MCP outages or
+            # while a new Secret revision is propagating through the runtime.
+            pass
     # LingXing limits this endpoint to a maximum 92-day date range.  The
     # dashboard allows a wider range for quick presets such as "去年", so split
     # longer requests into bounded chunks and merge the returned rows.  Chunk
@@ -1438,6 +1465,12 @@ async def fetch_product_performance(
                 "summary_field": "asin",
                 "is_recently_enum": False,
                 "purchase_status": 0,
+                # Without this flag LingXing may return generic totals while
+                # leaving the SP/SB/SBV/SD dimensions as zero placeholders.
+                # The LingXing product-performance API treats this as a
+                # boolean flag.  Sending JSON true enables the typed SP/SB/
+                # SBV/SD fields, while numeric 1 can leave them as zeros.
+                "query_order_profit": True,
             }
             if currency_code:
                 payload["currency_code"] = currency_code
@@ -1581,6 +1614,21 @@ def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str,
             # with zero makes the frontend mistake an incomplete breakdown for
             # a complete zero-valued breakdown and overwrite the generic total.
             result[ad_type][metric] = optional_metric(raw, *names)
+    generic_fields = {
+        "clicks": AMAZON_SOURCE_FIELDS["performance"]["clicks"],
+        "ad_cost": AMAZON_SOURCE_FIELDS["performance"]["ad_cost"],
+        "ad_units": AMAZON_SOURCE_FIELDS["performance"]["ad_units"],
+        "ad_orders": AMAZON_SOURCE_FIELDS["performance"]["ad_orders"],
+    }
+    # A zero-filled dimension block is not the same as four real zero values.
+    # When a generic total is positive but every typed value is zero, expose
+    # nulls so the UI shows an unavailable breakdown instead of false zeros.
+    for metric, names in generic_fields.items():
+        generic_total = optional_metric(raw, *names)
+        typed_values = [result[ad_type].get(metric) for ad_type in AMAZON_AD_BREAKDOWN_FIELDS]
+        if generic_total and all(value == 0 for value in typed_values if value is not None) and any(value is not None for value in typed_values):
+            for ad_type in result:
+                result[ad_type][metric] = None
     return result
 
 
@@ -1593,6 +1641,12 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
     fall back to the generic field only when no typed field was returned.
     """
     totals: dict[str, float] = {}
+    generic_fields = {
+        "clicks": AMAZON_SOURCE_FIELDS["performance"]["clicks"],
+        "ad_cost": AMAZON_SOURCE_FIELDS["performance"]["ad_cost"],
+        "ad_units": AMAZON_SOURCE_FIELDS["performance"]["ad_units"],
+        "ad_orders": AMAZON_SOURCE_FIELDS["performance"]["ad_orders"],
+    }
     for metric, _ in next(iter(AMAZON_AD_BREAKDOWN_FIELDS.values())).items():
         present = False
         total = 0.0
@@ -1602,7 +1656,8 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
             if value is not None:
                 present = True
                 total += value
-        if present:
+        generic_total = optional_metric(raw, *generic_fields.get(metric, ()))
+        if present and not (total == 0 and generic_total and metric in generic_fields):
             totals[metric] = total
     return totals
 
@@ -1730,7 +1785,7 @@ async def amazon_dashboard_periodic(
                 continue
             row_currency = str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency
             key = (period_label, site_name, group, product)
-            item = aggregate.setdefault(key, {"period": period_label, "site": site_name, "site_code": site_code, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": row_currency, "asins": set(), "ad_breakdown": {ad_type: {metric: 0.0 for metric in fields} for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items()}})
+            item = aggregate.setdefault(key, {"period": period_label, "site": site_name, "site_code": site_code, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": row_currency, "asins": set(), "ad_breakdown": {ad_type: {metric: None for metric in fields} for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items()}})
             item["asins"].update(amazon_asins_for_product(site_code, product))
             source = raw.get("_source", "performance")
             if source not in AMAZON_SOURCE_FIELDS:
@@ -1752,7 +1807,8 @@ async def amazon_dashboard_periodic(
             for ad_type, metrics in breakdown.items():
                 for metric, value in metrics.items():
                     if value is not None:
-                        item["ad_breakdown"][ad_type][metric] += value
+                        current = item["ad_breakdown"][ad_type].get(metric)
+                        item["ad_breakdown"][ad_type][metric] = (current or 0) + value
 
     rows: list[dict[str, Any]] = []
     for (period_label, site_name, group, product), item in aggregate.items():
@@ -1807,6 +1863,197 @@ async def amazon_dashboard_periodic(
     return response
 
 
+def lingxing_mcp_key() -> str:
+    return os.environ.get("LINGXING_MCP_KEY", "").strip()
+
+
+def _lingxing_mcp_json_body(response: httpx.Response) -> dict[str, Any]:
+    """Decode a JSON or SSE MCP response without exposing auth headers."""
+    text_body = response.text.strip()
+    if not text_body:
+        raise RuntimeError("LingXing MCP returned an empty response")
+    candidates = [text_body]
+    candidates.extend(
+        line[5:].strip()
+        for line in text_body.splitlines()
+        if line.startswith("data:") and line[5:].strip()
+    )
+    for candidate in reversed(candidates):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise RuntimeError("LingXing MCP returned invalid JSON")
+
+
+def _lingxing_mcp_result(payload: dict[str, Any]) -> Any:
+    result = payload.get("result")
+    if isinstance(result, dict):
+        if result.get("isError"):
+            raise RuntimeError("LingXing MCP request failed")
+        content = result.get("content") or []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                try:
+                    business = json.loads(str(item.get("text") or ""))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("LingXing MCP returned invalid business JSON") from exc
+                break
+        else:
+            business = result.get("structuredContent")
+    else:
+        business = payload
+    if not isinstance(business, dict):
+        raise RuntimeError("LingXing MCP returned an invalid result")
+    if business.get("success") is False or business.get("code") == 0:
+        message = business.get("msg") or business.get("message") or "request failed"
+        raise RuntimeError(f"LingXing MCP request failed: {message}")
+    nested = business.get("data")
+    if isinstance(nested, dict) and ("code" in nested or "success" in nested) and "data" in nested:
+        if nested.get("success") is False or nested.get("code") == 0:
+            message = nested.get("msg") or nested.get("message") or "request failed"
+            raise RuntimeError(f"LingXing MCP request failed: {message}")
+        return nested.get("data")
+    return nested if nested is not None else business
+
+
+async def lingxing_mcp_call(
+    tool_id: str,
+    schema_version: str,
+    tool_version_id: int,
+    params: dict[str, Any],
+    client: httpx.AsyncClient,
+) -> Any:
+    key = lingxing_mcp_key()
+    if not key:
+        raise RuntimeError("LINGXING_MCP_KEY missing")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"bi-dashboard-{time.time_ns()}",
+        "method": "tools/call",
+        "params": {
+            "name": "action",
+            "arguments": {
+                "catalogVersion": LINGXING_MCP_CATALOG_VERSION,
+                "schemaVersion": schema_version,
+                "toolId": tool_id,
+                "toolVersionId": tool_version_id,
+                "params": params,
+            },
+        },
+    }
+    response = await client.post(
+        LINGXING_MCP_URL,
+        json=payload,
+        headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
+    )
+    response.raise_for_status()
+    return _lingxing_mcp_result(_lingxing_mcp_json_body(response))
+
+
+async def fetch_mcp_product_performance(
+    sid: int,
+    start_date: date,
+    end_date: date,
+    client: httpx.AsyncClient,
+    asin_list: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "offset": 0,
+        "length": 10000,
+        "sort_field": "volume",
+        "sort_type": "desc",
+        "sids": str(sid),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "summary_field": "asin",
+        "date_type": "purchase",
+        "turn_on_summary": 1,
+        "query_order_profit": True,
+    }
+    if asin_list is not None:
+        params["search_field"] = "asin"
+        params["search_value"] = asin_list
+    data = await lingxing_mcp_call(
+        "query_product_performance_asin_lists",
+        LINGXING_MCP_PRODUCT_SCHEMA,
+        LINGXING_MCP_PRODUCT_VERSION,
+        params,
+        client,
+    )
+    if isinstance(data, dict):
+        rows = data.get("list") or data.get("rows") or data.get("records") or data.get("items") or []
+    else:
+        rows = data or []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+async def lingxing_mcp_shop_rows(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    cache_key = ("lingxing-mcp-ad-shops",)
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
+        return list(cached[1])
+    data = await lingxing_mcp_call(
+        "ad_auth_shops",
+        LINGXING_MCP_SHOPS_SCHEMA,
+        LINGXING_MCP_SHOPS_VERSION,
+        {},
+        client,
+    )
+    rows = data if isinstance(data, list) else []
+    _amazon_cache[cache_key] = (time.monotonic(), rows)
+    return rows
+
+
+async def fetch_mcp_campaign_report(
+    sid: int,
+    start_date: date,
+    end_date: date,
+    client: httpx.AsyncClient,
+) -> list[dict[str, Any]]:
+    shops = await lingxing_mcp_shop_rows(client)
+    profile_id = next(
+        (str(row.get("profile_id")) for row in shops if str(row.get("sid") or "") == str(sid) and row.get("profile_id")),
+        "",
+    )
+    if not profile_id:
+        return []
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        data = await lingxing_mcp_call(
+            "ad_campaign_report",
+            LINGXING_MCP_CAMPAIGN_SCHEMA,
+            LINGXING_MCP_CAMPAIGN_VERSION,
+            {
+                "report_date": f"{start_date.isoformat()} - {end_date.isoformat()}",
+                "profile_ids": [profile_id],
+                "page": page,
+                "length": 100,
+                "sort_field": "clicks",
+                "sort_type": "desc",
+            },
+            client,
+        )
+        batch = data.get("data") if isinstance(data, dict) else data
+        if not isinstance(batch, list) or not batch:
+            break
+        for row in batch:
+            if not isinstance(row, dict):
+                continue
+            # The campaign report prepends an aggregate row with metrics but
+            # no campaign id or name. It must not become a fake campaign.
+            if not ad_report_campaign_id(row) and not ad_report_campaign_name(row):
+                continue
+            rows.append(row)
+        if len(batch) < 100:
+            break
+        page += 1
+    return rows
+
+
 async def amazon_strategy_board_payload(
     start_date: date,
     end_date: date,
@@ -1842,11 +2089,43 @@ async def amazon_strategy_board_payload(
             for account in accounts:
                 account_sid = str(account["sid"])
                 try:
-                    account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
+                    if lingxing_mcp_key():
+                        account_rows = await fetch_mcp_campaign_report(
+                            int(account["sid"]), start_date, end_date, client
+                        )
+                        metadata_rows = []
+                    else:
+                        account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
+                        # The detail report is metric-complete but often omits
+                        # campaign metadata. The same LingXing report endpoint
+                        # exposes a campaign-level shape when show_detail=0;
+                        # merge those names/types by campaign id before grouping.
+                        metadata_rows = await fetch_ad_reports_range(
+                            int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0
+                        )
+
                 except RuntimeError as exc:
                     if "白名单" in str(exc) or "ip not permit" in str(exc).lower():
                         continue
-                    raise
+                    if lingxing_mcp_key():
+                        account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
+                        metadata_rows = await fetch_ad_reports_range(
+                            int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0
+                        )
+                    else:
+                        raise
+                metadata_by_id: dict[str, dict[str, Any]] = {}
+                for metadata in metadata_rows:
+                    metadata_id = ad_report_campaign_id(metadata)
+                    if metadata_id and (ad_report_campaign_name(metadata) or ad_report_type(metadata)):
+                        metadata_by_id.setdefault(metadata_id, metadata)
+                for row in account_rows:
+                    metadata = metadata_by_id.get(ad_report_campaign_id(row))
+                    if metadata:
+                        merged = dict(metadata)
+                        merged.update({key: value for key, value in row.items() if value not in (None, "", [], {})})
+                        row.clear()
+                        row.update(merged)
                 for row in account_rows:
                     row["_store_sid"] = str(row.get("_store_sid") or account_sid)
                     row["_store_name"] = str(ad_report_store_name(row) or account.get("name") or account.get("account_name") or "未命名店铺")
@@ -2007,6 +2286,7 @@ def save_campaign_strategy(
         raise HTTPException(status_code=422, detail="广告活动策略参数无效")
     if series and series not in AMAZON_SERIES:
         raise HTTPException(status_code=422, detail="广告活动系列参数无效")
+    validate_strategy_series(strategy, series)
     if product and product not in AMAZON_PRODUCTS:
         raise HTTPException(status_code=422, detail="广告活动产品参数无效")
     with session_factory()() as db:
@@ -2023,6 +2303,67 @@ def save_campaign_strategy(
         db.commit()
     _amazon_cache.clear()
     return {"ok": True, "site_code": site_code, "store_sid": store_sid, "campaign_id": campaign_id, "strategy": strategy, "series": series, "product": product}
+
+
+@app.post("/api/amazon/strategy-board/campaign-strategy/batch")
+def save_campaign_strategies(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Persist all visible campaign classifications in one transaction."""
+    require_business_access(x_sync_key, allow_public=True)
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(status_code=422, detail="至少需要一条广告活动分类")
+    normalized: dict[tuple[str, str, str], dict[str, str]] = {}
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="广告活动分类格式无效")
+        site_code = str(raw.get("site_code") or "").strip().upper()
+        store_sid = str(raw.get("store_sid") or "").strip()
+        campaign_id = str(raw.get("campaign_id") or "").strip()
+        strategy = normalize_strategy(raw.get("strategy"))
+        series = str(raw.get("series") or "").strip()
+        product = str(raw.get("product") or "").strip()
+        if site_code not in AMAZON_SITE_CODES.values() or not store_sid or not campaign_id or strategy not in AMAZON_STRATEGY_OPTIONS:
+            raise HTTPException(status_code=422, detail="广告活动策略参数无效")
+        if series and series not in AMAZON_SERIES:
+            raise HTTPException(status_code=422, detail="广告活动系列参数无效")
+        validate_strategy_series(strategy, series)
+        if product and product not in AMAZON_PRODUCTS:
+            raise HTTPException(status_code=422, detail="广告活动产品参数无效")
+        normalized[(site_code, store_sid, campaign_id)] = {
+            "site_code": site_code,
+            "store_sid": store_sid,
+            "campaign_id": campaign_id,
+            "campaign_name": str(raw.get("campaign_name") or "")[:500],
+            "store_name": str(raw.get("store_name") or "")[:255],
+            "strategy": strategy,
+            "series": series,
+            "product": product,
+        }
+    with session_factory()() as db:
+        site_codes = {item["site_code"] for item in normalized.values()}
+        existing = db.scalars(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code.in_(site_codes))).all()
+        by_key = {(item.site_code, str(item.store_sid), item.campaign_id): item for item in existing}
+        for values in normalized.values():
+            key = (values["site_code"], values["store_sid"], values["campaign_id"])
+            item = by_key.get(key)
+            if item is None:
+                item = AmazonCampaignAssignment(site_code=values["site_code"], store_sid=values["store_sid"], campaign_id=values["campaign_id"])
+                db.add(item)
+                by_key[key] = item
+            if values["campaign_name"]:
+                item.campaign_name = values["campaign_name"]
+            if values["store_name"]:
+                item.store_name = values["store_name"]
+            item.strategy = values["strategy"]
+            item.series = values["series"]
+            item.product = values["product"]
+            item.updated_at = utcnow()
+        db.commit()
+    _amazon_cache.clear()
+    return {"ok": True, "saved": len(normalized)}
 
 
 @app.post("/api/amazon/strategy-board/note")
