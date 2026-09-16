@@ -21,6 +21,7 @@ from app import (
     product_performance_ad_totals,
     amazon_series,
     amazon_sid_accounts,
+    amazon_strategy_board_groups,
     optional_metric,
     strategy_campaign_name,
     require_business_access,
@@ -134,6 +135,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             validate_strategy_series("品类词", "")
         with self.assertRaises(Exception):
             validate_strategy_series("/", "TN10系列（主链接）汇总")
+
+    def test_strategy_groups_omit_placeholder_and_empty_series_rows(self):
+        series = AMAZON_SERIES[0]
+        week = date(2026, 9, 7)
+        metrics = lambda clicks: {"impressions": clicks * 10, "clicks": clicks, "ad_cost": clicks * 0.5, "ad_sales": clicks * 2, "ad_units": clicks, "ad_orders": clicks}
+        aggregate = {
+            ("US", "100", "assigned"): {"site": "美国", "site_code": "US", "store_sid": "100", "store_name": "Shop", "campaign_id": "assigned", "campaign_name": "Assigned", "ad_type": "SP", "currency": "USD", "metrics": metrics(10)},
+            ("US", "100", "legacy-empty-series"): {"site": "美国", "site_code": "US", "store_sid": "100", "store_name": "Shop", "campaign_id": "legacy-empty-series", "campaign_name": "Legacy", "ad_type": "SP", "currency": "USD", "metrics": metrics(8)},
+            ("US", "100", "unclassified"): {"site": "美国", "site_code": "US", "store_sid": "100", "store_name": "Shop", "campaign_id": "unclassified", "campaign_name": "Unclassified", "ad_type": "SP", "currency": "USD", "metrics": metrics(5)},
+        }
+        assignments = {
+            ("US", "100", "assigned"): {"strategy": "品类词", "series": series, "product": "", "campaign_name": "Assigned", "store_name": "Shop"},
+            ("US", "100", "legacy-empty-series"): {"strategy": "竞品词", "series": "", "product": "", "campaign_name": "Legacy", "store_name": "Shop"},
+        }
+        notes = {(week, "US", series, "品类词"): "Keep the note"}
+        groups = amazon_strategy_board_groups(aggregate, assignments, notes, ["美国"], None, week)
+
+        self.assertEqual([(group["strategy"], group["series"]) for group in groups], [("品类词", series), ("/", "")])
+        self.assertEqual([len(group["campaigns"]) for group in groups], [1, 1])
+        self.assertEqual(groups[0]["note"], "Keep the note")
 
     def test_japan_uses_both_named_shops(self):
         accounts = amazon_sid_accounts("日本", {"JP": {"sid": 100}}, [

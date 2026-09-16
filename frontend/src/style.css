@@ -277,3 +277,11 @@
 .campaign-batch-save-button{min-height:42px;margin-left:auto;padding:0 14px;border:1px solid #4d8fd6;border-radius:8px;color:#fff;background:#2563eb;font-size:12px;font-weight:750;cursor:pointer}.campaign-batch-save-button:hover:not(:disabled){background:#1d4ed8}.campaign-batch-save-button:disabled{opacity:.55;cursor:not-allowed}@media(max-width:760px){.campaign-batch-save-button{margin-left:0;width:100%}}
 .week-picker-control{border:0!important;background:transparent!important;overflow:visible!important}
 .week-picker-control .el-date-editor .el-input__wrapper{height:42px!important;padding-top:0!important;padding-bottom:0!important}.week-picker-control .el-date-editor .el-input__inner{height:40px!important;line-height:40px!important;padding-top:0!important;padding-bottom:0!important}.week-picker-control .el-date-editor .el-input__prefix,.week-picker-control .el-date-editor .el-input__suffix{height:40px!important;display:flex!important;align-items:center!important}
+
+/* Strategy-board tracks are explicit: changing one column cannot redistribute
+   the remaining columns. */
+.strategy-board-empty{padding:34px;text-align:center;color:#71839a}
+.strategy-table{width:var(--strategy-table-width)!important;min-width:var(--strategy-table-width)!important;max-width:var(--strategy-table-width)!important}
+.strategy-name-column{width:var(--strategy-name-width)!important;min-width:var(--strategy-name-width)!important;max-width:var(--strategy-name-width)!important}
+.strategy-note-column{width:var(--strategy-note-width)!important;min-width:var(--strategy-note-width)!important;max-width:var(--strategy-note-width)!important}
+.strategy-note-editor textarea{flex:1 1 auto;width:100%;min-width:0}

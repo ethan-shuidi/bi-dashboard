@@ -2054,6 +2054,80 @@ async def fetch_mcp_campaign_report(
     return rows
 
 
+def amazon_strategy_board_groups(
+    aggregate: dict[tuple[str, str, str], dict[str, Any]],
+    assignments: dict[tuple[str, str, str], dict[str, str]],
+    notes: dict[tuple[date, str, str, str], str],
+    selected_sites: list[str],
+    selected_series: set[str] | None,
+    week_scope: date,
+) -> list[dict[str, Any]]:
+    """Build strategy groups from campaigns, without seeded placeholder rows."""
+    metric_names = ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")
+    strategies: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for (site_code, store_sid, campaign_id), item in aggregate.items():
+        if item["metrics"]["clicks"] <= 0:
+            continue
+        assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
+        strategy = assignment.get("strategy", "/")
+        if strategy not in AMAZON_STRATEGY_OPTIONS:
+            strategy = "/"
+        series = assignment.get("series", "") if assignment.get("series", "") in AMAZON_SERIES else ""
+        if strategy != "/" and not series:
+            continue
+        if selected_series is not None and series not in selected_series:
+            continue
+        group_key = (site_code, strategy, series, "")
+        group = strategies.get(group_key)
+        if group is None:
+            group = {
+                "strategy": strategy,
+                "series": series,
+                "product": "",
+                "note": notes.get((week_scope, site_code, series, strategy), ""),
+                "metrics": {name: 0.0 for name in metric_names},
+                "campaigns": [],
+                "sites": [],
+            }
+            strategies[group_key] = group
+        if item["site"] not in group["sites"]:
+            group["sites"].append(item["site"])
+        for name, value in item["metrics"].items():
+            group["metrics"][name] += value
+        group["campaigns"].append({
+            "campaign_id": campaign_id,
+            "campaign_name": item["campaign_name"],
+            "site": item["site"],
+            "site_code": site_code,
+            "store_sid": store_sid,
+            "store_name": item["store_name"],
+            "ad_type": item["ad_type"],
+            "series": series,
+            "product": "",
+            "strategy": strategy,
+            "currency": item["currency"],
+            **finalize_strategy_metrics(item["metrics"]),
+        })
+
+    output: list[dict[str, Any]] = []
+    for site_name in selected_sites:
+        site_code = strategy_site_code(site_name)
+        for group in (group for key, group in strategies.items() if key[0] == site_code):
+            group["campaigns"].sort(key=lambda campaign: (-campaign["clicks"], campaign["campaign_name"]))
+            group["metrics"] = finalize_strategy_metrics(group["metrics"])
+            group["site"] = site_name
+            group["site_code"] = site_code
+            group["currency"] = AMAZON_CURRENCY_CODES.get(site_name, "USD")
+            output.append(group)
+    output.sort(key=lambda group: (
+        selected_sites.index(group["site"]),
+        AMAZON_STRATEGY_OPTIONS.index(group["strategy"]),
+        group.get("series") or "",
+        group.get("product") or "",
+    ))
+    return output
+
+
 async def amazon_strategy_board_payload(
     start_date: date,
     end_date: date,
@@ -2187,50 +2261,8 @@ async def amazon_strategy_board_payload(
             for name, value in metrics.items():
                 item["metrics"][name] += value
 
-    metric_names = ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")
     week_scope = normalize_week_start(start_date)
-    strategies: dict[tuple[str, str, str, str], dict[str, Any]] = {
-        (strategy_site_code(site), name, "", ""): {"strategy": name, "series": "", "product": "", "note": notes.get((week_scope, strategy_site_code(site), "", name), ""), "metrics": {metric: 0.0 for metric in metric_names}, "campaigns": [], "sites": []}
-        for site in selected_sites for name in AMAZON_STRATEGY_OPTIONS
-    }
-    for (site_code, store_sid, campaign_id), item in aggregate.items():
-        if item["metrics"]["clicks"] <= 0:
-            continue
-        assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
-        strategy = assignment.get("strategy", "/")
-        if strategy not in AMAZON_STRATEGY_OPTIONS:
-            strategy = "/"
-        series = assignment.get("series", "") if assignment.get("series", "") in AMAZON_SERIES else ""
-        # Product-level classification is no longer part of the strategy board.
-        # Keep the database column for backward compatibility, but collapse old
-        # product assignments into the strategy + series group.
-        product = ""
-        if series_filter is not None and series not in series_filter:
-            continue
-        # Keep a separate site row when multiple marketplaces are selected, so
-        # native currencies never get added together.
-        group_key = (site_code, strategy, series, product)
-        group = strategies.get(group_key)
-        if group is None:
-            group = {"strategy": strategy, "series": series, "product": product, "note": notes.get((week_scope, site_code, series, strategy), ""), "metrics": {name: 0.0 for name in metric_names}, "campaigns": [], "sites": []}
-            strategies[group_key] = group
-        group["sites"] = [item["site"]]
-        for name, value in item["metrics"].items():
-            group["metrics"][name] += value
-        group["campaigns"].append({"campaign_id": campaign_id, "campaign_name": item["campaign_name"], "site": item["site"], "site_code": site_code, "store_sid": store_sid, "store_name": item["store_name"], "ad_type": item["ad_type"], "series": series, "product": product, "strategy": strategy, "currency": item["currency"], **finalize_strategy_metrics(item["metrics"])})
-
-    output = []
-    for site_name in selected_sites:
-        site_code = strategy_site_code(site_name)
-        site_groups = [group for key, group in strategies.items() if key[0] == site_code]
-        for group in site_groups:
-            group["campaigns"].sort(key=lambda campaign: (-campaign["clicks"], campaign["campaign_name"]))
-            group["metrics"] = finalize_strategy_metrics(group["metrics"])
-            group["site"] = site_name
-            group["site_code"] = site_code
-            group["currency"] = AMAZON_CURRENCY_CODES.get(site_name, "USD")
-            output.append(group)
-    output.sort(key=lambda group: (selected_sites.index(group["site"]), AMAZON_STRATEGY_OPTIONS.index(group["strategy"]), group.get("series") or "", group.get("product") or ""))
+    output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
     response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites}
     _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
