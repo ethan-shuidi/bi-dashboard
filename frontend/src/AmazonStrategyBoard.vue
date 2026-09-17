@@ -33,7 +33,7 @@ const weekEnd = (start) => { const date = new Date(`${monday(start || previousWe
 const strategyEndDate = computed(() => weekEnd(strategyWeekStart.value)); const planEndDate = computed(() => weekEnd(planWeekStart.value))
 function weekNumber(value) { const date = new Date(`${monday(value)}T00:00:00`); const thursday = new Date(date); thursday.setDate(date.getDate() + 3); const firstThursday = new Date(thursday.getFullYear(), 0, 4); const firstMonday = new Date(firstThursday); firstMonday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7)); return Math.floor((date - firstMonday) / 604800000) + 1 }
 const strategyWeekRangeLabel = computed(() => `${formatDotDate(strategyWeekStart.value)}~${formatDotDate(strategyEndDate.value)}`); const planWeekRangeLabel = computed(() => `${formatDotDate(planWeekStart.value)}~${formatDotDate(planEndDate.value)}`)
-const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })))
+const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })).sort((a, b) => compare(a.metrics?.[sort.value.key], b.metrics?.[sort.value.key], sort.value.direction)))
 const summaryMetrics = computed(() => {
   const total = { clicks: 0, ad_cost: 0, ad_sales: 0, ad_orders: 0, ad_units: 0 }
   rows.value.forEach((row) => {
