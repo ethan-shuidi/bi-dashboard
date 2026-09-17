@@ -37,6 +37,30 @@
       ]
     },
     {
+      "path": "/api/amazon/sales-dashboard",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/sales-dashboard/weekly",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/amazon/sales-dashboard/weekly/targets",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/sales-dashboard/targets",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
       "path": "/api/amazon/stores",
       "methods": [
         "GET"
