@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 
 const props = defineProps({
@@ -11,6 +11,8 @@ const year = ref(now.getFullYear())
 const month = ref(now.getMonth() + 1)
 const pickerYear = ref(year.value)
 const datePanelOpen = ref(false)
+const dateTriggerRef = ref(null)
+const datePanelPosition = ref({})
 const model = ref("TN10")
 const models = ["TN10", "TN20"]
 const site = ref("全部站点")
@@ -88,6 +90,29 @@ function changeYear(delta) {
 function toggleDatePicker() {
   pickerYear.value = year.value
   datePanelOpen.value = !datePanelOpen.value
+  if (datePanelOpen.value) {
+    nextTick(updateDatePanelPosition)
+  }
+}
+
+function updateDatePanelPosition() {
+  const rect = dateTriggerRef.value?.getBoundingClientRect()
+  if (!rect) return
+  const viewportGap = 16
+  const preferredWidth = 292
+  const width = Math.min(preferredWidth, window.innerWidth - viewportGap * 2)
+  const estimatedHeight = 190
+  let left = Math.min(rect.left, window.innerWidth - viewportGap - width)
+  left = Math.max(viewportGap, left)
+  let top = rect.bottom + 8
+  if (top + estimatedHeight > window.innerHeight - viewportGap && rect.top > estimatedHeight) {
+    top = Math.max(viewportGap, rect.top - estimatedHeight - 8)
+  }
+  datePanelPosition.value = {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+  }
 }
 
 function chooseMonth(nextMonth) {
@@ -181,14 +206,20 @@ function displayPercent(value) {
 }
 
 function closeDatePicker(event) {
-  if (!event.target.closest?.(".sales-date-field")) datePanelOpen.value = false
+  if (!event.target.closest?.(".sales-date-field, .sales-date-panel")) datePanelOpen.value = false
 }
 
 onMounted(() => {
   document.addEventListener("click", closeDatePicker)
+  window.addEventListener("resize", updateDatePanelPosition)
+  window.addEventListener("scroll", updateDatePanelPosition, true)
   loadDashboard()
 })
-onBeforeUnmount(() => document.removeEventListener("click", closeDatePicker))
+onBeforeUnmount(() => {
+  document.removeEventListener("click", closeDatePicker)
+  window.removeEventListener("resize", updateDatePanelPosition)
+  window.removeEventListener("scroll", updateDatePanelPosition, true)
+})
 watch([year, month, model, site], () => loadDashboard())
 </script>
 
@@ -206,61 +237,68 @@ watch([year, month, model, site], () => loadDashboard())
       </div>
     </section>
 
-    <section class="sales-filter-bar" aria-label="销售看板筛选">
-      <div class="sales-date-field">
-        <button class="sales-date-trigger" type="button" @click.stop="toggleDatePicker">
-          <span>日期</span>
-          <strong>{{ year }}年{{ month }}月</strong>
-          <i :class="{ open: datePanelOpen }">‹</i>
-        </button>
-        <div v-if="datePanelOpen" class="sales-date-panel" @click.stop>
-          <div class="sales-year-picker" aria-label="年份筛选">
-            <button type="button" :disabled="pickerYear <= 2000" @click="changeYear(-1)">‹</button>
-            <strong>{{ pickerYear }}年</strong>
-            <button type="button" :disabled="pickerYear >= 2100" @click="changeYear(1)">›</button>
-          </div>
-          <div class="sales-month-grid" aria-label="月份筛选">
-            <button v-for="item in months" :key="item" :class="{ active: item === month && pickerYear === year }" type="button" @click="chooseMonth(item)">{{ item }}月</button>
-          </div>
+    <section class="sales-target-module" aria-label="月度目标模块（筛选仅作用于本模块）">
+      <section class="sales-filter-bar" aria-label="月度目标模块筛选">
+        <div class="sales-date-field">
+          <button ref="dateTriggerRef" class="sales-date-trigger" type="button" @click.stop="toggleDatePicker">
+            <span>日期</span>
+            <strong>{{ year }}年{{ month }}月</strong>
+            <i :class="{ open: datePanelOpen }">‹</i>
+          </button>
+          <Teleport to="body">
+            <div v-if="datePanelOpen" class="sales-date-panel" :style="datePanelPosition" @click.stop>
+              <div class="sales-year-picker" aria-label="年份筛选">
+                <button type="button" :disabled="pickerYear <= 2000" @click="changeYear(-1)">‹</button>
+                <strong>{{ pickerYear }}年</strong>
+                <button type="button" :disabled="pickerYear >= 2100" @click="changeYear(1)">›</button>
+              </div>
+              <div class="sales-month-grid" aria-label="月份筛选">
+                <button v-for="item in months" :key="item" :class="{ active: item === month && pickerYear === year }" type="button" @click="chooseMonth(item)">{{ item }}月</button>
+              </div>
+            </div>
+          </Teleport>
         </div>
-      </div>
-      <label class="sales-model-field">
-        <span>型号</span>
-        <select :value="model" @change="changeModel($event.target.value)">
-          <option v-for="item in models" :key="item" :value="item">{{ item }}</option>
-        </select>
-      </label>
-      <label class="sales-model-field">
-        <span>站点</span>
-        <select :value="site" @change="changeSite($event.target.value)">
-          <option v-for="item in siteOptions" :key="item" :value="item">{{ item }}</option>
-        </select>
-      </label>
-      <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
-    </section>
-
-    <section class="sales-progress-panel" aria-label="销量目标进度">
-      <div class="sales-progress-copy">
-        <div>
-          <span>销量目标进度</span>
-          <strong>{{ salesProgressPercent === null ? "未设置目标" : displayPercent(salesProgressPercent) }}</strong>
+        <label class="sales-model-field">
+          <span>型号</span>
+          <select :value="model" @change="changeModel($event.target.value)">
+            <option v-for="item in models" :key="item" :value="item">{{ item }}</option>
+          </select>
+        </label>
+        <label class="sales-model-field">
+          <span>站点</span>
+          <select :value="site" @change="changeSite($event.target.value)">
+            <option v-for="item in siteOptions" :key="item" :value="item">{{ item }}</option>
+          </select>
+        </label>
+        <div class="sales-filter-scope">
+          <span>筛选范围</span>
+          <small>仅作用于销量进度和月度目标完成度</small>
         </div>
-        <small>{{ actualScopeLabel }}</small>
-      </div>
-      <div class="sales-progress-track" role="progressbar" :aria-valuenow="salesProgressPercent === null ? undefined : Math.round(salesProgressPercent)" aria-valuemin="0" aria-valuemax="100" :aria-label="salesProgressPercent === null ? '销量完成进度未设置目标' : `销量完成 ${displayPercent(salesProgressPercent)}`">
-        <i :style="{ width: `${salesProgressWidth}%` }" :class="{ over: salesProgressPercent > 100 }"></i>
-      </div>
-      <div class="sales-progress-meta">
-        <span>实际销量 {{ formatNumber(salesProgress.actual) }} / 目标销量 {{ formatNumber(salesProgress.target) }}</span>
-        <span>时间进度：{{ displayPercent(timeProgressPercent) }}</span>
-      </div>
-    </section>
+        <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
+      </section>
 
-    <section v-if="error" class="message error-message" role="alert"><strong>数据加载失败</strong><span>{{ error }}</span></section>
-    <section v-if="notice" class="message success-message" role="status"><span>{{ notice }}</span></section>
-    <section v-if="loading" class="sales-loading">正在获取领星产品表现和云端目标…</section>
+      <section class="sales-progress-panel" aria-label="销量目标进度">
+        <div class="sales-progress-copy">
+          <div>
+            <span>销量目标进度</span>
+            <strong>{{ salesProgressPercent === null ? "未设置目标" : displayPercent(salesProgressPercent) }}</strong>
+          </div>
+          <small>{{ actualScopeLabel }}</small>
+        </div>
+        <div class="sales-progress-track" role="progressbar" :aria-valuenow="salesProgressPercent === null ? undefined : Math.round(salesProgressPercent)" aria-valuemin="0" aria-valuemax="100" :aria-label="salesProgressPercent === null ? '销量完成进度未设置目标' : `销量完成 ${displayPercent(salesProgressPercent)}`">
+          <i :style="{ width: `${salesProgressWidth}%` }" :class="{ over: salesProgressPercent > 100 }"></i>
+        </div>
+        <div class="sales-progress-meta">
+          <span>实际销量 {{ formatNumber(salesProgress.actual) }} / 目标销量 {{ formatNumber(salesProgress.target) }}</span>
+          <span>时间进度：{{ displayPercent(timeProgressPercent) }}</span>
+        </div>
+      </section>
 
-    <section v-else class="sales-table-panel">
+      <section v-if="error" class="message error-message" role="alert"><strong>数据加载失败</strong><span>{{ error }}</span></section>
+      <section v-if="notice" class="message success-message" role="status"><span>{{ notice }}</span></section>
+      <section v-if="loading" class="sales-loading">正在获取领星产品表现和云端目标…</section>
+
+      <section v-else class="sales-table-panel">
       <header>
         <div>
           <span class="section-label">月度目标完成度</span>
@@ -294,6 +332,7 @@ watch([year, month, model, site], () => loadDashboard())
         <span v-if="data.data_quality.source">来源状态：{{ data.data_quality.source }}</span>
         <span>时间基准：{{ data.progress?.time?.site_date || "—" }}（{{ data.progress?.time?.timezone_basis || "站点日期" }}）</span>
       </footer>
+      </section>
     </section>
   </section>
 </template>
