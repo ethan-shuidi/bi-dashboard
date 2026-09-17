@@ -329,6 +329,9 @@
 .sales-percent-input{position:relative;display:inline-block}
 .sales-percent-input input{padding-right:30px}
 .sales-percent-input span{position:absolute;top:1px;right:11px;height:34px;color:#64778c;font-size:13px;font-weight:750;line-height:34px;pointer-events:none}
+.sales-derived-target{display:grid;min-width:180px;gap:2px;text-align:right}
+.sales-derived-target strong{color:#1f3d64;font-weight:800;font-variant-numeric:tabular-nums}
+.sales-derived-target small{color:#8195aa;font-size:11px;font-weight:600}
 .sales-save-button{height:44px;min-width:88px;margin-left:0;padding:0 16px;border:1px solid #1d4ed8;border-radius:9px;color:#fff;background:linear-gradient(135deg,#1e40af,#2563eb);font-size:13px;font-weight:750;cursor:pointer}
 .sales-save-button:hover:not(:disabled){background:linear-gradient(135deg,#1d4ed8,#1e6bf1)}
 .sales-save-button:disabled{opacity:.55;cursor:not-allowed}

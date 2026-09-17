@@ -142,17 +142,86 @@ AMAZON_SALES_MODELS = ("TN10", "TN20")
 AMAZON_SALES_ALL_SITES = "全部站点"
 AMAZON_SALES_TN20_SMALL_SERIES = "TN20系列（小链接）汇总"
 AMAZON_SALES_METRICS = (
-    {"key": "units", "label": "销量", "format": "count", "completion": "ratio"},
-    {"key": "net_sales", "label": "销售额", "format": "money", "completion": "ratio"},
-    {"key": "cpc", "label": "CPC", "format": "money", "completion": "difference", "difference_rule": "lower_is_red"},
-    {"key": "ad_sales_share", "label": "广告销量占比", "format": "percent", "completion": "difference", "difference_rule": "lower_is_red"},
-    {"key": "acoas", "label": "广告费比", "format": "percent", "completion": "difference", "difference_rule": "lower_is_red"},
-    {"key": "ad_units", "label": "广告销量", "format": "count", "completion": "difference", "difference_rule": "higher_is_red"},
-    {"key": "sessions", "label": "流量", "format": "count", "completion": "difference", "difference_rule": "higher_is_red"},
-    {"key": "ad_cvr", "label": "转化（广告CVR）", "format": "percent", "completion": "difference", "difference_rule": "higher_is_red"},
-    {"key": "ad_cost", "label": "广告花费", "format": "money", "completion": "difference", "difference_rule": "higher_is_red"},
+    {
+        "key": "units",
+        "label": "销量",
+        "format": "count",
+        "completion": "ratio",
+        "target_input": True,
+    },
+    {
+        "key": "aov",
+        "label": "客单",
+        "format": "money",
+        "completion": "difference",
+        "difference_rule": "lower_is_red",
+        "target_input": True,
+    },
+    {
+        "key": "net_sales",
+        "label": "销售额",
+        "format": "money",
+        "completion": "ratio",
+        "target_formula": "销量 × 客单",
+    },
+    {
+        "key": "cpc",
+        "label": "CPC",
+        "format": "money",
+        "completion": "difference",
+        "difference_rule": "lower_is_red",
+        "target_input": True,
+    },
+    {
+        "key": "ad_sales_share",
+        "label": "广告销量占比",
+        "format": "percent",
+        "completion": "difference",
+        "difference_rule": "lower_is_red",
+        "target_input": True,
+    },
+    {
+        "key": "acoas",
+        "label": "广告费比",
+        "format": "percent",
+        "completion": "difference",
+        "difference_rule": "lower_is_red",
+        "target_formula": "广告花费 ÷ 销售额",
+    },
+    {
+        "key": "ad_units",
+        "label": "广告销量",
+        "format": "count",
+        "completion": "difference",
+        "difference_rule": "higher_is_red",
+        "target_formula": "广告点击 × 广告CVR",
+    },
+    {
+        "key": "clicks",
+        "label": "广告点击",
+        "format": "count",
+        "completion": "difference",
+        "difference_rule": "higher_is_red",
+        "target_formula": "销量 × 广告销量占比 ÷ 广告CVR",
+    },
+    {
+        "key": "ad_cvr",
+        "label": "广告CVR",
+        "format": "percent",
+        "completion": "difference",
+        "difference_rule": "higher_is_red",
+        "target_input": True,
+    },
+    {
+        "key": "ad_cost",
+        "label": "广告花费",
+        "format": "money",
+        "completion": "difference",
+        "difference_rule": "higher_is_red",
+        "target_formula": "CPC × 广告点击",
+    },
 )
-AMAZON_SALES_TARGET_FIELDS = tuple(metric["key"] for metric in AMAZON_SALES_METRICS)
+AMAZON_SALES_TARGET_FIELDS = tuple(metric["key"] for metric in AMAZON_SALES_METRICS if metric.get("target_input"))
 AMAZON_SITE_ORDER = ("美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典")
 AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "德国": "DE", "英国": "UK", "法国": "FR", "加拿大": "CA", "澳洲": "AU", "西班牙": "ES", "意大利": "IT", "荷兰": "NL", "比利时": "BE", "墨西哥": "MX", "爱尔兰": "IE", "波兰": "PL", "瑞典": "SE"}
 AMAZON_SITE_TIMEZONES = {
@@ -357,6 +426,7 @@ class AmazonMonthlyTarget(Base):
     model = Column(String(16), nullable=False)
     site = Column(String(32), nullable=False, default=AMAZON_SALES_ALL_SITES)
     target_units = Column(Numeric(18, 4), nullable=True)
+    target_aov = Column(Numeric(18, 4), nullable=True)
     target_net_sales = Column(Numeric(18, 4), nullable=True)
     target_cpc = Column(Numeric(18, 4), nullable=True)
     target_ad_sales_share = Column(Numeric(18, 8), nullable=True)
@@ -511,7 +581,7 @@ def amazon_sales_selected_sites(site: str) -> list[str]:
 
 def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     """Aggregate product rows from totals so derived ratios stay correct."""
-    additive = ("units", "net_sales", "clicks", "ad_cost", "ad_units", "sessions", "ad_orders")
+    additive = ("units", "net_sales", "clicks", "ad_cost", "ad_units", "ad_orders")
     totals: dict[str, float] = {key: 0.0 for key in additive}
     present = {key: False for key in additive}
     for row in rows:
@@ -522,12 +592,12 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
                 present[key] = True
     return {
         "units": totals["units"] if present["units"] else None,
+        "aov": totals["net_sales"] / totals["units"] if present["net_sales"] and totals["units"] else None,
         "net_sales": totals["net_sales"] if present["net_sales"] else None,
         "cpc": totals["ad_cost"] / totals["clicks"] if present["ad_cost"] and totals["clicks"] else None,
         "ad_sales_share": totals["ad_units"] / totals["units"] if present["ad_units"] and totals["units"] else None,
         "acoas": totals["ad_cost"] / totals["net_sales"] if present["ad_cost"] and totals["net_sales"] else None,
         "ad_units": totals["ad_units"] if present["ad_units"] else None,
-        "sessions": totals["sessions"] if present["sessions"] else None,
         "ad_cvr": totals["ad_orders"] / totals["clicks"] if present["ad_orders"] and totals["clicks"] else None,
         "ad_cost": totals["ad_cost"] if present["ad_cost"] else None,
         "clicks": totals["clicks"] if present["clicks"] else None,
@@ -535,11 +605,48 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
 
 
 def amazon_sales_target_values(item: AmazonMonthlyTarget | None) -> dict[str, float | None]:
+    """Read the five manually entered targets.
+
+    Older rows did not store AOV directly. When both a legacy sales target and
+    a unit target exist, recover AOV from them so existing data remains useful.
+    Derived targets are intentionally not persisted; they are calculated from
+    the manual values every time the dashboard is rendered.
+    """
     if item is None:
         return {key: None for key in AMAZON_SALES_TARGET_FIELDS}
-    return {
+    values = {
         key: float(value) if (value := getattr(item, f"target_{key}")) is not None else None
         for key in AMAZON_SALES_TARGET_FIELDS
+    }
+    legacy_sales = getattr(item, "target_net_sales", None)
+    if values.get("aov") is None and legacy_sales is not None and values.get("units"):
+        values["aov"] = float(legacy_sales) / float(values["units"])
+    return values
+
+
+def amazon_sales_derived_targets(targets: dict[str, float | None]) -> dict[str, float | None]:
+    """Calculate non-manual monthly targets from the five manual inputs."""
+    units = targets.get("units")
+    aov = targets.get("aov")
+    cpc = targets.get("cpc")
+    ad_sales_share = targets.get("ad_sales_share")
+    ad_cvr = targets.get("ad_cvr")
+
+    net_sales = units * aov if units is not None and aov is not None else None
+    clicks = (
+        units * ad_sales_share / ad_cvr
+        if units is not None and ad_sales_share is not None and ad_cvr
+        else None
+    )
+    ad_units = clicks * ad_cvr if clicks is not None and ad_cvr is not None else None
+    ad_cost = cpc * clicks if cpc is not None and clicks is not None else None
+    acoas = ad_cost / net_sales if ad_cost is not None and net_sales else None
+    return {
+        "net_sales": net_sales,
+        "clicks": clicks,
+        "ad_units": ad_units,
+        "ad_cost": ad_cost,
+        "acoas": acoas,
     }
 
 
@@ -578,9 +685,10 @@ def amazon_sales_metric_rows(
     actuals: dict[str, float | None],
 ) -> list[dict[str, Any]]:
     output = []
+    derived_targets = amazon_sales_derived_targets(targets)
     for definition in AMAZON_SALES_METRICS:
         key = definition["key"]
-        target = targets.get(key)
+        target = targets.get(key) if definition.get("target_input") else derived_targets.get(key)
         actual = actuals.get(key)
         output.append({
             **definition,
@@ -1087,7 +1195,7 @@ def lingxing_auth_params(token: str, business: dict[str, Any]) -> dict[str, Any]
 
 
 def migrate_amazon_monthly_targets(engine) -> None:
-    """Add the site dimension to target rows created before this release."""
+    """Migrate monthly-target rows created before this release."""
     table = AmazonMonthlyTarget.__tablename__
     unique_name = "uq_amazon_monthly_target_scope_site"
     with engine.begin() as connection:
@@ -1096,6 +1204,11 @@ def migrate_amazon_monthly_targets(engine) -> None:
             return
         columns = {column["name"] for column in inspector.get_columns(table)}
         is_mysql = engine.dialect.name == "mysql"
+        if "target_aov" not in columns:
+            if is_mysql:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN target_aov DECIMAL(18, 4) NULL"))
+            else:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN target_aov NUMERIC(18, 4) NULL"))
         site_added = False
         if "site" not in columns:
             site_added = True

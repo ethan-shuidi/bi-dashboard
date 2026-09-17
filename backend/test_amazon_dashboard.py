@@ -29,6 +29,7 @@ from app import (
     amazon_series,
     amazon_sales_actuals,
     amazon_sales_completion,
+    amazon_sales_derived_targets,
     amazon_sales_metric_rows,
     amazon_sales_selected_sites,
     amazon_sales_scope,
@@ -407,6 +408,9 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIsNone(amazon_sales_target_number(None))
         self.assertIsNone(amazon_sales_target_number(""))
         self.assertEqual(amazon_sales_target_number("12.5"), 12.5)
+
+    def test_sales_targets_only_accept_the_five_manual_inputs(self):
+        self.assertEqual(AMAZON_SALES_TARGET_FIELDS, ("units", "aov", "cpc", "ad_sales_share", "ad_cvr"))
         for invalid in (-1, "abc", float("inf")):
             with self.assertRaises(ValueError):
                 amazon_sales_target_number(invalid)
@@ -458,6 +462,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 "SELECT year, month, model, site, target_units FROM amazon_monthly_targets"
             )).one()
         self.assertIn("site", columns)
+        self.assertIn("target_aov", columns)
         self.assertEqual(row.site, AMAZON_SALES_ALL_SITES)
         self.assertEqual(row.target_units, 100)
         self.assertTrue(any(index["name"] == "uq_amazon_monthly_target_scope_site" and index["unique"] for index in indexes))
@@ -485,11 +490,43 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         ]
         actuals = amazon_sales_actuals(rows)
         self.assertEqual(actuals["units"], 25)
+        self.assertAlmostEqual(actuals["aov"], 500 / 25)
         self.assertEqual(actuals["net_sales"], 500)
+        self.assertEqual(actuals["clicks"], 50)
         self.assertAlmostEqual(actuals["cpc"], 40 / 50)
         self.assertAlmostEqual(actuals["ad_sales_share"], 10 / 25)
         self.assertAlmostEqual(actuals["acoas"], 40 / 500)
         self.assertAlmostEqual(actuals["ad_cvr"], 10 / 50)
+
+    def test_sales_derived_targets_follow_requested_formulas(self):
+        targets = {
+            "units": 100,
+            "aov": 80,
+            "cpc": 0.5,
+            "ad_sales_share": 0.25,
+            "ad_cvr": 0.05,
+        }
+        derived = amazon_sales_derived_targets(targets)
+        self.assertEqual(derived["net_sales"], 8000)
+        self.assertEqual(derived["clicks"], 500)
+        self.assertEqual(derived["ad_units"], 25)
+        self.assertEqual(derived["ad_cost"], 250)
+        self.assertAlmostEqual(derived["acoas"], 250 / 8000)
+
+    def test_sales_metric_rows_use_manual_and_derived_targets(self):
+        rows = amazon_sales_metric_rows(
+            {"units": 100, "aov": 80, "cpc": 0.5, "ad_sales_share": 0.25, "ad_cvr": 0.05},
+            {"units": 90, "aov": 70, "net_sales": 6300, "cpc": 0.4, "clicks": 400},
+        )
+        by_key = {row["key"]: row for row in rows}
+        self.assertEqual(by_key["aov"]["target"], 80)
+        self.assertEqual(by_key["net_sales"]["target"], 8000)
+        self.assertEqual(by_key["clicks"]["label"], "广告点击")
+        self.assertEqual(by_key["clicks"]["target"], 500)
+        self.assertEqual(by_key["ad_cvr"]["label"], "广告CVR")
+        self.assertEqual(by_key["ad_units"]["target"], 25)
+        self.assertEqual(by_key["ad_cost"]["target"], 250)
+        self.assertAlmostEqual(by_key["acoas"]["target"], 250 / 8000)
 
     def test_sales_metric_rows_include_target_actual_and_completion(self):
         rows = amazon_sales_metric_rows(

@@ -27,7 +27,8 @@ const targetDraft = ref({})
 const savedTargets = ref({})
 
 const metricRows = computed(() => data.value?.metrics || [])
-const dirty = computed(() => metricRows.value.some(({ key }) => String(targetDraft.value[key] ?? "") !== String(savedTargets.value[key] ?? "")))
+const editableRows = computed(() => metricRows.value.filter(({ target_input }) => target_input))
+const dirty = computed(() => editableRows.value.some(({ key }) => String(targetDraft.value[key] ?? "") !== String(savedTargets.value[key] ?? "")))
 const salesProgress = computed(() => data.value?.progress?.sales || {})
 const timeProgress = computed(() => data.value?.progress?.time || {})
 const salesProgressPercent = computed(() => {
@@ -50,7 +51,7 @@ async function api(path, options = {}) {
 
 function syncDraft(targets = {}) {
   const values = {}
-  for (const item of data.value?.metrics || []) {
+  for (const item of editableRows.value) {
     let value = targets[item.key]
     if (item.format === "percent" && value !== null && value !== undefined && value !== "") {
       value = String(Number((Number(value) * 100).toFixed(8)))
@@ -142,7 +143,7 @@ async function saveTargets() {
   notice.value = ""
   try {
     const targets = {}
-    for (const item of metricRows.value) {
+    for (const item of editableRows.value) {
       const value = targetDraft.value[item.key] ?? ""
       if (item.format === "percent" && value !== "") {
         const percent = Number(value)
@@ -304,7 +305,7 @@ watch([year, month, model, site], () => loadDashboard())
           <span class="section-label">月度目标完成度</span>
           <h2>月度目标完成度看板</h2>
         </div>
-        <small>百分比目标请直接填写百分数：10% 填 10。目标保存后完成率立即重算。</small>
+        <small>手填销量、客单、CPC、广告销量占比、广告CVR；其他目标自动计算。百分比填 10 表示 10%。</small>
       </header>
       <div class="sales-table-wrap">
         <table class="sales-target-table">
@@ -315,11 +316,15 @@ watch([year, month, model, site], () => loadDashboard())
             <tr v-for="row in metricRows" :key="row.key">
               <th scope="row">{{ row.label }}</th>
               <td>
-                <div v-if="row.format === 'percent'" class="sales-percent-input">
+                <div v-if="row.target_input && row.format === 'percent'" class="sales-percent-input">
                   <input v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="如 10" aria-label="{{ row.label }} 月度目标（百分比）">
                   <span>%</span>
                 </div>
-                <input v-else v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="请输入目标" aria-label="{{ row.label }} 月度目标">
+                <input v-else-if="row.target_input" v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="请输入目标" aria-label="{{ row.label }} 月度目标">
+                <div v-else class="sales-derived-target">
+                  <strong>{{ formatMetric(row, "target") }}</strong>
+                  <small>{{ row.target_formula }}</small>
+                </div>
               </td>
               <td>{{ formatMetric(row, "actual") }}</td>
               <td><span :class="['sales-completion', row.completion?.status]">{{ formatCompletion(row) }}</span></td>
