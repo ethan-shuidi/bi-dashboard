@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 import AmazonAdsCharts from "./AmazonAdsCharts.vue"
+import AmazonPlanBoard from "./AmazonPlanBoard.vue"
 import AmazonStrategyBoard from "./AmazonStrategyBoard.vue"
 
 const apiBase = ref("")
@@ -787,6 +788,7 @@ onBeforeUnmount(() => {
     </section>
     <AmazonAdsCharts :api-base="apiBase" />
     <AmazonStrategyBoard :api-base="apiBase" />
+    <AmazonPlanBoard :api-base="apiBase" plan-type="ad" />
      <div v-if="copyMessage" class="amazon-copy-toast" role="status" aria-live="polite">{{ copyMessage }}</div>
    </div>
  </template>

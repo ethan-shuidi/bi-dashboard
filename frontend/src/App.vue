@@ -5,7 +5,6 @@ import { BarChart, LineChart } from "echarts/charts"
 import { AriaComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components"
 import { CanvasRenderer } from "echarts/renderers"
 import AmazonDashboard from "./AmazonDashboard.vue"
-import AmazonAdPlanDashboard from "./AmazonAdPlanDashboard.vue"
 import AmazonSalesDashboard from "./AmazonSalesDashboard.vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 
@@ -26,7 +25,6 @@ const sidebarCollapsed = ref(true)
 const dashboardNavDefaults = [
   { key: "commerce", label: "Shopify数据看板", icon: "⌁" },
   { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
-  { key: "amazon-ad-plan", label: "Amazon-广告计划", icon: "✎" },
   { key: "amazon-sales", label: "Amazon-销售看板", icon: "◎" },
 ]
 const dashboardNavStorageKey = "ideadock.dashboard.navigation-order.v1"
@@ -341,7 +339,6 @@ onBeforeUnmount(() => {
       </aside>
 
       <AmazonDashboard v-if="activeDashboard === 'amazon'" class="amazon-dashboard-frame" />
-      <AmazonAdPlanDashboard v-else-if="activeDashboard === 'amazon-ad-plan'" class="amazon-dashboard-frame" :api-base="apiBase" />
       <AmazonSalesDashboard v-else-if="activeDashboard === 'amazon-sales'" class="amazon-dashboard-frame" :api-base="apiBase" />
 
       <div v-else class="content-shell">

@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
+import { ElMessageBox } from "element-plus"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 import WeekPicker from "./WeekPicker.vue"
 
@@ -193,6 +194,24 @@ async function saveTargets() {
   }
 }
 
+async function refreshTargets() {
+  if (loading.value) return
+  if (dirty.value) {
+    try {
+      await ElMessageBox.confirm("有未保存内容，是否刷新", "刷新确认", {
+        confirmButtonText: "是",
+        cancelButtonText: "否",
+        type: "warning",
+      })
+    } catch {
+      return
+    }
+  }
+  notice.value = ""
+  await loadDashboard({ refresh: true })
+  if (!error.value) notice.value = `${dimensionName.value}数据已刷新`
+}
+
 function formatLocalDate(value) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`
 }
@@ -315,7 +334,10 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
         <span>筛选范围</span>
         <small>仅作用于销量进度和{{ dimensionName }}目标完成度</small>
       </div>
-      <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
+      <div class="sales-filter-actions">
+        <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
+        <button class="sales-refresh-button" type="button" :disabled="saving || loading" @click="refreshTargets">刷新</button>
+      </div>
     </section>
 
     <section class="sales-progress-panel" aria-label="销量目标进度">
