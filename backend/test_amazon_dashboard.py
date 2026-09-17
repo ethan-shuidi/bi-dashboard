@@ -39,6 +39,7 @@ from app import (
     amazon_sales_week_time_progress,
     amazon_sales_target_values,
     amazon_sales_target_number,
+    amazon_week_label,
     amazon_ads_chart_rows,
     amazon_ads_charts,
     normalize_week_start,
@@ -841,6 +842,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertAlmostEqual(row["ad_cvr"], 0.05)
         self.assertEqual(row["sessions"], 150)
         self.assertEqual(row["page_views"], 420)
+
+    def test_ads_chart_rows_use_backend_iso_week_labels(self):
+        rows = amazon_ads_chart_rows({
+            "rows": [
+                {
+                    "period": "2025-12-29~2026-01-04",
+                    "period_start": "2025-12-29",
+                    "period_end": "2026-01-04",
+                    "net_sales": 100,
+                },
+                {
+                    "period": "2026-09-07~2026-09-13",
+                    "period_start": "2026-09-07",
+                    "period_end": "2026-09-13",
+                    "net_sales": 200,
+                },
+            ]
+        })
+        self.assertEqual([row["week_label"] for row in rows], ["W01", "W37"])
+        self.assertEqual(amazon_week_label("2026-09-14"), "W38")
 
     def test_ads_chart_keeps_missing_pv_explicitly_unavailable(self):
         row = amazon_ads_chart_rows({

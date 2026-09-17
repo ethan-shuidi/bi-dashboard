@@ -3317,6 +3317,16 @@ def normalize_week_start(value: date | None) -> date:
     return selected - timedelta(days=selected.weekday())
 
 
+def amazon_week_label(period_start: str) -> str | None:
+    """Return the ISO week label used consistently by the ad charts."""
+
+    try:
+        week = date.fromisoformat(period_start).isocalendar()[1]
+    except ValueError:
+        return None
+    return f"W{week:02d}"
+
+
 def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
     """Collapse product/site rows into the three weekly ad-chart datasets."""
 
@@ -3353,6 +3363,7 @@ def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
             "period": item["period"],
             "period_start": item["period_start"],
             "period_end": item["period_end"],
+            "week_label": amazon_week_label(item["period_start"]),
             "net_sales": net_sales,
             "ad_sales": ad_sales,
             "ad_cost": ad_cost,

@@ -27,8 +27,15 @@ let conversionChart
 let trafficChart
 let resizeObserver
 
+function parseDate(value) {
+  if (!value) return new Date()
+  if (value instanceof Date) return new Date(value)
+  const parsed = new Date(`${value}T00:00:00`)
+  return parsed
+}
+
 function monday(value) {
-  const date = value ? new Date(`${value}T00:00:00`) : new Date()
+  const date = parseDate(value)
   date.setHours(0, 0, 0, 0)
   date.setDate(date.getDate() - ((date.getDay() + 6) % 7))
   return date
@@ -54,7 +61,7 @@ const startWeek = ref(isoDate(addDays(monday(), -28)))
 const rows = ref([])
 const currency = ref("USD")
 const fieldAvailability = ref(null)
-const weekLabels = computed(() => rows.value.map((row) => `W${String(isoWeek(row.period_start)).padStart(2, "0")}`))
+const weekLabels = computed(() => rows.value.map((row) => row.week_label || `W${String(isoWeek(row.period_start)).padStart(2, "0")}`))
 
 const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value || 0))
 const money = (value) => `${currency.value} ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(Number(value || 0))}`
