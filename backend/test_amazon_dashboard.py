@@ -184,6 +184,32 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(result.pages, 3)
         self.assertTrue(result.complete)
 
+    def test_mcp_campaign_short_final_page_is_complete_without_total_count(self):
+        shops_response = mcp_response({"success": True, "data": [{"sid": 14292, "profile_id": "profile-1"}]})
+        first_rows = [{"campaign_id": str(index), "campaign_name": f"Campaign {index}", "sponsored_type": "SP"} for index in range(1, 101)]
+        first_rows.insert(0, {"clicks": 999999})
+        second_rows = [{"campaign_id": str(index), "campaign_name": f"Campaign {index}", "sponsored_type": "SP"} for index in range(101, 108)]
+        batches = [
+            mcp_response({"success": True, "data": {"data": first_rows}}),
+            mcp_response({"success": True, "data": {"data": second_rows}}),
+        ]
+        client = AsyncMock()
+        client.post.side_effect = [
+            *mcp_metadata_responses("ad_auth_shops"),
+            shops_response,
+            *mcp_metadata_responses("ad_campaign_report"),
+            *batches,
+        ]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            _reset_lingxing_mcp_metadata_cache()
+            result = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+            _reset_lingxing_mcp_metadata_cache()
+        self.assertEqual(len(result.rows), 107)
+        self.assertIsNone(result.expected)
+        self.assertEqual(result.pages, 2)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.error, "")
+
     def test_mcp_campaign_profile_missing_is_explicitly_incomplete(self):
         shops_response = mcp_response({"success": True, "data": [{"sid": 99999, "profile_id": "other"}]})
         client = AsyncMock()
@@ -200,6 +226,8 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(ad_report_type({"sponsored_type": "SB2", "creative_type": "VIDEO"}), "SBV")
         self.assertEqual(ad_report_type({"sponsored_type": "HSA", "creative_type": "video"}), "SBV")
         self.assertEqual(ad_report_type({"sponsored_type": "SB2", "creative_type": "PRODUCT_COLLECTION"}), "SB")
+        self.assertEqual(ad_report_type({"sponsored_type": "SB2", "campaign_name": "US-TN10-C-SBV-MK-E"}), "SBV")
+        self.assertEqual(ad_report_type({"sponsored_type": "SB2", "campaign_name": "US-TN10-C-SB-MK-E"}), "SB")
 
     def test_strategy_data_quality_reports_counts_and_type_presence(self):
         raw_rows = [

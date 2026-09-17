@@ -753,7 +753,13 @@ def ad_report_type(row: dict[str, Any]) -> str:
     sponsored = str(_first_nested_field_value(row, ("sponsored_type", "sponsoredType")) or "").strip().upper()
     if sponsored in {"HSA", "SB2", "SPONSORED_BRANDS"}:
         creative = str(_first_nested_field_value(row, ("creative_type", "creativeType")) or "").upper()
-        return "SBV" if "VIDEO" in creative else "SB"
+        if "VIDEO" in creative:
+            return "SBV"
+        # Some LingXing campaign-report versions omit creative_type. Campaign
+        # names in this account use an explicit SBV token, so use it only as
+        # the last fallback for an already-identified Sponsored Brands row.
+        campaign_name = ad_report_campaign_name(row).upper()
+        return "SBV" if "SBV" in campaign_name else "SB"
     keys = ("ad_type", "adType", "ads_type", "adsType", "advertising_type", "advertisingType", "type", "product_type", "productType", "campaign_type", "campaignType", "ad_product", "adProduct", "campaign_type_name", "campaignTypeName", "ad_format", "adFormat", "ad_type_name", "adTypeName", "sponsored_type", "sponsoredType")
     for key in keys:
         value = _first_nested_field_value(row, (key,))
@@ -2274,6 +2280,7 @@ async def fetch_mcp_campaign_report(
     expected: int | None = None
     pages = 0
     errors: list[str] = []
+    ended_with_short_page = False
     page = 1
     while True:
         try:
@@ -2296,12 +2303,10 @@ async def fetch_mcp_campaign_report(
         if page_expected is not None:
             expected = page_expected
         pages += 1
+        ended_with_short_page = len(batch) < 100
         if not batch:
-            errors.append(
-                "LingXing MCP campaign report did not return a total count"
-                if expected is None
-                else f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns"
-            )
+            if expected is not None and len(rows) != expected:
+                errors.append(f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns")
             break
         for row in batch:
             # The campaign report prepends an aggregate row with metrics but
@@ -2313,17 +2318,21 @@ async def fetch_mcp_campaign_report(
                 errors.append(f"LingXing MCP campaign report returned {len(rows)} campaigns; expected {expected}")
             break
         if len(batch) < 100:
-            errors.append(
-                "LingXing MCP campaign report did not return a total count"
-                if expected is None
-                else f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns"
-            )
+            if expected is not None and len(rows) != expected:
+                errors.append(f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns")
             break
         if page >= 50:
             errors.append("LingXing MCP campaign report exceeded the pagination safety limit")
             break
         page += 1
-    complete = expected is not None and len(rows) == expected and not errors
+    # Newer MCP responses may omit recordsFiltered. A full page followed by a
+    # short final page is still an exhaustive traversal; retain the explicit
+    # count check whenever the upstream provides one.
+    exhausted_without_total = expected is None and pages > 0 and ended_with_short_page
+    complete = (
+        (expected is not None and len(rows) == expected or exhausted_without_total)
+        and not errors
+    )
     return CampaignReportResult(rows, expected, pages, True, complete, "; ".join(errors))
 
 
