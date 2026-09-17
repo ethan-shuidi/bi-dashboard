@@ -8,8 +8,14 @@ const props = defineProps({ apiBase: { type: String, default: "" } })
 
 const siteOptions = ["全部站点", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
 const modelOptions = ["TN10", "TN20"]
+const quickRangeOptions = [
+  { label: "近5周", value: 5 },
+  { label: "近10周", value: 10 },
+  { label: "近15周", value: 15 },
+]
 const site = ref("全部站点")
 const model = ref("TN10")
+const quickRange = ref(5)
 const loading = ref(false)
 const error = ref("")
 const data = ref(null)
@@ -30,17 +36,25 @@ function monday(value) {
 function isoDate(value) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`
 }
-const lastWeek = monday()
-lastWeek.setDate(lastWeek.getDate() - 7)
-const endWeek = ref(isoDate(lastWeek))
-const rangeStart = monday(lastWeek)
-rangeStart.setDate(rangeStart.getDate() - 49)
-const startWeek = ref(isoDate(rangeStart))
+function addDays(value, amount) {
+  const date = new Date(value)
+  date.setDate(date.getDate() + amount)
+  return date
+}
+function isoWeek(value) {
+  const start = monday(value)
+  const thursday = addDays(start, 3)
+  const firstThursday = new Date(thursday.getFullYear(), 0, 4)
+  const firstMonday = monday(firstThursday)
+  return Math.floor((start - firstMonday) / 604800000) + 1
+}
+const endWeek = ref(isoDate(monday()))
+const startWeek = ref(isoDate(addDays(monday(), -28)))
 
 const rows = ref([])
 const currency = ref("USD")
 const fieldAvailability = ref(null)
-const weekLabels = computed(() => rows.value.map((row) => `${row.period_start.slice(5)}~${row.period_end.slice(5)}`))
+const weekLabels = computed(() => rows.value.map((row) => `W${String(isoWeek(row.period_start)).padStart(2, "0")}`))
 
 const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value || 0))
 const money = (value) => `${currency.value} ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(Number(value || 0))}`
@@ -59,6 +73,18 @@ function requestErrorMessage(body, status) {
     if (message) return String(message)
   }
   return `请求失败：HTTP ${status}`
+}
+
+function applyQuickRange(weekCount) {
+  const end = monday()
+  endWeek.value = isoDate(end)
+  startWeek.value = isoDate(addDays(end, -(weekCount - 1) * 7))
+}
+
+function syncQuickRange() {
+  const currentWeek = monday()
+  const matched = quickRangeOptions.find(({ value }) => startWeek.value === isoDate(addDays(currentWeek, -(value - 1) * 7)) && endWeek.value === isoDate(currentWeek))
+  quickRange.value = matched?.value ?? null
 }
 
 async function load({ refresh = false } = {}) {
@@ -191,9 +217,11 @@ onMounted(async () => {
 
 watch(startWeek, (value) => {
   if (value && endWeek.value && value > endWeek.value) endWeek.value = value
+  syncQuickRange()
 })
 watch(endWeek, (value) => {
   if (value && startWeek.value && value < startWeek.value) startWeek.value = value
+  syncQuickRange()
 })
 watch(() => [props.apiBase, startWeek.value, endWeek.value, site.value, model.value], () => load())
 
@@ -216,6 +244,7 @@ onBeforeUnmount(() => {
       <button type="button" :disabled="loading" @click="load({ refresh: true })">{{ loading ? "同步中…" : "刷新" }}</button>
     </div>
     <div class="ads-chart-filters">
+      <label><span>快速选择</span><el-select v-model="quickRange" placeholder="自定义范围" @change="applyQuickRange"><el-option v-for="item in quickRangeOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></label>
       <label><span>开始周</span><WeekPicker v-model="startWeek" /></label>
       <label><span>结束周</span><WeekPicker v-model="endWeek" /></label>
       <label><span>站点</span><el-select v-model="site"><el-option v-for="item in siteOptions" :key="item" :label="item" :value="item" /></el-select></label>
@@ -245,10 +274,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .ads-chart-module{position:relative;z-index:1;margin-top:20px;padding:18px;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:var(--shadow-sm)}
 .ads-chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.ads-chart-head span{color:#73849a;font-size:12px;font-weight:750}.ads-chart-head h2{margin:3px 0 0;color:#132f5b;font-size:18px}.ads-chart-head p{margin:5px 0 0;color:#73849a;font-size:12px}.ads-chart-head button{height:36px;padding:0 14px;border:0;border-radius:9px;background:#1e57c8;color:#fff;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.ads-chart-head button:disabled{opacity:.65;cursor:not-allowed}
-.ads-chart-filters{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:12px;margin-top:16px;padding:14px;border:0;border-radius:12px;background:#f7fbff}.ads-chart-filters label{display:grid;gap:6px;min-width:0}.ads-chart-filters span{color:#5f7188;font-size:12px;font-weight:750}
+.ads-chart-filters{display:grid;grid-template-columns:repeat(5,minmax(136px,1fr));gap:12px;margin-top:16px;padding:14px;border:0;border-radius:12px;background:#f7fbff}.ads-chart-filters label{display:grid;gap:6px;min-width:0}.ads-chart-filters span{color:#5f7188;font-size:12px;font-weight:750}
 .ads-chart-error,.ads-chart-loading,.ads-chart-empty{margin-top:16px;padding:34px 16px;border-radius:12px;text-align:center;color:#75869c;background:#f8fbff}
 .ads-chart-error{color:#b52e45;background:#fff4f6}
 .ads-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:16px}.ads-chart-grid article{position:relative;min-width:0;padding:14px;border:1px solid #e5edf7;border-radius:14px;background:#fff}.ads-chart-grid header{display:flex;align-items:center;gap:10px;margin-bottom:8px}.ads-chart-grid header div{display:grid;min-width:0}.ads-chart-grid strong{color:#173d70;font-size:14px}.ads-chart-grid small{overflow:hidden;color:#75869c;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ads-chart-icon{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:10px}.ads-chart-icon svg{width:18px;height:18px;fill:currentColor}.ads-chart-icon.money{color:#1d4ed8;background:#e8f1ff}.ads-chart-icon.click{color:#b45309;background:#fff4df}.ads-chart-icon.traffic{color:#7c3aed;background:#f2ecff}.ads-chart-canvas{width:100%;height:310px}.ads-chart-missing{position:absolute;right:14px;bottom:14px;left:14px;margin:0;padding:7px 10px;border-radius:8px;background:rgba(255,247,235,.94);color:#a05a00;font-size:11px;text-align:center}
-@media (max-width:1500px){.ads-chart-grid{grid-template-columns:1fr}.ads-chart-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:1500px){.ads-chart-grid{grid-template-columns:1fr}.ads-chart-filters{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:720px){.ads-chart-filters{grid-template-columns:1fr}}
 </style>
