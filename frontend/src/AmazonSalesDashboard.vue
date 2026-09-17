@@ -1,5 +1,6 @@
 <script setup>
 import SalesTargetModule from "./SalesTargetModule.vue"
+import AmazonPlanBoard from "./AmazonPlanBoard.vue"
 
 defineProps({
   apiBase: { type: String, required: true },
@@ -21,5 +22,6 @@ defineProps({
 
     <SalesTargetModule :api-base="apiBase" variant="month" />
     <SalesTargetModule :api-base="apiBase" variant="week" />
+    <AmazonPlanBoard :api-base="apiBase" plan-type="operation" />
   </section>
 </template>

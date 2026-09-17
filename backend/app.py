@@ -412,6 +412,22 @@ class AmazonAdPlan(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AmazonOperationPlan(Base):
+    __tablename__ = "amazon_operation_plans"
+    __table_args__ = (
+        UniqueConstraint("week_start", "site_code", "series", name="uq_amazon_operation_plan_scope"),
+        Index("ix_amazon_operation_plan_scope", "week_start", "site_code"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    week_start = Column(Date, nullable=False)
+    site_code = Column(String(12), nullable=False)
+    series = Column(String(160), nullable=False)
+    review = Column(Text, nullable=False, default="")
+    plan = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AmazonStrategyNote(Base):
     # Versioned table keeps legacy site+strategy notes from leaking into the
     # new week+site+series scope and avoids an unsafe in-place constraint change.
@@ -3488,6 +3504,54 @@ def save_ad_plan(
         item = db.scalar(select(AmazonAdPlan).where(AmazonAdPlan.week_start == week_start, AmazonAdPlan.site_code == site_code, AmazonAdPlan.series == series))
         if item is None:
             item = AmazonAdPlan(week_start=week_start, site_code=site_code, series=series)
+            db.add(item)
+        item.review = review
+        item.plan = plan
+        item.updated_at = utcnow()
+        db.commit()
+    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan}
+
+
+@app.get("/api/amazon/operation-plan")
+def get_operation_plan(
+    week_start: date | None = Query(default=None),
+    site: str = Query(default="美国"),
+    series: str = Query(default=""),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    site_code = AMAZON_SITE_CODES.get(site, site.strip().upper())
+    if site_code not in AMAZON_SITE_CODES.values() or series not in AMAZON_SERIES:
+        raise HTTPException(status_code=422, detail="运营计划筛选条件无效")
+    week = normalize_week_start(week_start)
+    with session_factory()() as db:
+        item = db.scalar(select(AmazonOperationPlan).where(AmazonOperationPlan.week_start == week, AmazonOperationPlan.site_code == site_code, AmazonOperationPlan.series == series))
+        if item is None:
+            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": ""}
+        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, "updated_at": item.updated_at.isoformat() if item.updated_at else None}
+
+
+@app.post("/api/amazon/operation-plan")
+def save_operation_plan(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    site = str(payload.get("site") or "美国").strip()
+    site_code = AMAZON_SITE_CODES.get(site, str(payload.get("site_code") or "").strip().upper())
+    series = str(payload.get("series") or "").strip()
+    if site_code not in AMAZON_SITE_CODES.values() or series not in AMAZON_SERIES:
+        raise HTTPException(status_code=422, detail="运营计划筛选条件无效")
+    try:
+        week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="运营计划周格式无效") from exc
+    review = str(payload.get("review") or "")[:20000]
+    plan = str(payload.get("plan") or "")[:20000]
+    with session_factory()() as db:
+        item = db.scalar(select(AmazonOperationPlan).where(AmazonOperationPlan.week_start == week_start, AmazonOperationPlan.site_code == site_code, AmazonOperationPlan.series == series))
+        if item is None:
+            item = AmazonOperationPlan(week_start=week_start, site_code=site_code, series=series)
             db.add(item)
         item.review = review
         item.plan = plan
