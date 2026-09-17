@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import unittest
 from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
@@ -54,6 +55,7 @@ from app import (
     _strategy_campaign_data_quality,
     ad_report_type,
     fetch_mcp_product_performance,
+    fetch_product_performance,
     fetch_mcp_campaign_report,
     lingxing_mcp_call,
     product_performance_typed_clicks_present,
@@ -650,6 +652,40 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             optional_metric({"ads_sales_volume_quantity": "4"}, *AMAZON_SOURCE_FIELDS["performance"]["ad_units"]),
             4.0,
         )
+
+    def test_product_performance_cache_hit_does_not_reference_rate_limit_state(self):
+        start = date(2026, 9, 1)
+        end = date(2026, 9, 7)
+        cache_key = (
+            "product-performance-v3", 101, start.isoformat(), end.isoformat(), ("B0TEST",), "USD"
+        )
+        cached_rows = [{"asin": "B0TEST", "volume": 1}]
+        _amazon_cache[cache_key] = (time.monotonic(), cached_rows)
+        quality = {}
+
+        async def call_cached_product_performance():
+            async with httpx.AsyncClient() as client:
+                return await fetch_product_performance(
+                    101,
+                    start,
+                    end,
+                    "周",
+                    client,
+                    asyncio.Semaphore(1),
+                    ["B0TEST"],
+                    "USD",
+                    quality,
+                )
+
+        try:
+            with patch("app.lingxing_mcp_key", return_value=""):
+                rows = asyncio.run(call_cached_product_performance())
+        finally:
+            _amazon_cache.pop(cache_key, None)
+
+        self.assertEqual(rows, cached_rows)
+        self.assertEqual(quality["raw_rows"], 1)
+        self.assertEqual(quality["errors"], [])
 
     def test_metric_source_mapping_uses_product_performance_for_all_upstream_fields(self):
         self.assertIn("cvr", AMAZON_METRIC_SOURCES["performance"])

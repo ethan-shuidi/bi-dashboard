@@ -1877,6 +1877,7 @@ async def fetch_product_performance(
     while cursor <= end_date:
         chunk_end = min(cursor + timedelta(days=91), end_date)
         cache_key = ("product-performance-v3", sid, cursor.isoformat(), chunk_end.isoformat(), tuple(asin_list or ()), currency_code or "")
+        rate_limited = False
         cached = _amazon_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
             chunk_rows = cached[1]
@@ -1912,7 +1913,6 @@ async def fetch_product_performance(
             # account even when each request is within the documented range.
             # Retry only that specific upstream response with bounded backoff;
             # all other errors still fail fast and remain visible to the UI.
-            rate_limited = False
             for attempt in range(6):
                 try:
                     # The documented token bucket for this endpoint is 1.
