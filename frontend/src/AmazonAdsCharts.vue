@@ -46,6 +46,21 @@ const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "com
 const money = (value) => `${currency.value} ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(Number(value || 0))}`
 const percent = (value) => `${(Number(value || 0) * 100).toFixed(2)}%`
 
+function requestErrorMessage(body, status) {
+  const detail = body?.detail
+  if (typeof detail === "string" && detail) return detail
+  if (Array.isArray(detail)) {
+    const first = detail[0] || {}
+    const field = Array.isArray(first.loc) ? first.loc.filter((item) => typeof item === "string").join(".") : ""
+    const message = first.msg || first.message
+    if (message) return field ? `${field}: ${message}` : String(message)
+  } else if (detail && typeof detail === "object") {
+    const message = detail.message || detail.msg
+    if (message) return String(message)
+  }
+  return `请求失败：HTTP ${status}`
+}
+
 async function load({ refresh = false } = {}) {
   if (!props.apiBase) return
   loading.value = true
@@ -55,7 +70,7 @@ async function load({ refresh = false } = {}) {
     if (refresh) query.set("refresh", "true")
     const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/ads-charts?${query}`)
     const body = await response.json()
-    if (!response.ok) throw new Error(body.detail || `请求失败：HTTP ${response.status}`)
+    if (!response.ok) throw new Error(requestErrorMessage(body, response.status))
     data.value = body
     rows.value = body.rows || []
     currency.value = body.currency || "USD"
@@ -174,6 +189,12 @@ onMounted(async () => {
   await load()
 })
 
+watch(startWeek, (value) => {
+  if (value && endWeek.value && value > endWeek.value) endWeek.value = value
+})
+watch(endWeek, (value) => {
+  if (value && startWeek.value && value < startWeek.value) startWeek.value = value
+})
 watch(() => [props.apiBase, startWeek.value, endWeek.value, site.value, model.value], () => load())
 
 onBeforeUnmount(() => {
@@ -205,15 +226,15 @@ onBeforeUnmount(() => {
     <div v-else-if="!rows.length" class="ads-chart-empty">当前周度范围暂无数据</div>
     <div v-else class="ads-chart-grid">
       <article>
-        <header><span class="ads-chart-icon money" aria-hidden="true">￥</span><div><strong>销售看板</strong><small>销售额 · 广告销售额 · 费比</small></div></header>
+        <header><span class="ads-chart-icon money" aria-hidden="true"><svg viewBox="0 0 24 24" role="presentation"><path d="M12 3.75a1 1 0 0 1 .97.757L13.45 7h2.3a1 1 0 1 1 0 2h-1.85l-.65 3h1.75a1 1 0 1 1 0 2h-2.18l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L10.88 14H8.7l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L6.28 14H5a1 1 0 1 1 0-2h1.68l.65-3H5.75a1 1 0 1 1 0-2h2.05l.48-2.24a1 1 0 0 1 1.955.42L10.12 7h2.18l.35-1.49A1 1 0 0 1 12 3.75ZM9.78 9l-.65 3h2.18l.65-3H9.78Z"/></svg></span><div><strong>销售看板</strong><small>销售额 · 广告销售额 · 费比</small></div></header>
         <div ref="salesChartElement" class="ads-chart-canvas"></div>
       </article>
       <article>
-        <header><span class="ads-chart-icon click" aria-hidden="true">➤</span><div><strong>点击与转化</strong><small>点击数 · 广告转化率</small></div></header>
+        <header><span class="ads-chart-icon click" aria-hidden="true"><svg viewBox="0 0 24 24" role="presentation"><path d="M12 2.25a9.75 9.75 0 1 0 0 19.5 9.75 9.75 0 0 0 0-19.5Zm0 2a7.75 7.75 0 1 1 0 15.5 7.75 7.75 0 0 1 0-15.5Zm3.43 4.02-6.68 2.76c-.78.32-.74 1.45.06 1.71l2.4.78.82 2.32c.27.77 1.37.8 1.68.05l2.7-6.51c.3-.72-.49-1.45-1.2-1.16l.22-.95Z"/></svg></span><div><strong>点击与转化</strong><small>点击数 · 广告转化率</small></div></header>
         <div ref="conversionChartElement" class="ads-chart-canvas"></div>
       </article>
       <article>
-        <header><span class="ads-chart-icon traffic" aria-hidden="true">◎</span><div><strong>流量看板</strong><small>Sessions-Total · PV-Total</small></div></header>
+        <header><span class="ads-chart-icon traffic" aria-hidden="true"><svg viewBox="0 0 24 24" role="presentation"><path d="M12 4.75a7.25 7.25 0 1 0 0 14.5 7.25 7.25 0 0 0 0-14.5Zm0 2c.7 0 1.36.14 1.97.4a2.68 2.68 0 0 1 2.5 4.29A5.25 5.25 0 0 1 12 17.25c-.93 0-1.8-.24-2.56-.66a2.68 2.68 0 0 1 3.51-3.96 2.68 2.68 0 0 1 1.28-3.7A5.23 5.23 0 0 0 8.1 10.9a2.68 2.68 0 0 1 .67 4.86 5.21 5.21 0 0 1-.77-2.76c0-.85.2-1.65.56-2.36a2.68 2.68 0 0 1 3.4-3.78c.01-.04.03-.08.04-.11Zm5.25.25a7.25 7.25 0 0 0-4.3-1.42 2.68 2.68 0 1 1 4.3 1.42Z"/></svg></span><div><strong>流量看板</strong><small>Sessions-Total · PV-Total</small></div></header>
         <div ref="trafficChartElement" class="ads-chart-canvas"></div>
         <p v-if="fieldAvailability && !fieldAvailability.page_views_present" class="ads-chart-missing">领星未返回 PV-Total，已保留空值，未用其他流量替代。</p>
       </article>
@@ -227,7 +248,7 @@ onBeforeUnmount(() => {
 .ads-chart-filters{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:12px;margin-top:16px;padding:14px;border:0;border-radius:12px;background:#f7fbff}.ads-chart-filters label{display:grid;gap:6px;min-width:0}.ads-chart-filters span{color:#5f7188;font-size:12px;font-weight:750}
 .ads-chart-error,.ads-chart-loading,.ads-chart-empty{margin-top:16px;padding:34px 16px;border-radius:12px;text-align:center;color:#75869c;background:#f8fbff}
 .ads-chart-error{color:#b52e45;background:#fff4f6}
-.ads-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:16px}.ads-chart-grid article{position:relative;min-width:0;padding:14px;border:1px solid #e5edf7;border-radius:14px;background:#fff}.ads-chart-grid header{display:flex;align-items:center;gap:10px;margin-bottom:8px}.ads-chart-grid header div{display:grid;min-width:0}.ads-chart-grid strong{color:#173d70;font-size:14px}.ads-chart-grid small{overflow:hidden;color:#75869c;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ads-chart-icon{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:10px;font-size:16px;font-weight:800}.ads-chart-icon.money{color:#1d4ed8;background:#e8f1ff}.ads-chart-icon.click{color:#b45309;background:#fff4df}.ads-chart-icon.traffic{color:#7c3aed;background:#f2ecff}.ads-chart-canvas{width:100%;height:310px}.ads-chart-missing{position:absolute;right:14px;bottom:14px;left:14px;margin:0;padding:7px 10px;border-radius:8px;background:rgba(255,247,235,.94);color:#a05a00;font-size:11px;text-align:center}
+.ads-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:16px}.ads-chart-grid article{position:relative;min-width:0;padding:14px;border:1px solid #e5edf7;border-radius:14px;background:#fff}.ads-chart-grid header{display:flex;align-items:center;gap:10px;margin-bottom:8px}.ads-chart-grid header div{display:grid;min-width:0}.ads-chart-grid strong{color:#173d70;font-size:14px}.ads-chart-grid small{overflow:hidden;color:#75869c;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ads-chart-icon{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:10px}.ads-chart-icon svg{width:18px;height:18px;fill:currentColor}.ads-chart-icon.money{color:#1d4ed8;background:#e8f1ff}.ads-chart-icon.click{color:#b45309;background:#fff4df}.ads-chart-icon.traffic{color:#7c3aed;background:#f2ecff}.ads-chart-canvas{width:100%;height:310px}.ads-chart-missing{position:absolute;right:14px;bottom:14px;left:14px;margin:0;padding:7px 10px;border-radius:8px;background:rgba(255,247,235,.94);color:#a05a00;font-size:11px;text-align:center}
 @media (max-width:1500px){.ads-chart-grid{grid-template-columns:1fr}.ads-chart-filters{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:720px){.ads-chart-filters{grid-template-columns:1fr}}
 </style>
