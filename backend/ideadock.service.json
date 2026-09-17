@@ -114,6 +114,13 @@
         "GET",
         "POST"
       ]
+    },
+    {
+      "path": "/api/amazon/operation-plan",
+      "methods": [
+        "GET",
+        "POST"
+      ]
     }
   ],
   "resources": {
