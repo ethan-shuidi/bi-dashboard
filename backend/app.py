@@ -693,6 +693,9 @@ async def amazon_sales_actual_rows(
         store_rows = []
     if refresh:
         _amazon_cache.clear()
+    # A single site reports in that site's native marketplace currency.  The
+    # all-sites rollup needs one common currency, so it stays in USD.
+    requested_currency = amazon_sales_currency(selected_sites)
     periodic = await amazon_dashboard_periodic(
         comparison,
         period_start,
@@ -702,9 +705,16 @@ async def amazon_sales_actual_rows(
         products,
         sid_map,
         store_rows,
-        "USD",
+        requested_currency,
     )
     return periodic["rows"], periodic["data_quality"]
+
+
+def amazon_sales_currency(selected_sites: list[str]) -> str:
+    """Use the native currency for one site and USD for all-site rollups."""
+    if len(selected_sites) == 1:
+        return AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD")
+    return "USD"
 
 
 def amazon_sales_derived_targets(targets: dict[str, float | None]) -> dict[str, float | None]:
@@ -3403,7 +3413,7 @@ async def amazon_sales_dashboard(
         "models": list(AMAZON_SALES_MODELS),
         "site": site,
         "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
-        "currency": "USD",
+        "currency": amazon_sales_currency(selected_sites),
         "period": {
             "start": month_start.isoformat(),
             "end": month_end.isoformat(),
@@ -3510,7 +3520,7 @@ async def amazon_sales_weekly_dashboard(
         "models": list(AMAZON_SALES_MODELS),
         "site": site,
         "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
-        "currency": "USD",
+        "currency": amazon_sales_currency(selected_sites),
         "period": {
             "start": week.isoformat(),
             "end": week_end.isoformat(),

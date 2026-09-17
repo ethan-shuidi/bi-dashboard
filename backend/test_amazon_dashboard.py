@@ -30,6 +30,7 @@ from app import (
     amazon_series,
     amazon_sales_actuals,
     amazon_sales_completion,
+    amazon_sales_currency,
     amazon_sales_derived_targets,
     amazon_sales_metric_rows,
     amazon_sales_selected_sites,
@@ -437,6 +438,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(amazon_sales_selected_sites(AMAZON_SALES_ALL_SITES), list(AMAZON_SITE_CODES))
         with self.assertRaisesRegex(ValueError, "站点无效"):
             amazon_sales_selected_sites("火星")
+
+    def test_sales_dashboard_currency_follows_site_scope(self):
+        self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("全部站点")), "USD")
+        self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("美国")), "USD")
+        self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("德国")), "EUR")
+        self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("日本")), "JPY")
 
     def test_monthly_target_migration_adds_site_without_losing_legacy_rows(self):
         database = create_engine("sqlite:///:memory:")

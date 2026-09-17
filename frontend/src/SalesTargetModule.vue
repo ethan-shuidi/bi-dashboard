@@ -293,12 +293,12 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
           </div>
         </Teleport>
       </div>
-      <label v-else class="sales-week-field">
+      <div v-else class="sales-week-field">
         <span>周 <b>{{ weekRangeLabel }}</b></span>
         <div class="sales-week-picker-control">
           <WeekPicker :model-value="weekStart" @change="changeWeek" />
         </div>
-      </label>
+      </div>
       <label class="sales-model-field">
         <span>型号</span>
         <select :value="model" @change="changeModel($event.target.value)">
