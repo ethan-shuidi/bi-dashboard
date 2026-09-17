@@ -66,6 +66,20 @@ const weekLabels = computed(() => rows.value.map((row) => row.week_label || `W${
 const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value || 0))
 const money = (value) => `${currency.value} ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(Number(value || 0))}`
 const percent = (value) => `${(Number(value || 0) * 100).toFixed(2)}%`
+const fixedDecimal = (value) => new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Number(value || 0))
+
+function formatChartTooltipValue(seriesName, value) {
+  if (seriesName === "销售额" || seriesName === "广告销售额") return fixedDecimal(value)
+  if (seriesName === "费比" || seriesName === "广告转化率") return percent(value)
+  return value
+}
+
+function chartTooltipFormatter(params) {
+  const items = Array.isArray(params) ? params : [params]
+  if (!items.length) return ""
+  const lines = items.map((item) => `${item.marker} ${item.seriesName}: ${formatChartTooltipValue(item.seriesName, item.value)}`)
+  return `${items[0].name}<br/>${lines.join("<br/>")}`
+}
 
 function requestErrorMessage(body, status) {
   const detail = body?.detail
@@ -132,6 +146,7 @@ function baseOption(ariaText) {
       backgroundColor: "rgba(15, 35, 68, .94)",
       borderWidth: 0,
       textStyle: { color: "#fff", fontSize: 12 },
+      formatter: chartTooltipFormatter,
     },
     xAxis: {
       type: "category",
