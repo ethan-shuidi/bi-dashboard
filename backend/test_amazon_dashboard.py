@@ -83,6 +83,30 @@ def mcp_metadata_responses(tool_id: str, catalog_version: str = "20260915"):
     ]
 
 
+def mcp_metadata_responses_without_versions(tool_id: str):
+    """Reproduce the 2026-09-17 LingXing catalog response contract."""
+
+    return [
+        mcp_response({
+            "success": True,
+            "data": {
+                "usage": "help -> search -> action",
+                "total": 1,
+                "tools": [{"toolId": tool_id, "displayName": tool_id}],
+            },
+        }),
+        mcp_response({
+            "success": True,
+            "data": {
+                "toolId": tool_id,
+                "displayName": tool_id,
+                "toolType": "read",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        }),
+    ]
+
+
 def reset_mcp_test_state():
     _reset_lingxing_mcp_metadata_cache()
     _amazon_cache.pop(("lingxing-mcp-ad-shops",), None)
@@ -180,6 +204,24 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         retry_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
         self.assertEqual(retry_arguments["catalogVersion"], "20260915")
 
+    def test_mcp_version_fallback_survives_catalog_without_version_fields(self):
+        action_response = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [
+            *mcp_metadata_responses_without_versions("ad_auth_shops"),
+            action_response,
+        ]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            reset_mcp_test_state()
+            result = asyncio.run(lingxing_mcp_call("ad_auth_shops", {}, client))
+            reset_mcp_test_state()
+        self.assertEqual(result, {"value": 42})
+        self.assertEqual(client.post.call_count, 3)
+        action_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
+        self.assertEqual(action_arguments["catalogVersion"], "lingxing-mcp-20260915-v1")
+        self.assertEqual(action_arguments["schemaVersion"], "ad_auth_shops-v1-c500-20260907")
+        self.assertEqual(action_arguments["toolVersionId"], 199)
+
     def test_mcp_campaign_report_paginates_to_records_filtered(self):
         shops_response = mcp_response({"success": True, "data": [{"sid": 14292, "profile_id": "profile-1"}]})
         batches = []
@@ -272,6 +314,22 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(quality["type_counts"], {"SP": 1, "SB": 1, "SBV": 1, "SD": 1})
         self.assertEqual(quality["campaign_rows"], 4)
         self.assertEqual(quality["campaign_expected"], 4)
+
+    def test_strategy_data_quality_rejects_and_does_not_cache_untyped_campaigns(self):
+        fetched = [(
+            "美国", "US",
+            [{"sponsored_type": "SP"}, {"campaign_id": "123", "name": "SB campaign"}],
+            [{
+                "source": "mcp", "mcp_ok": True, "campaign_pages": 1,
+                "campaign_rows": 2, "campaign_expected": 2,
+                "profile_found": True, "complete": True, "errors": [],
+            }],
+        )]
+        quality = _strategy_campaign_data_quality(fetched)
+        self.assertFalse(quality["complete"])
+        self.assertFalse(quality["campaign_inventory_complete"])
+        self.assertFalse(quality["cacheable"])
+        self.assertIn("no recognizable ad type", quality["errors"][0])
 
     def test_openapi_product_fallback_is_never_marked_complete(self):
         quality = {

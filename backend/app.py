@@ -117,6 +117,23 @@ LINGXING_MCP_URL = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
 LINGXING_MCP_PRODUCT_TOOL = "query_product_performance_asin_lists"
 LINGXING_MCP_CAMPAIGN_TOOL = "ad_campaign_report"
 LINGXING_MCP_SHOPS_TOOL = "ad_auth_shops"
+LINGXING_MCP_KNOWN_VERSIONS = {
+    LINGXING_MCP_PRODUCT_TOOL: (
+        "lingxing-mcp-20260915-v1",
+        "query_product_performance_asin_lists-v1-c500-20260907",
+        288,
+    ),
+    LINGXING_MCP_CAMPAIGN_TOOL: (
+        "lingxing-mcp-20260915-v1",
+        "ad_campaign_report-260914-v1",
+        180068,
+    ),
+    LINGXING_MCP_SHOPS_TOOL: (
+        "lingxing-mcp-20260915-v1",
+        "ad_auth_shops-v1-c500-20260907",
+        199,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -125,7 +142,7 @@ class LingXingMCPMetadata:
 
     tool_id: str
     schema_version: str
-    tool_version_id: str
+    tool_version_id: int
     catalog_version: str
 AMAZON_SERIES = [
     "TN10系列（主链接）汇总",
@@ -2521,7 +2538,14 @@ async def lingxing_mcp_metadata(
     client: httpx.AsyncClient,
     force_refresh: bool = False,
 ) -> LingXingMCPMetadata:
-    """Resolve a tool against the live catalog instead of pinning it in code."""
+    """Resolve a tool from the live catalog, with a verified version fallback.
+
+    LingXing's catalog responses have changed shape at least once: ``help`` and
+    ``search`` can describe a tool without returning the three version fields
+    required by ``action``.  Prefer fresh catalog values whenever they exist,
+    but keep the last production-verified tuple as a fallback instead of
+    silently dropping the authoritative MCP data source.
+    """
 
     async with _lingxing_mcp_metadata_lock:
         cached = _lingxing_mcp_metadata_cache.get(tool_id)
@@ -2530,30 +2554,77 @@ async def lingxing_mcp_metadata(
         if force_refresh:
             _lingxing_mcp_metadata_cache.clear()
 
-        help_result = await lingxing_mcp_raw("help", {"query": tool_id, "limit": 20}, client)
-        search_result = await lingxing_mcp_raw("search", {"toolId": tool_id}, client)
-        catalog_version = _mcp_scalar(help_result, ("catalogVersion", "catalog_version")) or _mcp_scalar(
-            search_result,
-            ("catalogVersion", "catalog_version"),
+        help_result: Any = None
+        search_result: Any = None
+        discovery_errors: list[str] = []
+        try:
+            help_result = await lingxing_mcp_raw("help", {"query": tool_id, "limit": 20}, client)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            discovery_errors.append(f"help: {exc}")
+        try:
+            search_result = await lingxing_mcp_raw("search", {"toolId": tool_id}, client)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            discovery_errors.append(f"search: {exc}")
+
+        catalog_value = (
+            _mcp_scalar(help_result, ("catalogVersion", "catalog_version"))
+            or _mcp_scalar(search_result, ("catalogVersion", "catalog_version"))
         )
-        tool_record = _mcp_tool_record(search_result, tool_id)
+        tool_record = _mcp_tool_record(search_result, tool_id) or _mcp_tool_record(help_result, tool_id)
         version_source = tool_record or (search_result if isinstance(search_result, dict) else {})
-        schema_version = _mcp_scalar(version_source, ("schemaVersion", "schema_version"))
-        tool_version_id = _mcp_scalar(version_source, ("toolVersionId", "tool_version_id"))
-        if catalog_version in (None, "") or schema_version in (None, "") or tool_version_id in (None, ""):
-            raise RuntimeError(f"LingXing MCP metadata for {tool_id} is incomplete")
+        schema_value = _mcp_scalar(
+            version_source,
+            ("schemaVersion", "schema_version", "inputSchemaVersion", "input_schema_version"),
+        )
+        version_id_value = _mcp_scalar(
+            version_source,
+            ("toolVersionId", "tool_version_id", "latestToolVersionId", "latest_tool_version_id"),
+        )
+        missing_fields = [
+            name
+            for name, value in (
+                ("catalogVersion", catalog_value),
+                ("schemaVersion", schema_value),
+                ("toolVersionId", version_id_value),
+            )
+            if value in (None, "")
+        ]
+
+        if not missing_fields:
+            try:
+                version_id = int(version_id_value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"LingXing MCP metadata for {tool_id} has invalid toolVersionId"
+                ) from exc
+            metadata = LingXingMCPMetadata(
+                tool_id=tool_id,
+                schema_version=str(schema_value),
+                tool_version_id=version_id,
+                catalog_version=str(catalog_value),
+            )
+        else:
+            known_version = LINGXING_MCP_KNOWN_VERSIONS.get(tool_id)
+            if known_version is None:
+                detail = "; ".join([*discovery_errors, f"missing {', '.join(missing_fields)}"])
+                raise RuntimeError(f"LingXing MCP metadata for {tool_id} is incomplete: {detail}")
+            print(
+                f"LingXing MCP metadata fallback for {tool_id}: missing "
+                f"{', '.join(missing_fields)}",
+                flush=True,
+            )
+            metadata = LingXingMCPMetadata(
+                tool_id=tool_id,
+                catalog_version=known_version[0],
+                schema_version=known_version[1],
+                tool_version_id=known_version[2],
+            )
 
         global _lingxing_mcp_catalog_version
-        catalog_text = str(catalog_version)
+        catalog_text = metadata.catalog_version
         if _lingxing_mcp_catalog_version and _lingxing_mcp_catalog_version != catalog_text:
             _lingxing_mcp_metadata_cache.clear()
         _lingxing_mcp_catalog_version = catalog_text
-        metadata = LingXingMCPMetadata(
-            tool_id=tool_id,
-            schema_version=schema_version,
-            tool_version_id=tool_version_id,
-            catalog_version=catalog_version,
-        )
         _lingxing_mcp_metadata_cache[tool_id] = (time.monotonic(), metadata)
         return metadata
 
@@ -2830,12 +2901,24 @@ def _strategy_campaign_data_quality(
     expected_values = [quality.get("campaign_expected") for quality in qualities]
     expected = sum(value for value in expected_values if value is not None) if qualities and all(value is not None for value in expected_values) else None
     type_counts = {ad_type: 0 for ad_type in ("SP", "SB", "SBV", "SD")}
+    missing_type_rows = 0
     for _, _, raw_rows, _ in fetched:
         for raw in raw_rows:
             ad_type = ad_report_type(raw)
             if ad_type in type_counts:
                 type_counts[ad_type] += 1
-    complete = bool(qualities) and all(bool(quality.get("complete")) for quality in qualities)
+            else:
+                missing_type_rows += 1
+    if missing_type_rows:
+        errors.insert(0, f"{missing_type_rows} campaign rows have no recognizable ad type")
+    complete = (
+        bool(qualities)
+        and all(bool(quality.get("complete")) for quality in qualities)
+        and missing_type_rows == 0
+    )
+    cacheable = complete and not errors and bool(qualities) and all(
+        quality.get("source") == "mcp" for quality in qualities
+    )
     return {
         "source": "mcp" if qualities and all(quality.get("source") == "mcp" for quality in qualities) else "openapi_fallback",
         "mcp_ok": bool(qualities) and all(bool(quality.get("mcp_ok")) for quality in qualities),
@@ -2848,6 +2931,7 @@ def _strategy_campaign_data_quality(
         "complete": complete,
         "errors": errors,
         "campaign_inventory_complete": complete,
+        "cacheable": cacheable,
         "unassigned_campaigns_included": True,
     }
 
@@ -3007,8 +3091,13 @@ async def amazon_strategy_board_payload(
 
     week_scope = normalize_week_start(start_date)
     output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
-    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": _strategy_campaign_data_quality(fetched)}
-    _amazon_cache[cache_key] = (time.monotonic(), response)
+    data_quality = _strategy_campaign_data_quality(fetched)
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": data_quality}
+    # A degraded OpenAPI response must not occupy the normal 10-minute slot.
+    # Leaving it uncached makes the next request retry the authoritative MCP
+    # inventory immediately after a catalog or upstream metadata failure.
+    if data_quality.get("cacheable"):
+        _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
 
 
