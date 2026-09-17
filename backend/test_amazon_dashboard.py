@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 from decimal import Decimal
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 import httpx
@@ -19,6 +19,7 @@ from app import (
     ASIN_MAPPING,
     AMAZON_SITE_CODES,
     AmazonMonthlyTarget,
+    AmazonWeeklyTarget,
     Base,
     amazon_empty_row,
     amazon_dashboard_periodic,
@@ -33,8 +34,10 @@ from app import (
     amazon_sales_metric_rows,
     amazon_sales_selected_sites,
     amazon_sales_scope,
+    amazon_sales_week_time_progress,
     amazon_sales_target_values,
     amazon_sales_target_number,
+    normalize_week_start,
     migrate_amazon_monthly_targets,
     amazon_sid_accounts,
     amazon_strategy_board_groups,
@@ -482,6 +485,44 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             db.commit()
             count = db.execute(text("SELECT COUNT(*) FROM amazon_monthly_targets")).scalar_one()
         self.assertEqual(count, 2)
+
+    def test_weekly_targets_can_store_the_same_week_for_different_sites(self):
+        database = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(database, tables=[AmazonWeeklyTarget.__table__])
+        from sqlalchemy.orm import Session
+        with Session(database) as db:
+            timestamp = datetime(2026, 9, 17, tzinfo=timezone.utc)
+            week = date(2026, 9, 14)
+            db.add_all([
+                AmazonWeeklyTarget(week_start=week, model="TN10", site=AMAZON_SALES_ALL_SITES, target_units=100, updated_at=timestamp),
+                AmazonWeeklyTarget(week_start=week, model="TN10", site="美国", target_units=30, updated_at=timestamp),
+                AmazonWeeklyTarget(week_start=week + timedelta(days=7), model="TN10", site="美国", target_units=35, updated_at=timestamp),
+            ])
+            db.commit()
+            count = db.execute(text("SELECT COUNT(*) FROM amazon_weekly_targets")).scalar_one()
+        self.assertEqual(count, 3)
+
+    def test_weekly_target_values_read_only_manual_inputs(self):
+        item = SimpleNamespace(
+            week_start=date(2026, 9, 14),
+            **{f"target_{key}": Decimal("10") if key == "units" else None
+               for key in AMAZON_SALES_TARGET_FIELDS},
+        )
+        values = amazon_sales_target_values(item)
+        self.assertEqual(set(values), set(AMAZON_SALES_TARGET_FIELDS))
+        self.assertEqual(values["units"], 10.0)
+
+    def test_sales_week_time_progress_uses_elapsed_week_days(self):
+        week = date(2026, 9, 14)
+        week_end = date(2026, 9, 20)
+        self.assertEqual(amazon_sales_week_time_progress(week, week_end, date(2026, 9, 13)), 0)
+        self.assertAlmostEqual(amazon_sales_week_time_progress(week, week_end, date(2026, 9, 14)), 1 / 7)
+        self.assertAlmostEqual(amazon_sales_week_time_progress(week, week_end, date(2026, 9, 17)), 4 / 7)
+        self.assertEqual(amazon_sales_week_time_progress(week, week_end, date(2026, 9, 21)), 1)
+
+    def test_week_start_is_normalized_to_monday(self):
+        self.assertEqual(normalize_week_start(date(2026, 9, 17)), date(2026, 9, 14))
+        self.assertEqual(normalize_week_start(date(2026, 9, 20)), date(2026, 9, 14))
 
     def test_sales_actuals_recalculate_ratios_from_totals(self):
         rows = [

@@ -304,6 +304,10 @@
 .sales-target-module{position:relative;margin-top:20px;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:var(--shadow-sm)}
 .sales-filter-bar{position:relative;z-index:20;margin:0;padding:16px 18px;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;border:0;border-bottom:1px solid #eef3f9;border-radius:18px 18px 0 0;background:#fbfdff;box-shadow:none}
 .sales-date-field{position:relative;display:grid;gap:6px}
+.sales-week-field{position:relative;display:grid;gap:6px;min-width:220px}
+.sales-week-field>span{display:flex;align-items:center;gap:10px;min-height:18px;color:#5f7188;font-size:12px;font-weight:700}
+.sales-week-field b{color:#2563eb;font-size:12px;font-weight:800;letter-spacing:.2px}
+.sales-week-picker-control{overflow:hidden;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff}
 .sales-date-trigger{display:flex;align-items:center;justify-content:space-between;gap:12px;width:168px;height:44px;padding:0 12px;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff;color:#203a62;font-size:13px;font-weight:750;cursor:pointer}
 .sales-date-trigger span{color:#5f7188;font-size:12px}
 .sales-date-trigger strong{flex:1;text-align:left;white-space:nowrap}
@@ -332,6 +336,7 @@
 .sales-derived-target{display:grid;min-width:180px;gap:2px;text-align:right}
 .sales-derived-target strong{color:#1f3d64;font-weight:800;font-variant-numeric:tabular-nums}
 .sales-derived-target small{color:#8195aa;font-size:11px;font-weight:600}
+.sales-auto-target{min-width:180px;color:#77899d;font-size:12px;font-weight:700;text-align:right}
 .sales-save-button{height:44px;min-width:88px;margin-left:0;padding:0 16px;border:1px solid #1d4ed8;border-radius:9px;color:#fff;background:linear-gradient(135deg,#1e40af,#2563eb);font-size:13px;font-weight:750;cursor:pointer}
 .sales-save-button:hover:not(:disabled){background:linear-gradient(135deg,#1d4ed8,#1e6bf1)}
 .sales-save-button:disabled{opacity:.55;cursor:not-allowed}
@@ -366,5 +371,5 @@
 .sales-completion.red{color:#b52e45}
 .sales-completion.gray{color:#68788c}
 .sales-table-panel>footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;padding:12px 20px;border-top:1px solid var(--line);background:#fbfdff;color:#71839a;font-size:12px}
-@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-date-field,.sales-model-field{width:calc(50% - 8px)}.sales-date-trigger{width:100%}.sales-filter-scope{width:calc(100% - 96px)}.sales-save-button{margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-target-table{min-width:620px}.sales-table-wrap{overflow-x:auto}}
-@media(max-width:520px){.sales-date-field,.sales-model-field,.sales-filter-scope,.sales-save-button{width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-date-field,.sales-week-field,.sales-model-field{width:calc(50% - 8px)}.sales-date-trigger{width:100%}.sales-filter-scope{width:calc(100% - 96px)}.sales-save-button{margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-target-table{min-width:620px}.sales-table-wrap{overflow-x:auto}}
+@media(max-width:520px){.sales-date-field,.sales-week-field,.sales-model-field,.sales-filter-scope,.sales-save-button{width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}

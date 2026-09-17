@@ -438,6 +438,27 @@ class AmazonMonthlyTarget(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AmazonWeeklyTarget(Base):
+    """Manually entered weekly targets for the sales dashboard."""
+
+    __tablename__ = "amazon_weekly_targets"
+    __table_args__ = (
+        UniqueConstraint("week_start", "model", "site", name="uq_amazon_weekly_target_scope"),
+        Index("ix_amazon_weekly_target_scope", "week_start", "model", "site"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    week_start = Column(Date, nullable=False)
+    model = Column(String(16), nullable=False)
+    site = Column(String(32), nullable=False, default=AMAZON_SALES_ALL_SITES)
+    target_units = Column(Numeric(18, 4), nullable=True)
+    target_aov = Column(Numeric(18, 4), nullable=True)
+    target_cpc = Column(Numeric(18, 4), nullable=True)
+    target_ad_sales_share = Column(Numeric(18, 8), nullable=True)
+    target_ad_cvr = Column(Numeric(18, 8), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 SHOPIFY_ORDERS_QUERY = """#graphql
 query Orders($first: Int!, $after: String, $search: String!) {
   orders(first: $first, after: $after, query: $search, sortKey: UPDATED_AT, reverse: false) {
@@ -604,7 +625,7 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     }
 
 
-def amazon_sales_target_values(item: AmazonMonthlyTarget | None) -> dict[str, float | None]:
+def amazon_sales_target_values(item: Any | None) -> dict[str, float | None]:
     """Read the five manually entered targets.
 
     Older rows did not store AOV directly. When both a legacy sales target and
@@ -622,6 +643,68 @@ def amazon_sales_target_values(item: AmazonMonthlyTarget | None) -> dict[str, fl
     if values.get("aov") is None and legacy_sales is not None and values.get("units"):
         values["aov"] = float(legacy_sales) / float(values["units"])
     return values
+
+
+def amazon_sales_week_time_progress(week_start: date, week_end: date, site_today: date) -> float:
+    """Return elapsed-day progress for a Monday-based week."""
+    if site_today < week_start:
+        return 0.0
+    if site_today > week_end:
+        return 1.0
+    return ((site_today - week_start).days + 1) / 7
+
+
+async def amazon_sales_actual_rows(
+    period_start: date,
+    actual_end: date | None,
+    comparison: str,
+    selected_sites: list[str],
+    selected_series: set[str],
+    products: set[str],
+    refresh: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch sales-dashboard product rows through the existing LingXing path."""
+    no_data = {"source": "not_requested", "complete": True, "errors": []}
+    if actual_end is None or actual_end < period_start:
+        return [], no_data
+    if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+        raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+    try:
+        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+    if not sid_map:
+        try:
+            for store_item in await lingxing_store_rows():
+                country = str(store_item.get("country") or "")
+                sid = store_item.get("sid")
+                if country and sid and int(store_item.get("status") or 0) == 1:
+                    sid_map.setdefault(country, {"sid": sid})
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
+    try:
+        # Japan has two seller accounts, so the authoritative store list is
+        # used to supplement configured sids. A configured sid map still
+        # allows the dashboard to render if this secondary call fails.
+        store_rows = await lingxing_store_rows()
+    except Exception as exc:
+        if not sid_map:
+            raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
+        store_rows = []
+    if refresh:
+        _amazon_cache.clear()
+    periodic = await amazon_dashboard_periodic(
+        comparison,
+        period_start,
+        actual_end,
+        selected_sites,
+        selected_series,
+        products,
+        sid_map,
+        store_rows,
+        "USD",
+    )
+    return periodic["rows"], periodic["data_quality"]
 
 
 def amazon_sales_derived_targets(targets: dict[str, float | None]) -> dict[str, float | None]:
@@ -713,11 +796,11 @@ def amazon_sales_target_number(raw: Any) -> float | None:
     try:
         value = float(text)
     except (TypeError, ValueError) as exc:
-        raise ValueError("月度目标必须是数字") from exc
+        raise ValueError("目标必须是数字") from exc
     if is_percent:
         value /= 100
     if not math.isfinite(value) or value < 0:
-        raise ValueError("月度目标必须是不小于 0 的数字")
+        raise ValueError("目标必须是不小于 0 的数字")
     return value
 
 
@@ -3294,46 +3377,16 @@ async def amazon_sales_dashboard(
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     if month_start <= site_today:
-        if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
-            raise HTTPException(status_code=503, detail="领星 API 尚未配置")
         try:
-            sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-        if not sid_map:
-            try:
-                for store_item in await lingxing_store_rows():
-                    country = str(store_item.get("country") or "")
-                    sid = store_item.get("sid")
-                    if country and sid and int(store_item.get("status") or 0) == 1:
-                        sid_map.setdefault(country, {"sid": sid})
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
-        try:
-            # Japan has two seller accounts, so the authoritative store list is
-            # used to supplement configured sids. A configured sid map still
-            # allows the dashboard to render if this secondary call fails.
-            store_rows = await lingxing_store_rows()
-        except Exception as exc:
-            if not sid_map:
-                raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
-            store_rows = []
-        if refresh:
-            _amazon_cache.clear()
-        try:
-            periodic = await amazon_dashboard_periodic(
-                "月",
+            rows, data_quality = await amazon_sales_actual_rows(
                 month_start,
                 actual_end,
+                "月",
                 selected_sites,
                 selected_series,
                 products,
-                sid_map,
-                store_rows,
-                "USD",
+                refresh,
             )
-            rows = periodic["rows"]
-            data_quality = periodic["data_quality"]
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
         except RuntimeError as exc:
@@ -3379,6 +3432,171 @@ async def amazon_sales_dashboard(
         },
         "data_quality": data_quality,
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/amazon/sales-dashboard/weekly")
+async def amazon_sales_weekly_dashboard(
+    week_start: date | None = Query(default=None),
+    model: str = Query(default="TN10"),
+    site: str = Query(default=AMAZON_SALES_ALL_SITES),
+    refresh: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Return weekly target completion for one merged product model."""
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        week = normalize_week_start(week_start)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="销售看板周格式无效") from exc
+    model = model.strip().upper()
+    if model not in AMAZON_SALES_MODELS:
+        raise HTTPException(status_code=422, detail="销售看板型号无效")
+    try:
+        selected_sites = amazon_sales_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    products, selected_series = amazon_sales_scope(model)
+    if not products or not selected_series:
+        raise HTTPException(status_code=422, detail="销售看板型号暂无产品映射")
+
+    week_end = week + timedelta(days=6)
+    site_today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in selected_sites
+    )
+    timezone_basis = selected_sites[0] if len(selected_sites) == 1 else "全部站点站点日期的最小值"
+    time_progress = amazon_sales_week_time_progress(week, week_end, site_today)
+
+    with session_factory()() as db:
+        item = db.scalar(
+            select(AmazonWeeklyTarget).where(
+                AmazonWeeklyTarget.week_start == week,
+                AmazonWeeklyTarget.model == model,
+                AmazonWeeklyTarget.site == site,
+            )
+        )
+        targets = amazon_sales_target_values(item)
+
+    rows: list[dict[str, Any]] = []
+    data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
+    try:
+        rows, data_quality = await amazon_sales_actual_rows(
+            week,
+            min(week_end, site_today),
+            "周",
+            selected_sites,
+            selected_series,
+            products,
+            refresh,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+
+    actuals = amazon_sales_actuals(rows)
+    target_units = targets.get("units")
+    actual_units = actuals.get("units")
+    sales_rate = actual_units / target_units if target_units and actual_units is not None else None
+    actual_end = min(week_end, site_today) if week <= site_today else None
+    current_day = (site_today - week).days + 1 if week <= site_today <= week_end else None
+    return {
+        "dimension": "week",
+        "week_start": week.isoformat(),
+        "week_end": week_end.isoformat(),
+        "model": model,
+        "models": list(AMAZON_SALES_MODELS),
+        "site": site,
+        "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
+        "currency": "USD",
+        "period": {
+            "start": week.isoformat(),
+            "end": week_end.isoformat(),
+            "actual_end": actual_end.isoformat() if actual_end else None,
+        },
+        "scope": {
+            "products": sorted(products),
+            "series": sorted(selected_series),
+            "sites": selected_sites,
+        },
+        "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "metrics": amazon_sales_metric_rows(targets, actuals),
+        "progress": {
+            "sales": {
+                "target": float(target_units) if target_units is not None else None,
+                "actual": float(actual_units) if actual_units is not None else None,
+                "rate": sales_rate,
+            },
+            "time": {
+                "rate": time_progress,
+                "current_day": current_day,
+                "days_in_week": 7,
+                "site_date": site_today.isoformat(),
+                "timezone_basis": timezone_basis,
+            },
+        },
+        "data_quality": data_quality,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/amazon/sales-dashboard/weekly/targets")
+def save_amazon_sales_weekly_targets(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Upsert all editable weekly targets for one week/model/site scope."""
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        week = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="周度目标保存周格式无效") from exc
+    model = str(payload.get("model") or "").strip().upper()
+    site = str(payload.get("site") or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
+    if model not in AMAZON_SALES_MODELS:
+        raise HTTPException(status_code=422, detail="周度目标保存参数无效")
+    try:
+        amazon_sales_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, dict):
+        raise HTTPException(status_code=422, detail="周度目标格式无效")
+    unknown_keys = set(raw_targets) - set(AMAZON_SALES_TARGET_FIELDS)
+    if unknown_keys:
+        raise HTTPException(status_code=422, detail="周度目标包含未知指标")
+    try:
+        normalized = {
+            key: amazon_sales_target_number(raw_targets.get(key))
+            for key in AMAZON_SALES_TARGET_FIELDS
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    with session_factory()() as db:
+        item = db.scalar(
+            select(AmazonWeeklyTarget).where(
+                AmazonWeeklyTarget.week_start == week,
+                AmazonWeeklyTarget.model == model,
+                AmazonWeeklyTarget.site == site,
+            )
+        )
+        if item is None:
+            item = AmazonWeeklyTarget(week_start=week, model=model, site=site)
+            db.add(item)
+        for key, value in normalized.items():
+            setattr(item, f"target_{key}", value)
+        item.updated_at = utcnow()
+        db.commit()
+
+    return {
+        "ok": True,
+        "week_start": week.isoformat(),
+        "model": model,
+        "site": site,
+        "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
     }
 
 
