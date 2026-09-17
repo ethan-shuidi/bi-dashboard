@@ -20,6 +20,11 @@ from app import (
     product_performance_ad_breakdown,
     product_performance_ad_totals,
     amazon_series,
+    amazon_sales_actuals,
+    amazon_sales_completion,
+    amazon_sales_metric_rows,
+    amazon_sales_scope,
+    amazon_sales_target_number,
     amazon_sid_accounts,
     amazon_strategy_board_groups,
     finalize_strategy_metrics,
@@ -367,6 +372,58 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertNotIn("TN20-主链接-樱桃红", AMAZON_PRODUCTS)
         self.assertEqual(amazon_product("US", "B0H8SZZN8X"), "TN20-主链接-红")
         self.assertEqual(amazon_series("TN20-主链接-红"), "TN20系列（主链接）汇总")
+
+    def test_sales_scope_merges_current_and_future_tn20_variants(self):
+        products, series = amazon_sales_scope("TN20")
+        self.assertIn("TN20-主链接-黑色", products)
+        self.assertIn("TN20-小链接-樱桃红", products)
+        self.assertIn("TN20系列（主链接）汇总", series)
+        self.assertIn("TN20系列（小链接）汇总", series)
+
+    def test_sales_completion_uses_requested_business_rules(self):
+        self.assertEqual(amazon_sales_completion("units", 100, 90)["status"], "green")
+        self.assertEqual(amazon_sales_completion("units", 100, 110)["status"], "red")
+        self.assertEqual(amazon_sales_completion("units", 100, 100)["status"], "gray")
+        self.assertEqual(amazon_sales_completion("cpc", 1, 0.8)["status"], "red")
+        self.assertEqual(amazon_sales_completion("cpc", 1, 1.2)["status"], "green")
+        self.assertEqual(amazon_sales_completion("cpc", 1, 1)["status"], "gray")
+        self.assertEqual(amazon_sales_completion("ad_units", 100, 110)["status"], "red")
+        self.assertEqual(amazon_sales_completion("ad_units", 100, 90)["status"], "green")
+        self.assertEqual(amazon_sales_completion("ad_units", 100, 100)["status"], "gray")
+        self.assertEqual(amazon_sales_completion("units", None, 90), {"value": None, "status": ""})
+        self.assertEqual(amazon_sales_completion("units", 100, None), {"value": None, "status": ""})
+
+    def test_sales_target_number_validates_nonnegative_finite_values(self):
+        self.assertIsNone(amazon_sales_target_number(None))
+        self.assertIsNone(amazon_sales_target_number(""))
+        self.assertEqual(amazon_sales_target_number("12.5"), 12.5)
+        for invalid in (-1, "abc", float("inf")):
+            with self.assertRaises(ValueError):
+                amazon_sales_target_number(invalid)
+
+    def test_sales_actuals_recalculate_ratios_from_totals(self):
+        rows = [
+            {"units": 10, "net_sales": 200, "clicks": 20, "ad_cost": 10, "ad_units": 4, "ad_orders": 3},
+            {"units": 15, "net_sales": 300, "clicks": 30, "ad_cost": 30, "ad_units": 6, "ad_orders": 7},
+        ]
+        actuals = amazon_sales_actuals(rows)
+        self.assertEqual(actuals["units"], 25)
+        self.assertEqual(actuals["net_sales"], 500)
+        self.assertAlmostEqual(actuals["cpc"], 40 / 50)
+        self.assertAlmostEqual(actuals["ad_sales_share"], 10 / 25)
+        self.assertAlmostEqual(actuals["acoas"], 40 / 500)
+        self.assertAlmostEqual(actuals["ad_cvr"], 10 / 50)
+
+    def test_sales_metric_rows_include_target_actual_and_completion(self):
+        rows = amazon_sales_metric_rows(
+            {"units": 100, "cpc": 1},
+            {"units": 90, "cpc": 0.8},
+        )
+        units = next(row for row in rows if row["key"] == "units")
+        cpc = next(row for row in rows if row["key"] == "cpc")
+        self.assertEqual((units["target"], units["actual"], units["completion"]["value"]), (100, 90, 0.9))
+        self.assertEqual((cpc["target"], cpc["actual"]), (1, 0.8))
+        self.assertAlmostEqual(cpc["completion"]["value"], -0.2)
 
     def test_us_asin_product_mapping_matches_latest_assignment(self):
         expected = {

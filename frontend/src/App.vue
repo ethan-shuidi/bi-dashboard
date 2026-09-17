@@ -5,6 +5,7 @@ import { BarChart, LineChart } from "echarts/charts"
 import { AriaComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components"
 import { CanvasRenderer } from "echarts/renderers"
 import AmazonDashboard from "./AmazonDashboard.vue"
+import AmazonSalesDashboard from "./AmazonSalesDashboard.vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 
 use([LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, AriaComponent, CanvasRenderer])
@@ -21,6 +22,15 @@ const period = ref("30")
 const store = ref("")
 const activeDashboard = ref("amazon")
 const sidebarCollapsed = ref(true)
+const dashboardNavDefaults = [
+  { key: "commerce", label: "Shopify数据看板", icon: "⌁" },
+  { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
+  { key: "amazon-sales", label: "Amazon-销售看板", icon: "◎" },
+]
+const dashboardNavStorageKey = "ideadock.dashboard.navigation-order.v1"
+const dashboardNavItems = ref(normalizeDashboardNavOrder(readDashboardNavOrder()))
+const draggingDashboardKey = ref("")
+const dragOverDashboardKey = ref("")
 const salesChartElement = ref(null)
 const productChartElement = ref(null)
 
@@ -88,6 +98,46 @@ const maxFulfillment = computed(() => Math.max(...(dashboard.value?.fulfillment 
 const periodSales = computed(() => (dashboard.value?.daily || []).reduce((sum, item) => sum + item.sales, 0))
 const peakDay = computed(() => (dashboard.value?.daily || []).reduce((peak, item) => !peak || item.sales > peak.sales ? item : peak, null))
 const periodLabel = computed(() => dashboard.value ? `${dashboard.value.period.start} 至 ${dashboard.value.period.end}` : "—")
+
+function readDashboardNavOrder() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(dashboardNavStorageKey) || "[]")
+    return Array.isArray(parsed) ? parsed.map(String) : []
+  } catch {
+    return []
+  }
+}
+
+function normalizeDashboardNavOrder(savedOrder) {
+  const output = savedOrder.map(String)
+  for (const item of dashboardNavDefaults) {
+    if (!output.includes(item.key)) output.push(item.key)
+  }
+  return dashboardNavDefaults
+    .filter((item) => output.includes(item.key))
+    .sort((a, b) => output.indexOf(a.key) - output.indexOf(b.key))
+}
+
+function onDashboardDragStart(item) {
+  draggingDashboardKey.value = item.key
+}
+
+function onDashboardDragOver(item) {
+  if (!draggingDashboardKey.value) return
+  dragOverDashboardKey.value = item.key
+}
+
+function onDashboardDrop() {
+  const fromKey = draggingDashboardKey.value
+  const toKey = dragOverDashboardKey.value || draggingDashboardKey.value
+  draggingDashboardKey.value = ""
+  dragOverDashboardKey.value = ""
+  if (!fromKey || !toKey || fromKey === toKey) return
+  const next = dashboardNavItems.value.map((item) => item.key)
+  next.splice(next.indexOf(toKey), 0, next.splice(next.indexOf(fromKey), 1)[0])
+  dashboardNavItems.value = normalizeDashboardNavOrder(next)
+  localStorage.setItem(dashboardNavStorageKey, JSON.stringify(next))
+}
 
 function renderSalesChart() {
   if (!salesChartElement.value || !dashboard.value?.daily?.length) return
@@ -271,11 +321,25 @@ onBeforeUnmount(() => {
     <div class="workspace">
       <aside :class="['dashboard-sidebar', { collapsed: sidebarCollapsed }]" aria-label="看板导航">
         <div class="dashboard-sidebar-head"><span class="dashboard-sidebar-label">看板导航</span><button class="sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开看板导航' : '收起看板导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="sidebarCollapsed = !sidebarCollapsed"><span aria-hidden="true">{{ sidebarCollapsed ? '›' : '‹' }}</span></button></div>
-        <button :class="['dashboard-nav-item', { active: activeDashboard === 'commerce' }]" @click="activeDashboard = 'commerce'"><span class="dashboard-nav-icon">⌁</span><span>Shopify数据看板</span></button>
-        <button :class="['dashboard-nav-item', { active: activeDashboard === 'amazon' }]" @click="activeDashboard = 'amazon'"><span class="dashboard-nav-icon">▦</span><span>Amazon-广告数据</span></button>
+        <button
+          v-for="item in dashboardNavItems"
+          :key="item.key"
+          :class="['dashboard-nav-item', { active: activeDashboard === item.key, dragging: draggingDashboardKey === item.key, 'drag-over': dragOverDashboardKey === item.key && draggingDashboardKey !== item.key }]"
+          type="button"
+          draggable="true"
+          :title="`${item.label}（可拖动排序）`"
+          @click="activeDashboard = item.key"
+          @dragstart="onDashboardDragStart(item)"
+          @dragover.prevent="onDashboardDragOver(item)"
+          @drop.prevent="onDashboardDrop"
+          @dragend="onDashboardDrop"
+        >
+          <span class="dashboard-nav-icon" aria-hidden="true">{{ item.icon }}</span><span>{{ item.label }}</span>
+        </button>
       </aside>
 
       <AmazonDashboard v-if="activeDashboard === 'amazon'" class="amazon-dashboard-frame" />
+      <AmazonSalesDashboard v-else-if="activeDashboard === 'amazon-sales'" class="amazon-dashboard-frame" :api-base="apiBase" />
 
       <div v-else class="content-shell">
       <section class="page-header">

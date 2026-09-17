@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import os
 import re
 import base64
 import hashlib
 import hmac
+import math
 import time
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -135,6 +137,20 @@ AMAZON_PRODUCTS = [
     "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红",
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
+AMAZON_SALES_MODELS = ("TN10", "TN20")
+AMAZON_SALES_TN20_SMALL_SERIES = "TN20系列（小链接）汇总"
+AMAZON_SALES_METRICS = (
+    {"key": "units", "label": "销量", "format": "count", "completion": "ratio"},
+    {"key": "net_sales", "label": "销售额", "format": "money", "completion": "ratio"},
+    {"key": "cpc", "label": "CPC", "format": "money", "completion": "difference", "difference_rule": "lower_is_red"},
+    {"key": "ad_sales_share", "label": "广告销量占比", "format": "percent", "completion": "difference", "difference_rule": "lower_is_red"},
+    {"key": "acoas", "label": "广告费比", "format": "percent", "completion": "difference", "difference_rule": "lower_is_red"},
+    {"key": "ad_units", "label": "广告销量", "format": "count", "completion": "difference", "difference_rule": "higher_is_red"},
+    {"key": "sessions", "label": "流量", "format": "count", "completion": "difference", "difference_rule": "higher_is_red"},
+    {"key": "ad_cvr", "label": "转化（广告CVR）", "format": "percent", "completion": "difference", "difference_rule": "higher_is_red"},
+    {"key": "ad_cost", "label": "广告花费", "format": "money", "completion": "difference", "difference_rule": "higher_is_red"},
+)
+AMAZON_SALES_TARGET_FIELDS = tuple(metric["key"] for metric in AMAZON_SALES_METRICS)
 AMAZON_SITE_ORDER = ("美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典")
 AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "德国": "DE", "英国": "UK", "法国": "FR", "加拿大": "CA", "澳洲": "AU", "西班牙": "ES", "意大利": "IT", "荷兰": "NL", "比利时": "BE", "墨西哥": "MX", "爱尔兰": "IE", "波兰": "PL", "瑞典": "SE"}
 AMAZON_SITE_TIMEZONES = {
@@ -326,6 +342,29 @@ class AmazonStrategyNote(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AmazonMonthlyTarget(Base):
+    __tablename__ = "amazon_monthly_targets"
+    __table_args__ = (
+        UniqueConstraint("year", "month", "model", name="uq_amazon_monthly_target_scope"),
+        Index("ix_amazon_monthly_target_scope", "year", "month", "model"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    model = Column(String(16), nullable=False)
+    target_units = Column(Numeric(18, 4), nullable=True)
+    target_net_sales = Column(Numeric(18, 4), nullable=True)
+    target_cpc = Column(Numeric(18, 4), nullable=True)
+    target_ad_sales_share = Column(Numeric(18, 8), nullable=True)
+    target_acoas = Column(Numeric(18, 8), nullable=True)
+    target_ad_units = Column(Numeric(18, 4), nullable=True)
+    target_sessions = Column(Numeric(18, 4), nullable=True)
+    target_ad_cvr = Column(Numeric(18, 8), nullable=True)
+    target_ad_cost = Column(Numeric(18, 4), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 SHOPIFY_ORDERS_QUERY = """#graphql
 query Orders($first: Int!, $after: String, $search: String!) {
   orders(first: $first, after: $after, query: $search, sortKey: UPDATED_AT, reverse: false) {
@@ -444,7 +483,109 @@ def amazon_series(product: str | None) -> str | None:
         return AMAZON_SERIES[1]
     if product.startswith("TN20-主链接"):
         return AMAZON_SERIES[2]
+    if product.startswith("TN20-小链接"):
+        return AMAZON_SALES_TN20_SMALL_SERIES
     return None
+
+
+def amazon_sales_scope(model: str) -> tuple[set[str], set[str]]:
+    """Map a sales-dashboard model to every currently known product variant."""
+    prefix = f"{model}-"
+    products = {product for product in AMAZON_PRODUCTS if product.startswith(prefix)}
+    series = {amazon_series(product) for product in products}
+    series.discard(None)
+    return products, series
+
+
+def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Aggregate product rows from totals so derived ratios stay correct."""
+    additive = ("units", "net_sales", "clicks", "ad_cost", "ad_units", "sessions", "ad_orders")
+    totals: dict[str, float] = {key: 0.0 for key in additive}
+    present = {key: False for key in additive}
+    for row in rows:
+        for key in additive:
+            value = row.get(key)
+            if value is not None:
+                totals[key] += float(value)
+                present[key] = True
+    return {
+        "units": totals["units"] if present["units"] else None,
+        "net_sales": totals["net_sales"] if present["net_sales"] else None,
+        "cpc": totals["ad_cost"] / totals["clicks"] if present["ad_cost"] and totals["clicks"] else None,
+        "ad_sales_share": totals["ad_units"] / totals["units"] if present["ad_units"] and totals["units"] else None,
+        "acoas": totals["ad_cost"] / totals["net_sales"] if present["ad_cost"] and totals["net_sales"] else None,
+        "ad_units": totals["ad_units"] if present["ad_units"] else None,
+        "sessions": totals["sessions"] if present["sessions"] else None,
+        "ad_cvr": totals["ad_orders"] / totals["clicks"] if present["ad_orders"] and totals["clicks"] else None,
+        "ad_cost": totals["ad_cost"] if present["ad_cost"] else None,
+        "clicks": totals["clicks"] if present["clicks"] else None,
+    }
+
+
+def amazon_sales_target_values(item: AmazonMonthlyTarget | None) -> dict[str, float | None]:
+    if item is None:
+        return {key: None for key in AMAZON_SALES_TARGET_FIELDS}
+    return {key: getattr(item, f"target_{key}") for key in AMAZON_SALES_TARGET_FIELDS}
+
+
+def amazon_sales_completion(
+    metric_key: str,
+    target: float | None,
+    actual: float | None,
+) -> dict[str, Any]:
+    """Apply the dashboard's explicit threshold and color rules.
+
+    The signs here intentionally follow the requested business rules rather
+    than the usual higher-is-better convention.
+    """
+    definition = next(item for item in AMAZON_SALES_METRICS if item["key"] == metric_key)
+    if target is None or actual is None:
+        return {"value": None, "status": ""}
+    epsilon = 1e-9
+    if definition["completion"] == "ratio":
+        if abs(float(target)) <= epsilon:
+            return {"value": None, "status": ""}
+        value = float(actual) / float(target)
+        status = "gray" if abs(value - 1) <= epsilon else ("green" if value < 1 else "red")
+        return {"value": value, "status": status}
+    value = float(actual) - float(target)
+    if abs(value) <= epsilon:
+        status = "gray"
+    elif definition["difference_rule"] == "lower_is_red":
+        status = "red" if value < 0 else "green"
+    else:
+        status = "red" if value > 0 else "green"
+    return {"value": value, "status": status}
+
+
+def amazon_sales_metric_rows(
+    targets: dict[str, float | None],
+    actuals: dict[str, float | None],
+) -> list[dict[str, Any]]:
+    output = []
+    for definition in AMAZON_SALES_METRICS:
+        key = definition["key"]
+        target = targets.get(key)
+        actual = actuals.get(key)
+        output.append({
+            **definition,
+            "target": float(target) if target is not None else None,
+            "actual": float(actual) if actual is not None else None,
+            "completion": amazon_sales_completion(key, target, actual),
+        })
+    return output
+
+
+def amazon_sales_target_number(raw: Any) -> float | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("月度目标必须是数字") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("月度目标必须是不小于 0 的数字")
+    return value
 
 
 async def lingxing_store_rows() -> list[dict[str, Any]]:
@@ -2913,6 +3054,195 @@ async def amazon_dashboard(
         store_rows,
         requested_currency,
     )
+
+
+@app.get("/api/amazon/sales-dashboard")
+async def amazon_sales_dashboard(
+    year: int = Query(default=datetime.now(timezone.utc).year),
+    month: int = Query(default=datetime.now(timezone.utc).month),
+    model: str = Query(default="TN10"),
+    refresh: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Return monthly target completion for one merged product model."""
+    require_business_access(x_sync_key, allow_public=True)
+    if year < 2000 or year > 2100 or month < 1 or month > 12:
+        raise HTTPException(status_code=422, detail="年月参数无效")
+    model = model.strip().upper()
+    if model not in AMAZON_SALES_MODELS:
+        raise HTTPException(status_code=422, detail="销售看板型号无效")
+
+    products, selected_series = amazon_sales_scope(model)
+    if not products or not selected_series:
+        raise HTTPException(status_code=422, detail="销售看板型号暂无产品映射")
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+    # All sites are queried, then product/series filters retain only the model.
+    # The minimum site-local date is the dashboard's conservative "today"; it
+    # also prevents a future site-local day from leaking into other sites.
+    site_today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in AMAZON_SITE_CODES
+    )
+    selected_month = (year, month)
+    current_month = (site_today.year, site_today.month)
+    if selected_month < current_month:
+        time_progress = 1.0
+    elif selected_month > current_month:
+        time_progress = 0.0
+    else:
+        time_progress = site_today.day / month_end.day
+
+    with session_factory()() as db:
+        item = db.scalar(
+            select(AmazonMonthlyTarget).where(
+                AmazonMonthlyTarget.year == year,
+                AmazonMonthlyTarget.month == month,
+                AmazonMonthlyTarget.model == model,
+            )
+        )
+        targets = amazon_sales_target_values(item)
+
+    actual_end = min(month_end, site_today)
+    rows: list[dict[str, Any]] = []
+    data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
+    if month_start <= site_today:
+        if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+            raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+        try:
+            sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+        if not sid_map:
+            try:
+                for store_item in await lingxing_store_rows():
+                    country = str(store_item.get("country") or "")
+                    sid = store_item.get("sid")
+                    if country and sid and int(store_item.get("status") or 0) == 1:
+                        sid_map.setdefault(country, {"sid": sid})
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
+        try:
+            # Japan has two seller accounts, so the authoritative store list is
+            # used to supplement configured sids. A configured sid map still
+            # allows the dashboard to render if this secondary call fails.
+            store_rows = await lingxing_store_rows()
+        except Exception as exc:
+            if not sid_map:
+                raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
+            store_rows = []
+        if refresh:
+            _amazon_cache.clear()
+        try:
+            periodic = await amazon_dashboard_periodic(
+                "月",
+                month_start,
+                actual_end,
+                list(AMAZON_SITE_CODES),
+                selected_series,
+                products,
+                sid_map,
+                store_rows,
+                "USD",
+            )
+            rows = periodic["rows"]
+            data_quality = periodic["data_quality"]
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+
+    actuals = amazon_sales_actuals(rows)
+    target_units = targets.get("units")
+    actual_units = actuals.get("units")
+    sales_rate = actual_units / target_units if target_units and actual_units is not None else None
+    return {
+        "year": year,
+        "month": month,
+        "model": model,
+        "models": list(AMAZON_SALES_MODELS),
+        "currency": "USD",
+        "period": {
+            "start": month_start.isoformat(),
+            "end": month_end.isoformat(),
+            "actual_end": actual_end.isoformat() if month_start <= site_today else None,
+        },
+        "scope": {
+            "products": sorted(products),
+            "series": sorted(selected_series),
+            "sites": list(AMAZON_SITE_CODES),
+        },
+        "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "metrics": amazon_sales_metric_rows(targets, actuals),
+        "progress": {
+            "sales": {
+                "target": float(target_units) if target_units is not None else None,
+                "actual": float(actual_units) if actual_units is not None else None,
+                "rate": sales_rate,
+            },
+            "time": {
+                "rate": time_progress,
+                "current_day": site_today.day if selected_month == current_month else None,
+                "days_in_month": month_end.day,
+                "site_date": site_today.isoformat(),
+                "timezone_basis": "全部站点站点日期的最小值",
+            },
+        },
+        "data_quality": data_quality,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/amazon/sales-dashboard/targets")
+def save_amazon_sales_targets(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Upsert all editable monthly targets for one year/month/model scope."""
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        year = int(payload.get("year"))
+        month = int(payload.get("month"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="年月参数无效") from exc
+    model = str(payload.get("model") or "").strip().upper()
+    if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODELS:
+        raise HTTPException(status_code=422, detail="月度目标保存参数无效")
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, dict):
+        raise HTTPException(status_code=422, detail="月度目标格式无效")
+    unknown_keys = set(raw_targets) - set(AMAZON_SALES_TARGET_FIELDS)
+    if unknown_keys:
+        raise HTTPException(status_code=422, detail="月度目标包含未知指标")
+    try:
+        normalized = {key: amazon_sales_target_number(raw_targets.get(key)) for key in AMAZON_SALES_TARGET_FIELDS}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    with session_factory()() as db:
+        item = db.scalar(
+            select(AmazonMonthlyTarget).where(
+                AmazonMonthlyTarget.year == year,
+                AmazonMonthlyTarget.month == month,
+                AmazonMonthlyTarget.model == model,
+            )
+        )
+        if item is None:
+            item = AmazonMonthlyTarget(year=year, month=month, model=model)
+            db.add(item)
+        for key, value in normalized.items():
+            setattr(item, f"target_{key}", value)
+        item.updated_at = utcnow()
+        db.commit()
+
+    return {
+        "ok": True,
+        "year": year,
+        "month": month,
+        "model": model,
+        "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
+    }
 
 
 @app.get("/api/amazon/stores")
