@@ -27,13 +27,52 @@ from app import (
     strategy_campaign_name,
     require_business_access,
     _lingxing_mcp_result,
+    _lingxing_mcp_metadata_cache,
+    _amazon_cache,
+    _performance_data_quality,
+    _reset_lingxing_mcp_metadata_cache,
+    _strategy_campaign_data_quality,
+    ad_report_type,
     fetch_mcp_product_performance,
     fetch_mcp_campaign_report,
+    lingxing_mcp_call,
+    product_performance_typed_clicks_present,
     validate_strategy_series,
 )
 
 
+def mcp_response(business: dict):
+    return httpx.Response(
+        200,
+        request=httpx.Request("POST", "https://example.test/mcp"),
+        json={"result": {"content": [{"type": "text", "text": json.dumps(business)}]}},
+    )
+
+
+def mcp_metadata_responses(tool_id: str, catalog_version: str = "20260915"):
+    tool = {
+        "toolId": tool_id,
+        "schemaVersion": "1.0.1",
+        "toolVersionId": 37,
+    }
+    return [
+        mcp_response({"success": True, "data": {"catalogVersion": catalog_version}}),
+        mcp_response({"success": True, "data": {"catalogVersion": catalog_version, "tools": [tool]}}),
+    ]
+
+
+def reset_mcp_test_state():
+    _reset_lingxing_mcp_metadata_cache()
+    _amazon_cache.pop(("lingxing-mcp-ad-shops",), None)
+
+
 class AmazonDashboardPeriodTests(unittest.TestCase):
+    def setUp(self):
+        reset_mcp_test_state()
+
+    def tearDown(self):
+        reset_mcp_test_state()
+
     def test_lingxing_mcp_result_decodes_text_business_payload(self):
         payload = {
             "result": {
@@ -46,61 +85,154 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(_lingxing_mcp_result(payload), [{"clicks": 3239}])
 
     def test_mcp_product_performance_preserves_ad_type_clicks(self):
-        response = httpx.Response(
-            200,
-            request=httpx.Request("POST", "https://example.test/mcp"),
-            json={
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps({
-                            "success": True,
-                            "data": {"list": [{
-                                "asin": "B0TEST",
-                                "clicks": 4226,
-                                "ad_clicks_sp": 3239,
-                                "ad_clicks_sb": 417,
-                                "ad_clicks_sbv": 100,
-                                "ad_clicks_sd": 470,
-                            }]},
-                        }),
-                    }]
-                }
-            },
-        )
+        action_response = mcp_response({
+            "success": True,
+            "data": {"list": [{
+                "asin": "B0TEST",
+                "clicks": 4226,
+                "ad_clicks_sp": 3239,
+                "ad_clicks_sb": 417,
+                "ad_clicks_sbv": 100,
+                "ad_clicks_sd": 470,
+            }]},
+        })
         client = AsyncMock()
-        client.post.return_value = response
+        client.post.side_effect = [*mcp_metadata_responses("query_product_performance_asin_lists"), action_response]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            reset_mcp_test_state()
             rows = asyncio.run(fetch_mcp_product_performance(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+            reset_mcp_test_state()
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sp"]["clicks"], 3239)
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sb"]["clicks"], 417)
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sbv"]["clicks"], 100)
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sd"]["clicks"], 470)
+        self.assertTrue(product_performance_typed_clicks_present(rows[0]))
+        self.assertEqual(client.post.call_count, 3)
 
     def test_mcp_campaign_report_resolves_profile_and_keeps_real_name(self):
-        shops_response = httpx.Response(
-            200,
-            request=httpx.Request("POST", "https://example.test/mcp"),
-            json={"result": {"content": [{"type": "text", "text": json.dumps({
-                "success": True,
-                "data": [{"sid": 14292, "profile_id": "2815938091388375"}],
-            })}]}}
-        )
-        campaign_response = httpx.Response(
-            200,
-            request=httpx.Request("POST", "https://example.test/mcp"),
-            json={"result": {"content": [{"type": "text", "text": json.dumps({
-                "success": True,
-                "data": {"data": [{"campaign_id": "123", "name": "真实活动名称", "ads_type": "SP"}]},
-            })}]}}
-        )
+        shops_response = mcp_response({
+            "success": True,
+            "data": [{"sid": 14292, "profile_id": "2815938091388375"}],
+        })
+        campaign_response = mcp_response({
+            "success": True,
+            "data": {
+                "recordsFiltered": 1,
+                "data": [{"campaign_id": "123", "name": "真实活动名称", "ads_type": "SP"}],
+            },
+        })
         client = AsyncMock()
-        client.post.side_effect = [shops_response, campaign_response]
+        client.post.side_effect = [
+            *mcp_metadata_responses("ad_auth_shops"),
+            shops_response,
+            *mcp_metadata_responses("ad_campaign_report"),
+            campaign_response,
+        ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
-            rows = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
-        self.assertEqual(rows[0]["name"], "真实活动名称")
-        self.assertEqual(rows[0]["campaign_id"], "123")
-        self.assertEqual(client.post.call_count, 2)
+            reset_mcp_test_state()
+            result = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+            reset_mcp_test_state()
+        self.assertEqual(result.rows[0]["name"], "真实活动名称")
+        self.assertEqual(result.rows[0]["campaign_id"], "123")
+        self.assertEqual(result.expected, 1)
+        self.assertEqual(result.pages, 1)
+        self.assertTrue(result.complete)
+        self.assertEqual(client.post.call_count, 6)
+
+    def test_mcp_catalog_update_refreshes_metadata_and_retries_once(self):
+        error_response = mcp_response({"success": False, "msg": "Catalog已更新，请重新查询工具版本"})
+        success_response = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [
+            *mcp_metadata_responses("ad_campaign_report", "20260914"),
+            error_response,
+            *mcp_metadata_responses("ad_campaign_report", "20260915"),
+            success_response,
+        ]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            reset_mcp_test_state()
+            result = asyncio.run(lingxing_mcp_call("ad_campaign_report", {"page": 1}, client))
+            reset_mcp_test_state()
+        self.assertEqual(result, {"value": 42})
+        self.assertEqual(client.post.call_count, 6)
+        retry_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
+        self.assertEqual(retry_arguments["catalogVersion"], "20260915")
+
+    def test_mcp_campaign_report_paginates_to_records_filtered(self):
+        shops_response = mcp_response({"success": True, "data": [{"sid": 14292, "profile_id": "profile-1"}]})
+        batches = []
+        for page in range(3):
+            start = page * 100 + 1
+            count = 100 if page < 2 else 8
+            rows = [{"campaign_id": str(index), "campaign_name": f"Campaign {index}", "sponsored_type": "SP"} for index in range(start, start + count)]
+            if page == 0:
+                rows.insert(0, {"clicks": 999999})
+            batches.append(mcp_response({"success": True, "data": {"recordsFiltered": 208, "data": rows}}))
+        client = AsyncMock()
+        client.post.side_effect = [
+            *mcp_metadata_responses("ad_auth_shops"),
+            shops_response,
+            *mcp_metadata_responses("ad_campaign_report"),
+            *batches,
+        ]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            _reset_lingxing_mcp_metadata_cache()
+            result = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+            _reset_lingxing_mcp_metadata_cache()
+        self.assertEqual(len(result.rows), 208)
+        self.assertEqual(result.expected, 208)
+        self.assertEqual(result.pages, 3)
+        self.assertTrue(result.complete)
+
+    def test_mcp_campaign_profile_missing_is_explicitly_incomplete(self):
+        shops_response = mcp_response({"success": True, "data": [{"sid": 99999, "profile_id": "other"}]})
+        client = AsyncMock()
+        client.post.side_effect = [*mcp_metadata_responses("ad_auth_shops"), shops_response]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
+            _reset_lingxing_mcp_metadata_cache()
+            result = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
+            _reset_lingxing_mcp_metadata_cache()
+        self.assertFalse(result.profile_found)
+        self.assertFalse(result.complete)
+        self.assertIn("profile_id", result.error)
+
+    def test_sb_video_is_classified_before_generic_sb(self):
+        self.assertEqual(ad_report_type({"sponsored_type": "SB2", "creative_type": "VIDEO"}), "SBV")
+        self.assertEqual(ad_report_type({"sponsored_type": "HSA", "creative_type": "video"}), "SBV")
+        self.assertEqual(ad_report_type({"sponsored_type": "SB2", "creative_type": "PRODUCT_COLLECTION"}), "SB")
+
+    def test_strategy_data_quality_reports_counts_and_type_presence(self):
+        raw_rows = [
+            {"sponsored_type": "SP"},
+            {"sponsored_type": "SB2", "creative_type": "VIDEO"},
+            {"sponsored_type": "SB2", "creative_type": "PRODUCT"},
+            {"sponsored_type": "SD"},
+        ]
+        fetched = [(
+            "美国", "US", raw_rows,
+            [{
+                "source": "mcp", "mcp_ok": True, "campaign_pages": 3,
+                "campaign_rows": 4, "campaign_expected": 4,
+                "profile_found": True, "complete": True, "errors": [],
+            }],
+        )]
+        quality = _strategy_campaign_data_quality(fetched)
+        self.assertTrue(quality["complete"])
+        self.assertTrue(quality["types_present"])
+        self.assertEqual(quality["type_counts"], {"SP": 1, "SB": 1, "SBV": 1, "SD": 1})
+        self.assertEqual(quality["campaign_rows"], 4)
+        self.assertEqual(quality["campaign_expected"], 4)
+
+    def test_openapi_product_fallback_is_never_marked_complete(self):
+        quality = {
+            "sources": {"openapi_fallback"}, "mcp_ok": False,
+            "raw_rows": 12, "typed_rows": 12, "errors": ["MCP unavailable"],
+        }
+        result = _performance_data_quality(quality)
+        self.assertEqual(result["source"], "openapi_fallback")
+        self.assertFalse(result["mcp_ok"])
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["typed_clicks_present"])
 
     def test_campaign_name_reads_nested_campaign_objects(self):
         self.assertEqual(

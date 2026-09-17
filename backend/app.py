@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import time
+from dataclasses import dataclass
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -85,9 +86,13 @@ _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
+_lingxing_mcp_metadata_lock = asyncio.Lock()
+_lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
+_lingxing_mcp_catalog_version = ""
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
+LINGXING_MCP_METADATA_TTL_SECONDS = 3600
 AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
     "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
@@ -106,13 +111,19 @@ AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "
 
 LINGXING_API_BASE = "https://openapi.lingxing.com"
 LINGXING_MCP_URL = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
-LINGXING_MCP_CATALOG_VERSION = "lingxing-mcp-20260915-v1"
-LINGXING_MCP_PRODUCT_SCHEMA = "query_product_performance_asin_lists-v1-c500-20260907"
-LINGXING_MCP_CAMPAIGN_SCHEMA = "ad_campaign_report-260914-v1"
-LINGXING_MCP_SHOPS_SCHEMA = "ad_auth_shops-v1-c500-20260907"
-LINGXING_MCP_PRODUCT_VERSION = 288
-LINGXING_MCP_CAMPAIGN_VERSION = 180068
-LINGXING_MCP_SHOPS_VERSION = 199
+LINGXING_MCP_PRODUCT_TOOL = "query_product_performance_asin_lists"
+LINGXING_MCP_CAMPAIGN_TOOL = "ad_campaign_report"
+LINGXING_MCP_SHOPS_TOOL = "ad_auth_shops"
+
+
+@dataclass(frozen=True)
+class LingXingMCPMetadata:
+    """A concrete LingXing MCP tool version resolved from its live catalog."""
+
+    tool_id: str
+    schema_version: str
+    tool_version_id: str
+    catalog_version: str
 AMAZON_SERIES = [
     "TN10系列（主链接）汇总",
     "TN10系列（小链接）汇总",
@@ -737,15 +748,17 @@ def ad_report_type(row: dict[str, Any]) -> str:
         if text in {"SB", "SB2", "HSA", "SPONSORED_BRANDS", "PRODUCT_COLLECTION"} or text.startswith("SB"): return "SB"
         if text in {"SD", "SPONSORED_DISPLAY"} or text.startswith("SD"): return "SD"
         return ""
+    # SB and SBV share the sponsored type (SB2/HSA). The creative format must
+    # win before the generic key scan maps SB2/HSA to plain SB.
+    sponsored = str(_first_nested_field_value(row, ("sponsored_type", "sponsoredType")) or "").strip().upper()
+    if sponsored in {"HSA", "SB2", "SPONSORED_BRANDS"}:
+        creative = str(_first_nested_field_value(row, ("creative_type", "creativeType")) or "").upper()
+        return "SBV" if "VIDEO" in creative else "SB"
     keys = ("ad_type", "adType", "ads_type", "adsType", "advertising_type", "advertisingType", "type", "product_type", "productType", "campaign_type", "campaignType", "ad_product", "adProduct", "campaign_type_name", "campaignTypeName", "ad_format", "adFormat", "ad_type_name", "adTypeName", "sponsored_type", "sponsoredType")
     for key in keys:
         value = _first_nested_field_value(row, (key,))
         classified = classify(value)
         if classified: return classified
-    sponsored = str(_first_nested_field_value(row, ("sponsored_type", "sponsoredType")) or "").strip().upper()
-    if sponsored in {"HSA", "SB2"}:
-        creative = str(_first_nested_field_value(row, ("creative_type", "creativeType")) or "").upper()
-        return "SBV" if "VIDEO" in creative else "SB"
     return ""
 
 
@@ -1414,6 +1427,7 @@ async def fetch_product_performance(
     semaphore: asyncio.Semaphore,
     asin_list: list[str] | None = None,
     currency_code: str | None = None,
+    quality: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Read LingXing's product-performance endpoint for operating metrics."""
     # An explicitly empty list means the selected products have no ASINs
@@ -1422,11 +1436,16 @@ async def fetch_product_performance(
         return []
     if lingxing_mcp_key():
         try:
-            return await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
-        except (RuntimeError, httpx.HTTPError):
-            # Product performance OpenAPI retains the typed SP/SB/SBV/SD fields;
-            # use it as a bounded fallback when the MCP endpoint is unavailable.
-            pass
+            rows = await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
+            if quality is not None:
+                _record_performance_quality(quality, "mcp", True, None, rows)
+            return rows
+        except (RuntimeError, httpx.HTTPError) as exc:
+            # The OpenAPI endpoint is only an explicit degraded mode. It does
+            # not expose the same typed click dimensions, so never present its
+            # result as a complete MCP dataset.
+            if quality is not None:
+                _record_performance_quality(quality, "openapi_fallback", False, str(exc))
     # LingXing limits this endpoint to a maximum 92-day date range.  The
     # dashboard allows a wider range for quick presets such as "去年", so split
     # longer requests into bounded chunks and merge the returned rows.  Chunk
@@ -1525,9 +1544,64 @@ async def fetch_product_performance(
                 chunk_rows = []
             chunk_rows = chunk_rows if isinstance(chunk_rows, list) else []
             _amazon_cache[cache_key] = (time.monotonic(), chunk_rows)
+        if quality is not None:
+            _record_performance_quality(
+                quality,
+                "openapi_fallback",
+                False,
+                "product OpenAPI rate limited" if rate_limited else None,
+                chunk_rows,
+            )
         rows.extend(chunk_rows)
         cursor = chunk_end + timedelta(days=1)
     return rows
+
+
+def _record_performance_quality(
+    quality: dict[str, Any],
+    source: str,
+    mcp_ok: bool,
+    error: str | None,
+    rows: list[dict[str, Any]] | None = None,
+) -> None:
+    quality.setdefault("sources", set()).add(source)
+    quality.setdefault("errors", [])
+    quality["mcp_ok"] = bool(quality.get("mcp_ok", True)) and mcp_ok
+    if error:
+        quality["errors"].append(str(error))
+    if rows is not None:
+        quality["raw_rows"] = quality.get("raw_rows", 0) + len(rows)
+        quality["typed_rows"] = quality.get("typed_rows", 0) + sum(
+            product_performance_typed_clicks_present(row) for row in rows if isinstance(row, dict)
+        )
+
+
+def product_performance_typed_clicks_present(raw: dict[str, Any]) -> bool:
+    """Return whether all four authoritative product ad-click fields exist."""
+
+    try:
+        breakdown = product_performance_ad_breakdown(raw)
+        return all(breakdown[ad_type]["clicks"] is not None for ad_type in ("sp", "sb", "sbv", "sd"))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _performance_data_quality(quality: dict[str, Any]) -> dict[str, Any]:
+    sources = {str(source) for source in quality.get("sources", set())}
+    raw_rows = int(quality.get("raw_rows", 0) or 0)
+    typed_rows = int(quality.get("typed_rows", 0) or 0)
+    errors = [str(error) for error in quality.get("errors", [])]
+    typed_present = raw_rows > 0 and raw_rows == typed_rows
+    mcp_ok = bool(quality.get("mcp_ok", False))
+    return {
+        "source": "openapi_fallback" if "openapi_fallback" in sources else ("mcp" if sources else "unknown"),
+        "mcp_ok": mcp_ok,
+        "raw_rows": raw_rows,
+        "typed_rows": typed_rows,
+        "typed_clicks_present": typed_present,
+        "complete": mcp_ok and not errors and (raw_rows == 0 or typed_present),
+        "errors": errors,
+    }
 
 
 def optional_metric(row: dict[str, Any], *names: str) -> float | None:
@@ -1676,6 +1750,7 @@ async def amazon_dashboard_periodic(
     if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
+    performance_quality: dict[str, Any] = {}
     cache_key = ("periodic-dashboard-v5-cpo", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
@@ -1710,7 +1785,7 @@ async def amazon_dashboard_periodic(
                     for period_label, period_start, period_end in periods:
                         period_rows = await fetch_product_performance(
                             int(sid_value), period_start, period_end, comparison,
-                            client, semaphore, asin_filter, query_currency,
+                            client, semaphore, asin_filter, query_currency, performance_quality,
                         )
                         for period_row in period_rows:
                             if isinstance(period_row, dict):
@@ -1719,6 +1794,7 @@ async def amazon_dashboard_periodic(
                                 tagged["_source"] = "performance"
                                 performance_rows.append(tagged)
                 except RuntimeError as exc:
+                    _record_performance_quality(performance_quality, "openapi_fallback", False, str(exc))
                     if "ip not permit" in str(exc).lower() or "白名单" in str(exc):
                         performance_rows = []
                     else:
@@ -1841,6 +1917,7 @@ async def amazon_dashboard_periodic(
         "filters": {"site": selected_sites, "series": list(selected_series), "products": list(selected_products)},
         "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods],
         "rows": rows,
+        "data_quality": _performance_data_quality(performance_quality),
         "mapping": {
             "key": "site+asin",
             "sites": list(AMAZON_SITE_CODES),
@@ -1856,6 +1933,77 @@ async def amazon_dashboard_periodic(
 
 def lingxing_mcp_key() -> str:
     return os.environ.get("LINGXING_MCP_KEY", "").strip()
+
+
+def _reset_lingxing_mcp_metadata_cache() -> None:
+    """Clear dynamically resolved MCP metadata; used by tests and refreshes."""
+
+    global _lingxing_mcp_catalog_version
+    _lingxing_mcp_metadata_cache.clear()
+    _lingxing_mcp_catalog_version = ""
+
+
+def _normalized_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key or "").lower())
+
+
+def _mcp_scalar(node: Any, names: tuple[str, ...]) -> str | int | None:
+    wanted = {_normalized_key(name) for name in names}
+    stack = [node]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if _normalized_key(key) in wanted and item not in (None, "") and not isinstance(item, (dict, list, bool)):
+                    return item
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return None
+
+
+def _mcp_tool_record(node: Any, tool_id: str) -> dict[str, Any] | None:
+    id_keys = {_normalized_key(key) for key in ("toolId", "tool_id", "name", "id")}
+    stack = [node]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            if any(_normalized_key(key) in id_keys and str(item) == tool_id for key, item in value.items()):
+                return value
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return None
+
+
+def _lingxing_mcp_business_error(business: dict[str, Any] | None) -> str | None:
+    if not isinstance(business, dict):
+        return None
+    containers = [business]
+    nested = business.get("data")
+    if isinstance(nested, dict):
+        containers.append(nested)
+    for container in containers:
+        if container.get("success") is False or container.get("code") == 0:
+            return str(
+                container.get("msg")
+                or container.get("message")
+                or container.get("error")
+                or container.get("error_message")
+                or "request failed"
+            )
+    return None
+
+
+def _lingxing_mcp_content_text(result: dict[str, Any]) -> str:
+    content = result.get("content") or []
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
 
 
 def _lingxing_mcp_json_body(response: httpx.Response) -> dict[str, Any]:
@@ -1880,10 +2028,22 @@ def _lingxing_mcp_json_body(response: httpx.Response) -> dict[str, Any]:
 
 
 def _lingxing_mcp_result(payload: dict[str, Any]) -> Any:
+    protocol_error = payload.get("error")
+    if isinstance(protocol_error, dict):
+        message = protocol_error.get("message") or protocol_error.get("error") or "request failed"
+        raise RuntimeError(f"LingXing MCP request failed: {message}")
     result = payload.get("result")
     if isinstance(result, dict):
         if result.get("isError"):
-            raise RuntimeError("LingXing MCP request failed")
+            text = _lingxing_mcp_content_text(result)
+            business = None
+            try:
+                decoded = json.loads(text)
+                business = decoded if isinstance(decoded, dict) else None
+            except (json.JSONDecodeError, TypeError):
+                business = None
+            message = (_lingxing_mcp_business_error(business) if business else None) or text or "request failed"
+            raise RuntimeError(f"LingXing MCP request failed: {message}")
         content = result.get("content") or []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
@@ -1898,8 +2058,9 @@ def _lingxing_mcp_result(payload: dict[str, Any]) -> Any:
         business = payload
     if not isinstance(business, dict):
         raise RuntimeError("LingXing MCP returned an invalid result")
-    if business.get("success") is False or business.get("code") == 0:
-        message = business.get("msg") or business.get("message") or "request failed"
+    business_error = _lingxing_mcp_business_error(business)
+    if business_error:
+        message = business_error
         raise RuntimeError(f"LingXing MCP request failed: {message}")
     nested = business.get("data")
     if isinstance(nested, dict) and ("code" in nested or "success" in nested) and "data" in nested:
@@ -1910,13 +2071,13 @@ def _lingxing_mcp_result(payload: dict[str, Any]) -> Any:
     return nested if nested is not None else business
 
 
-async def lingxing_mcp_call(
-    tool_id: str,
-    schema_version: str,
-    tool_version_id: int,
-    params: dict[str, Any],
+async def lingxing_mcp_raw(
+    operation: str,
+    arguments: dict[str, Any],
     client: httpx.AsyncClient,
 ) -> Any:
+    """Call a low-level LingXing MCP operation without hard-coded versions."""
+
     key = lingxing_mcp_key()
     if not key:
         raise RuntimeError("LINGXING_MCP_KEY missing")
@@ -1924,16 +2085,7 @@ async def lingxing_mcp_call(
         "jsonrpc": "2.0",
         "id": f"bi-dashboard-{time.time_ns()}",
         "method": "tools/call",
-        "params": {
-            "name": "action",
-            "arguments": {
-                "catalogVersion": LINGXING_MCP_CATALOG_VERSION,
-                "schemaVersion": schema_version,
-                "toolId": tool_id,
-                "toolVersionId": tool_version_id,
-                "params": params,
-            },
-        },
+        "params": {"name": operation, "arguments": arguments},
     }
     response = await client.post(
         LINGXING_MCP_URL,
@@ -1942,6 +2094,91 @@ async def lingxing_mcp_call(
     )
     response.raise_for_status()
     return _lingxing_mcp_result(_lingxing_mcp_json_body(response))
+
+
+async def lingxing_mcp_metadata(
+    tool_id: str,
+    client: httpx.AsyncClient,
+    force_refresh: bool = False,
+) -> LingXingMCPMetadata:
+    """Resolve a tool against the live catalog instead of pinning it in code."""
+
+    async with _lingxing_mcp_metadata_lock:
+        cached = _lingxing_mcp_metadata_cache.get(tool_id)
+        if cached and not force_refresh and time.monotonic() - cached[0] < LINGXING_MCP_METADATA_TTL_SECONDS:
+            return cached[1]
+        if force_refresh:
+            _lingxing_mcp_metadata_cache.clear()
+
+        help_result = await lingxing_mcp_raw("help", {"query": tool_id, "limit": 20}, client)
+        search_result = await lingxing_mcp_raw("search", {"toolId": tool_id}, client)
+        catalog_version = _mcp_scalar(help_result, ("catalogVersion", "catalog_version")) or _mcp_scalar(
+            search_result,
+            ("catalogVersion", "catalog_version"),
+        )
+        tool_record = _mcp_tool_record(search_result, tool_id)
+        version_source = tool_record or (search_result if isinstance(search_result, dict) else {})
+        schema_version = _mcp_scalar(version_source, ("schemaVersion", "schema_version"))
+        tool_version_id = _mcp_scalar(version_source, ("toolVersionId", "tool_version_id"))
+        if catalog_version in (None, "") or schema_version in (None, "") or tool_version_id in (None, ""):
+            raise RuntimeError(f"LingXing MCP metadata for {tool_id} is incomplete")
+
+        global _lingxing_mcp_catalog_version
+        catalog_text = str(catalog_version)
+        if _lingxing_mcp_catalog_version and _lingxing_mcp_catalog_version != catalog_text:
+            _lingxing_mcp_metadata_cache.clear()
+        _lingxing_mcp_catalog_version = catalog_text
+        metadata = LingXingMCPMetadata(
+            tool_id=tool_id,
+            schema_version=schema_version,
+            tool_version_id=tool_version_id,
+            catalog_version=catalog_version,
+        )
+        _lingxing_mcp_metadata_cache[tool_id] = (time.monotonic(), metadata)
+        return metadata
+
+
+def _is_lingxing_catalog_update_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return "catalog" in message or "版本" in str(error) or "version" in message or "updated" in message or "expired" in message
+
+
+async def lingxing_mcp_call(
+    tool_id: str,
+    params: dict[str, Any],
+    client: httpx.AsyncClient,
+) -> Any:
+    metadata = await lingxing_mcp_metadata(tool_id, client)
+    try:
+        return await lingxing_mcp_raw(
+            "action",
+            {
+                "catalogVersion": metadata.catalog_version,
+                "schemaVersion": metadata.schema_version,
+                "toolId": metadata.tool_id,
+                "toolVersionId": metadata.tool_version_id,
+                "params": params,
+            },
+            client,
+        )
+    except RuntimeError as exc:
+        if not _is_lingxing_catalog_update_error(exc):
+            raise
+
+    # Catalog changes invalidate every cached tool version together, then the
+    # failed action receives exactly one refreshed retry.
+    metadata = await lingxing_mcp_metadata(tool_id, client, force_refresh=True)
+    return await lingxing_mcp_raw(
+        "action",
+        {
+            "catalogVersion": metadata.catalog_version,
+            "schemaVersion": metadata.schema_version,
+            "toolId": metadata.tool_id,
+            "toolVersionId": metadata.tool_version_id,
+            "params": params,
+        },
+        client,
+    )
 
 
 async def fetch_mcp_product_performance(
@@ -1968,9 +2205,7 @@ async def fetch_mcp_product_performance(
         params["search_field"] = "asin"
         params["search_value"] = asin_list
     data = await lingxing_mcp_call(
-        "query_product_performance_asin_lists",
-        LINGXING_MCP_PRODUCT_SCHEMA,
-        LINGXING_MCP_PRODUCT_VERSION,
+        LINGXING_MCP_PRODUCT_TOOL,
         params,
         client,
     )
@@ -1987,9 +2222,7 @@ async def lingxing_mcp_shop_rows(client: httpx.AsyncClient) -> list[dict[str, An
     if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
         return list(cached[1])
     data = await lingxing_mcp_call(
-        "ad_auth_shops",
-        LINGXING_MCP_SHOPS_SCHEMA,
-        LINGXING_MCP_SHOPS_VERSION,
+        LINGXING_MCP_SHOPS_TOOL,
         {},
         client,
     )
@@ -1998,51 +2231,100 @@ async def lingxing_mcp_shop_rows(client: httpx.AsyncClient) -> list[dict[str, An
     return rows
 
 
+@dataclass
+class CampaignReportResult:
+    rows: list[dict[str, Any]]
+    expected: int | None
+    pages: int
+    profile_found: bool
+    complete: bool
+    error: str = ""
+
+
+def _mcp_profile_id(row: dict[str, Any]) -> str:
+    value = _mcp_scalar(row, ("profileId", "profile_id", "profileID", "amazonProfileId", "amazon_profile_id"))
+    return str(value or "").strip()
+
+
+def _campaign_report_page(data: Any) -> tuple[list[dict[str, Any]], int | None]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)], None
+    if not isinstance(data, dict):
+        return [], None
+    batch = next((data[key] for key in ("data", "list", "rows", "records", "items") if isinstance(data.get(key), list)), None)
+    expected_value = _mcp_scalar(data, ("recordsFiltered", "records_filtered", "recordsTotal", "records_total", "total", "totalCount", "total_count", "count"))
+    try:
+        expected = int(expected_value) if expected_value is not None else None
+    except (TypeError, ValueError):
+        expected = None
+    return ([row for row in batch if isinstance(row, dict)] if isinstance(batch, list) else []), expected
+
+
 async def fetch_mcp_campaign_report(
     sid: int,
     start_date: date,
     end_date: date,
     client: httpx.AsyncClient,
-) -> list[dict[str, Any]]:
+) -> CampaignReportResult:
     shops = await lingxing_mcp_shop_rows(client)
-    profile_id = next(
-        (str(row.get("profile_id")) for row in shops if str(row.get("sid") or "") == str(sid) and row.get("profile_id")),
-        "",
-    )
+    profile_id = next((_mcp_profile_id(row) for row in shops if str(row.get("sid") or "") == str(sid) and _mcp_profile_id(row)), "")
     if not profile_id:
-        return []
+        return CampaignReportResult([], None, 0, False, False, f"LingXing MCP profile_id not found for sid {sid}")
     rows: list[dict[str, Any]] = []
+    expected: int | None = None
+    pages = 0
+    errors: list[str] = []
     page = 1
     while True:
-        data = await lingxing_mcp_call(
-            "ad_campaign_report",
-            LINGXING_MCP_CAMPAIGN_SCHEMA,
-            LINGXING_MCP_CAMPAIGN_VERSION,
-            {
-                "report_date": f"{start_date.isoformat()} - {end_date.isoformat()}",
-                "profile_ids": [profile_id],
-                "page": page,
-                "length": 100,
-                "sort_field": "clicks",
-                "sort_type": "desc",
-            },
-            client,
-        )
-        batch = data.get("data") if isinstance(data, dict) else data
-        if not isinstance(batch, list) or not batch:
+        try:
+            data = await lingxing_mcp_call(
+                LINGXING_MCP_CAMPAIGN_TOOL,
+                {
+                    "report_date": f"{start_date.isoformat()} - {end_date.isoformat()}",
+                    "profile_ids": [profile_id],
+                    "page": page,
+                    "length": 100,
+                    "sort_field": "clicks",
+                    "sort_type": "desc",
+                },
+                client,
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            errors.append(str(exc))
+            break
+        batch, page_expected = _campaign_report_page(data)
+        if page_expected is not None:
+            expected = page_expected
+        pages += 1
+        if not batch:
+            errors.append(
+                "LingXing MCP campaign report did not return a total count"
+                if expected is None
+                else f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns"
+            )
             break
         for row in batch:
-            if not isinstance(row, dict):
-                continue
             # The campaign report prepends an aggregate row with metrics but
             # no campaign id or name. It must not become a fake campaign.
-            if not ad_report_campaign_id(row) and not ad_report_campaign_name(row):
-                continue
-            rows.append(row)
+            if ad_report_campaign_id(row) or ad_report_campaign_name(row):
+                rows.append(row)
+        if expected is not None and len(rows) >= expected:
+            if len(rows) > expected:
+                errors.append(f"LingXing MCP campaign report returned {len(rows)} campaigns; expected {expected}")
+            break
         if len(batch) < 100:
+            errors.append(
+                "LingXing MCP campaign report did not return a total count"
+                if expected is None
+                else f"LingXing MCP campaign report returned {len(rows)} of {expected} campaigns"
+            )
+            break
+        if page >= 50:
+            errors.append("LingXing MCP campaign report exceeded the pagination safety limit")
             break
         page += 1
-    return rows
+    complete = expected is not None and len(rows) == expected and not errors
+    return CampaignReportResult(rows, expected, pages, True, complete, "; ".join(errors))
 
 
 def amazon_strategy_board_groups(
@@ -2117,6 +2399,36 @@ def amazon_strategy_board_groups(
     return output
 
 
+def _strategy_campaign_data_quality(
+    fetched: list[tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    qualities = [quality for _, _, _, account_quality in fetched for quality in account_quality]
+    errors = [error for quality in qualities for error in quality.get("errors", [])]
+    expected_values = [quality.get("campaign_expected") for quality in qualities]
+    expected = sum(value for value in expected_values if value is not None) if qualities and all(value is not None for value in expected_values) else None
+    type_counts = {ad_type: 0 for ad_type in ("SP", "SB", "SBV", "SD")}
+    for _, _, raw_rows, _ in fetched:
+        for raw in raw_rows:
+            ad_type = ad_report_type(raw)
+            if ad_type in type_counts:
+                type_counts[ad_type] += 1
+    complete = bool(qualities) and all(bool(quality.get("complete")) for quality in qualities)
+    return {
+        "source": "mcp" if qualities and all(quality.get("source") == "mcp" for quality in qualities) else "openapi_fallback",
+        "mcp_ok": bool(qualities) and all(bool(quality.get("mcp_ok")) for quality in qualities),
+        "campaign_pages": sum(int(quality.get("campaign_pages") or 0) for quality in qualities),
+        "campaign_rows": sum(int(quality.get("campaign_rows") or 0) for quality in qualities),
+        "campaign_expected": expected,
+        "profile_found": bool(qualities) and all(bool(quality.get("profile_found")) for quality in qualities),
+        "types_present": all(type_counts[ad_type] > 0 for ad_type in type_counts),
+        "type_counts": type_counts,
+        "complete": complete,
+        "errors": errors,
+        "campaign_inventory_complete": complete,
+        "unassigned_campaigns_included": True,
+    }
+
+
 async def amazon_strategy_board_payload(
     start_date: date,
     end_date: date,
@@ -2149,44 +2461,72 @@ async def amazon_strategy_board_payload(
             site_code = strategy_site_code(site_name)
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
             rows: list[dict[str, Any]] = []
+            account_quality: list[dict[str, Any]] = []
             for account in accounts:
                 account_sid = str(account["sid"])
-                try:
-                    if lingxing_mcp_key():
-                        account_rows = await fetch_mcp_campaign_report(
+                if selected_store_sids and account_sid not in selected_store_sids:
+                    continue
+                errors: list[str] = []
+                mcp_result: CampaignReportResult | None = None
+                if lingxing_mcp_key():
+                    try:
+                        mcp_result = await fetch_mcp_campaign_report(
                             int(account["sid"]), start_date, end_date, client
                         )
-                        metadata_rows = []
-                    else:
-                        account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
-                        metadata_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0)
+                    except (RuntimeError, httpx.HTTPError) as exc:
+                        errors.append(str(exc))
+                    if mcp_result and mcp_result.error:
+                        errors.append(mcp_result.error)
 
-                except RuntimeError as exc:
-                    if "白名单" in str(exc) or "ip not permit" in str(exc).lower():
-                        continue
-                    if lingxing_mcp_key():
-                        account_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
+                # OpenAPI is only an explicit degraded source. Its SP-detail
+                # endpoint can enrich names/types and preserve visible rows,
+                # but it can never turn an incomplete MCP inventory into a
+                # complete SB/SBV/SD campaign list.
+                fallback_rows: list[dict[str, Any]] = []
+                metadata_rows: list[dict[str, Any]] = []
+                if mcp_result is None or not mcp_result.complete:
+                    try:
+                        fallback_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
                         metadata_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0)
-                    else:
-                        raise
+                    except (RuntimeError, httpx.HTTPError) as exc:
+                        errors.append(str(exc))
                 metadata_by_id: dict[str, dict[str, Any]] = {}
                 for metadata in metadata_rows:
                     metadata_id = ad_report_campaign_id(metadata)
                     if metadata_id and (ad_report_campaign_name(metadata) or ad_report_type(metadata)):
                         metadata_by_id.setdefault(metadata_id, metadata)
-                for row in account_rows:
+
+                combined_by_campaign: dict[str, dict[str, Any]] = {}
+                source_rows = list(mcp_result.rows if mcp_result else []) + fallback_rows
+                for row in source_rows:
+                    campaign_key = ad_report_campaign_id(row) or ad_report_campaign_name(row)
+                    if not campaign_key:
+                        continue
                     metadata = metadata_by_id.get(ad_report_campaign_id(row))
-                    if metadata:
-                        merged = dict(metadata)
-                        merged.update({key: value for key, value in row.items() if value not in (None, "", [], {})})
-                        row.clear()
-                        row.update(merged)
+                    merged = dict(metadata or {})
+                    merged.update({key: value for key, value in row.items() if value not in (None, "", [], {})})
+                    previous = combined_by_campaign.get(campaign_key)
+                    if previous is None or (mcp_result and row in mcp_result.rows):
+                        combined_by_campaign[campaign_key] = merged
+                account_rows = list(combined_by_campaign.values())
                 for row in account_rows:
                     row["_store_sid"] = str(row.get("_store_sid") or account_sid)
                     row["_store_name"] = str(ad_report_store_name(row) or account.get("name") or account.get("account_name") or "未命名店铺")
                     row["_site_name"] = site_name
                     row["_ad_type"] = ad_report_type(row)
                 rows.extend(account_rows)
+                used_fallback = mcp_result is None or not mcp_result.complete
+                account_quality.append({
+                    "sid": account_sid,
+                    "source": "openapi_fallback" if used_fallback else "mcp",
+                    "mcp_ok": bool(mcp_result and mcp_result.complete),
+                    "campaign_pages": mcp_result.pages if mcp_result else 0,
+                    "campaign_rows": len(account_rows),
+                    "campaign_expected": mcp_result.expected if mcp_result else None,
+                    "profile_found": bool(mcp_result and mcp_result.profile_found),
+                    "complete": bool(mcp_result and mcp_result.complete),
+                    "errors": errors,
+                })
             store_lookup = {str(item.get("sid")): item for item in (store_rows or []) if item.get("sid") is not None}
             for row in rows:
                 row["_store_sid"] = str(row.get("_store_sid") or "")
@@ -2196,7 +2536,7 @@ async def amazon_strategy_board_payload(
                 row["_ad_type"] = ad_report_type(row)
             if selected_store_sids:
                 rows = [row for row in rows if str(row.get("_store_sid") or "") in selected_store_sids]
-            return site_name, site_code, rows
+            return site_name, site_code, rows, account_quality
 
         fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
@@ -2219,7 +2559,7 @@ async def amazon_strategy_board_payload(
             notes[(item.week_start, item.site_code, item.series, normalize_strategy(item.strategy))] = item.note
 
     aggregate: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for site_name, site_code, raw_rows in fetched:
+    for site_name, site_code, raw_rows, _ in fetched:
         for raw in raw_rows:
             campaign_id = strategy_campaign_id(raw)
             campaign_name = strategy_campaign_name(raw)
@@ -2244,7 +2584,7 @@ async def amazon_strategy_board_payload(
 
     week_scope = normalize_week_start(start_date)
     output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
-    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": {"campaign_inventory_complete": bool(lingxing_mcp_key()), "unassigned_campaigns_included": True}}
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": _strategy_campaign_data_quality(fetched)}
     _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
 
