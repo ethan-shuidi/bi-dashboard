@@ -1824,7 +1824,7 @@ def status():
 
 
 def amazon_empty_row(series: str, product: str | None = None) -> dict[str, Any]:
-    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "ad_order_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "cpo": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None}
+    return {"series": series, "product": product or "", "acoas": None, "ad_sales_share": None, "ad_order_share": None, "units": None, "net_sales": None, "orders": None, "b2b_units": None, "b2b_orders": None, "ctr": None, "clicks": 0, "cpc": None, "cpo": None, "ad_cost": 0, "ad_cvr": None, "ad_units": 0, "ad_orders": 0, "cvr": None, "acos": None, "sessions": None, "page_views": None}
 
 
 def amazon_periods(start_date: date, end_date: date, comparison: str) -> list[tuple[str, date, date]]:
@@ -2053,6 +2053,7 @@ AMAZON_SOURCE_FIELDS = {
         "b2b_units": ("b2b_volume", "b2bVolume", "totalB2bSalesQuantity"),
         "b2b_orders": ("b2b_order_items", "b2bOrderItems", "totalB2bOrderQuantity"),
         "sessions": ("sessions_total", "sessionsTotal", "sessionTotal", "trafficSessionTotal"),
+        "page_views": ("page_views_total", "pageViewsTotal", "page_view_total", "pageViewTotal", "pageviews_total", "pageviewsTotal", "trafficPVTotal", "trafficPvTotal", "traffic_pv_total", "trafficPageViewsTotal", "pv_total", "pvTotal", "page_views", "pageViews", "page_view", "pageView", "pv"),
         "impressions": ("impressions", "ad_impressions", "adImpressions", "total_ad_impressions", "totalAdImpressions"),
         "clicks": ("clicks", "ad_clicks", "adClicks", "ads_clicks", "adsClicks", "total_ad_clicks", "totalAdClicks", "ad_click_quantity", "adClickQuantity", "ad_clicks_total"),
         "ad_sales": ("ad_sales_amount", "ads_sales_amount", "adSalesAmount"),
@@ -2065,7 +2066,7 @@ AMAZON_SOURCE_RATIOS = {
     "performance": {"source_cvr": ("cvr", "conversion_rate", "conversionRate")},
 }
 AMAZON_METRIC_SOURCES = {
-    "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "cvr", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
+    "performance": ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "sessions", "page_views", "cvr", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "ctr", "cpc", "ad_cvr", "acos"],
     "calculated": ["acoas", "ad_sales_share", "ad_order_share"],
 }
 
@@ -2188,7 +2189,7 @@ async def amazon_dashboard_periodic(
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v5-cpo", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v6-pv", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -2324,6 +2325,7 @@ async def amazon_dashboard_periodic(
         ad_cost = item.get("ad_cost")
         ad_orders = item.get("ad_orders")
         sessions = item.get("sessions")
+        page_views = item.get("page_views")
         ad_units = item.get("ad_units")
         ad_sales_share = (ad_units / units) if ad_units is not None and units else None
         ad_order_share = (ad_orders / orders) if ad_orders is not None and orders else None
@@ -2343,7 +2345,9 @@ async def amazon_dashboard_periodic(
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
             "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
-            "sessions": int(sessions) if sessions is not None else None, "ad_breakdown": item.get("ad_breakdown", {}),
+            "sessions": int(sessions) if sessions is not None else None,
+            "page_views": int(page_views) if page_views is not None else None,
+            "ad_breakdown": item.get("ad_breakdown", {}),
         })
     output_currency = requested_currency if requested_currency != "original" else (AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD") if len(selected_sites) == 1 else "original")
     response = {
@@ -3295,6 +3299,153 @@ def save_strategy_note(
 def normalize_week_start(value: date | None) -> date:
     selected = value or datetime.now(timezone.utc).date()
     return selected - timedelta(days=selected.weekday())
+
+
+def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collapse product/site rows into the three weekly ad-chart datasets."""
+
+    additive = ("net_sales", "ad_sales", "ad_cost", "clicks", "ad_orders", "sessions", "page_views")
+    grouped: dict[str, dict[str, Any]] = {}
+    for source in periodic.get("rows", []):
+        period_start = str(source.get("period_start") or "")
+        period_end = str(source.get("period_end") or "")
+        if not period_start or not period_end:
+            continue
+        item = grouped.setdefault(source["period_start"], {
+            "period": source.get("period") or period_start,
+            "period_start": period_start,
+            "period_end": period_end,
+            **{key: 0.0 for key in additive},
+            **{f"{key}_present": False for key in additive},
+        })
+        for key in additive:
+            value = source.get(key)
+            if value is not None:
+                item[key] += float(value)
+                item[f"{key}_present"] = True
+
+    output: list[dict[str, Any]] = []
+    for item in sorted(grouped.values(), key=lambda row: row["period_start"]):
+        net_sales = item["net_sales"] if item["net_sales_present"] else None
+        ad_sales = item["ad_sales"] if item["ad_sales_present"] else None
+        ad_cost = item["ad_cost"] if item["ad_cost_present"] else None
+        clicks = item["clicks"] if item["clicks_present"] else None
+        ad_orders = item["ad_orders"] if item["ad_orders_present"] else None
+        sessions = item["sessions"] if item["sessions_present"] else None
+        page_views = item["page_views"] if item["page_views_present"] else None
+        output.append({
+            "period": item["period"],
+            "period_start": item["period_start"],
+            "period_end": item["period_end"],
+            "net_sales": net_sales,
+            "ad_sales": ad_sales,
+            "ad_cost": ad_cost,
+            "fee_ratio": ad_cost / net_sales if ad_cost is not None and net_sales else None,
+            "clicks": int(clicks) if clicks is not None else None,
+            "ad_orders": int(ad_orders) if ad_orders is not None else None,
+            "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else None,
+            "sessions": int(sessions) if sessions is not None else None,
+            "page_views": int(page_views) if page_views is not None else None,
+        })
+    return output
+
+
+@app.get("/api/amazon/ads-charts")
+async def amazon_ads_charts(
+    start_week: date | None = Query(default=None),
+    end_week: date | None = Query(default=None),
+    site: str = Query(default=AMAZON_SALES_ALL_SITES),
+    model: str = Query(default="TN10"),
+    refresh: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Return weekly sales, conversion, and traffic charts for one model."""
+
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        start = normalize_week_start(start_week)
+        end = normalize_week_start(end_week)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="广告图表周格式无效") from exc
+    if not start_week or not end_week or start > end:
+        raise HTTPException(status_code=422, detail="广告图表周范围无效")
+    if (end - start).days + 7 > AMAZON_MAX_DATE_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"广告图表周范围无效，最多支持 {AMAZON_MAX_DATE_RANGE_DAYS} 天")
+    model = model.strip().upper()
+    if model not in AMAZON_SALES_MODELS:
+        raise HTTPException(status_code=422, detail="广告图表型号无效")
+    try:
+        selected_sites = amazon_sales_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
+        raise HTTPException(status_code=503, detail="领星 API 尚未配置")
+
+    products, selected_series = amazon_sales_scope(model)
+    if not products or not selected_series:
+        raise HTTPException(status_code=422, detail="广告图表型号暂无产品映射")
+    try:
+        sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
+    if not sid_map:
+        for store_item in await lingxing_store_rows():
+            country = str(store_item.get("country") or "")
+            sid = store_item.get("sid")
+            if country and sid and int(store_item.get("status") or 0) == 1:
+                sid_map.setdefault(country, {"sid": sid})
+    store_rows = []
+    if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
+        store_rows = await lingxing_store_rows()
+    if refresh:
+        _amazon_cache.clear()
+
+    site_today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in selected_sites
+    )
+    fetch_end = min(end + timedelta(days=6), site_today)
+    rows: list[dict[str, Any]] = []
+    data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
+    if start <= fetch_end:
+        try:
+            periodic = await amazon_dashboard_periodic(
+                "周",
+                start,
+                fetch_end,
+                selected_sites,
+                selected_series,
+                products,
+                sid_map,
+                store_rows,
+                "USD" if len(selected_sites) > 1 else "original",
+            )
+            rows = amazon_ads_chart_rows(periodic)
+            data_quality = dict(periodic.get("data_quality") or {})
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+
+    sessions_present = any(row.get("sessions") is not None for row in rows)
+    page_views_present = any(row.get("page_views") is not None for row in rows)
+    return {
+        "period": {"start": start.isoformat(), "end": (end + timedelta(days=6)).isoformat()},
+        "site": site,
+        "selected_sites": selected_sites,
+        "model": model,
+        "currency": "USD" if len(selected_sites) > 1 else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD"),
+        "currency_mode": "USD" if len(selected_sites) > 1 else "original",
+        "rows": rows,
+        "field_availability": {
+            "sessions_field": "Sessions-Total",
+            "sessions_present": sessions_present,
+            "page_views_field": "PV-Total",
+            "page_views_present": page_views_present,
+        },
+        "data_quality": data_quality,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/amazon/ad-plan")

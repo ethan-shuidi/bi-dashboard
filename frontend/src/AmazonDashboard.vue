@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import AmazonAdsCharts from "./AmazonAdsCharts.vue"
 import AmazonStrategyBoard from "./AmazonStrategyBoard.vue"
 
 const apiBase = ref("")
@@ -784,6 +785,7 @@ onBeforeUnmount(() => {
       <Teleport to="body"><div v-if="breakdownOpenKey && breakdownRow && breakdownColumn" class="ad-breakdown-popover ad-breakdown-popover-floating" role="tooltip" :style="{ top: `${breakdownPosition.top}px`, left: `${breakdownPosition.left}px` }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><strong>{{ breakdownColumn.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(breakdownRow.metrics, breakdownColumn.key, adType.key) }}</em></span><small v-if="!breakdownHasData(breakdownRow.metrics)">暂无四类广告明细</small></div></Teleport>
     </section>
     </section>
+    <AmazonAdsCharts :api-base="apiBase" />
     <AmazonStrategyBoard :api-base="apiBase" />
      <div v-if="copyMessage" class="amazon-copy-toast" role="status" aria-live="polite">{{ copyMessage }}</div>
    </div>

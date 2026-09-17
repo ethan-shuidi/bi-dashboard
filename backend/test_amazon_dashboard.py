@@ -39,6 +39,8 @@ from app import (
     amazon_sales_week_time_progress,
     amazon_sales_target_values,
     amazon_sales_target_number,
+    amazon_ads_chart_rows,
+    amazon_ads_charts,
     normalize_week_start,
     migrate_amazon_monthly_targets,
     amazon_sid_accounts,
@@ -710,6 +712,10 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             optional_metric({"ads_sales_volume_quantity": "4"}, *AMAZON_SOURCE_FIELDS["performance"]["ad_units"]),
             4.0,
         )
+        self.assertEqual(
+            optional_metric({"pageViewsTotal": "18"}, *AMAZON_SOURCE_FIELDS["performance"]["page_views"]),
+            18.0,
+        )
 
     def test_product_performance_cache_hit_does_not_reference_rate_limit_state(self):
         start = date(2026, 9, 1)
@@ -765,6 +771,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "b2b_volume": 1,
             "b2b_order_items": 1,
             "sessions_total": 50,
+            "pageViewsTotal": 120,
             "cvr": 0.1,
             "impressions": 100,
             "clicks": 5,
@@ -790,8 +797,98 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["ad_orders"], 2)
         self.assertEqual(row["cpo"], 1)
         self.assertEqual(row["ad_order_share"], 0.4)
+        self.assertEqual(row["sessions"], 50)
+        self.assertEqual(row["page_views"], 120)
         self.assertEqual(row["asin"], asin)
         self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)
+
+    def test_ads_chart_rows_recalculate_ratios_from_period_totals(self):
+        periodic = {
+            "rows": [
+                {
+                    "period": "2026-09-07~2026-09-13",
+                    "period_start": "2026-09-07",
+                    "period_end": "2026-09-13",
+                    "net_sales": 100,
+                    "ad_sales": 30,
+                    "ad_cost": 10,
+                    "clicks": 50,
+                    "ad_orders": 2,
+                    "sessions": 80,
+                    "page_views": 200,
+                },
+                {
+                    "period": "2026-09-07~2026-09-13",
+                    "period_start": "2026-09-07",
+                    "period_end": "2026-09-13",
+                    "net_sales": 100,
+                    "ad_sales": 20,
+                    "ad_cost": 10,
+                    "clicks": 50,
+                    "ad_orders": 3,
+                    "sessions": 70,
+                    "page_views": 220,
+                },
+            ]
+        }
+        row = amazon_ads_chart_rows(periodic)[0]
+        self.assertEqual(row["net_sales"], 200)
+        self.assertEqual(row["ad_sales"], 50)
+        self.assertEqual(row["ad_cost"], 20)
+        self.assertAlmostEqual(row["fee_ratio"], 0.1)
+        self.assertEqual(row["clicks"], 100)
+        self.assertEqual(row["ad_orders"], 5)
+        self.assertAlmostEqual(row["ad_cvr"], 0.05)
+        self.assertEqual(row["sessions"], 150)
+        self.assertEqual(row["page_views"], 420)
+
+    def test_ads_chart_keeps_missing_pv_explicitly_unavailable(self):
+        row = amazon_ads_chart_rows({
+            "rows": [{
+                "period": "2026-09-07~2026-09-13",
+                "period_start": "2026-09-07",
+                "period_end": "2026-09-13",
+                "sessions": 20,
+            }]
+        })[0]
+        self.assertEqual(row["sessions"], 20)
+        self.assertIsNone(row["page_views"])
+
+    def test_ads_charts_endpoint_reports_explicit_field_availability(self):
+        periodic = {
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+            "rows": [{
+                "period": "2026-09-07~2026-09-13",
+                "period_start": "2026-09-07",
+                "period_end": "2026-09-13",
+                "net_sales": 100,
+                "ad_sales": 25,
+                "ad_cost": 5,
+                "clicks": 20,
+                "ad_orders": 1,
+                "sessions": 30,
+                "page_views": None,
+            }],
+        }
+
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
+        }
+        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=AsyncMock(return_value=periodic)):
+            result = asyncio.run(amazon_ads_charts(
+                date(2026, 9, 7),
+                date(2026, 9, 7),
+                "全部站点",
+                "TN20",
+                False,
+            ))
+        self.assertEqual(result["model"], "TN20")
+        self.assertEqual(result["currency"], "USD")
+        self.assertTrue(result["field_availability"]["sessions_present"])
+        self.assertFalse(result["field_availability"]["page_views_present"])
+        self.assertAlmostEqual(result["rows"][0]["fee_ratio"], 0.05)
 
     def test_product_performance_ad_metrics_sum_sp_sb_sbv_and_sd(self):
         raw = {
