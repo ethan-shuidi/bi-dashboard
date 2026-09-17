@@ -299,7 +299,15 @@
 .dashboard-nav-item.dragging{opacity:.62}
 .dashboard-nav-item.drag-over{border-color:#93b8ea;background:#eaf3ff}
 .sales-dashboard{display:block}
-.sales-filter-bar{position:relative;z-index:1;margin-top:20px;padding:16px 18px;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;border:1px solid var(--line);border-radius:var(--radius);background:#fff;box-shadow:var(--shadow-sm)}
+.sales-filter-bar{position:relative;z-index:20;margin-top:20px;padding:16px 18px;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;border:1px solid var(--line);border-radius:var(--radius);background:#fff;box-shadow:var(--shadow-sm)}
+.sales-date-field{position:relative;display:grid;gap:6px}
+.sales-date-trigger{display:flex;align-items:center;justify-content:space-between;gap:12px;width:168px;height:44px;padding:0 12px;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff;color:#203a62;font-size:13px;font-weight:750;cursor:pointer}
+.sales-date-trigger span{color:#5f7188;font-size:12px}
+.sales-date-trigger strong{flex:1;text-align:left;white-space:nowrap}
+.sales-date-trigger i{width:16px;color:#52769f;font-size:15px;font-style:normal;line-height:1;transform:rotate(-90deg);transition:transform .16s ease}
+.sales-date-trigger i.open{transform:rotate(90deg)}
+.sales-date-trigger:hover{border-color:#8db4e0;background:#f2f7ff}
+.sales-date-panel{position:absolute;top:calc(100% + 8px);left:0;z-index:1200;width:292px;padding:12px;border:1px solid #cfe0f1;border-radius:12px;background:#fff;box-shadow:0 18px 44px rgba(23,50,88,.18)}
 .sales-year-picker{height:44px;display:flex;align-items:center;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff;overflow:hidden}
 .sales-year-picker strong{min-width:86px;color:#203a62;font-size:13px;text-align:center}
 .sales-year-picker button{width:36px;height:42px;border:0;background:transparent;color:#52769f;font-size:19px;cursor:pointer}
@@ -312,6 +320,9 @@
 .sales-model-field{display:grid;gap:6px}
 .sales-model-field>span{color:#5f7188;font-size:12px;font-weight:700}
 .sales-model-field select{width:138px;height:44px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;color:#203a62;background:#f8fbff;font-size:13px;font-weight:700}
+.sales-percent-input{position:relative;display:inline-block}
+.sales-percent-input input{padding-right:30px}
+.sales-percent-input span{position:absolute;top:1px;right:11px;height:34px;color:#64778c;font-size:13px;font-weight:750;line-height:34px;pointer-events:none}
 .sales-save-button{height:44px;min-width:88px;margin-left:auto;padding:0 16px;border:1px solid #1d4ed8;border-radius:9px;color:#fff;background:linear-gradient(135deg,#1e40af,#2563eb);font-size:13px;font-weight:750;cursor:pointer}
 .sales-save-button:hover:not(:disabled){background:linear-gradient(135deg,#1d4ed8,#1e6bf1)}
 .sales-save-button:disabled{opacity:.55;cursor:not-allowed}
@@ -345,5 +356,5 @@
 .sales-completion.red{color:#b52e45}
 .sales-completion.gray{color:#68788c}
 .sales-table-panel>footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;padding:12px 20px;border-top:1px solid var(--line);background:#fbfdff;color:#71839a;font-size:12px}
-@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-month-grid{width:100%;grid-template-columns:repeat(6,1fr)}.sales-year-picker,.sales-model-field{width:50%}.sales-year-picker strong{width:100%}.sales-save-button{margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-target-table{min-width:620px}.sales-table-wrap{overflow-x:auto}}
-@media(max-width:520px){.sales-year-picker,.sales-model-field,.sales-save-button{width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-date-field,.sales-model-field{width:calc(50% - 8px)}.sales-date-trigger{width:100%}.sales-date-panel{width:min(340px,calc(100vw - 68px))}.sales-save-button{margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-target-table{min-width:620px}.sales-table-wrap{overflow-x:auto}}
+@media(max-width:520px){.sales-date-field,.sales-model-field,.sales-save-button{width:100%}.sales-date-panel{left:0;width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}

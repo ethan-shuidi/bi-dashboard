@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 
 const props = defineProps({
@@ -9,8 +9,12 @@ const props = defineProps({
 const now = new Date()
 const year = ref(now.getFullYear())
 const month = ref(now.getMonth() + 1)
+const pickerYear = ref(year.value)
+const datePanelOpen = ref(false)
 const model = ref("TN10")
 const models = ["TN10", "TN20"]
+const site = ref("全部站点")
+const siteOptions = ["全部站点", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
 const months = Array.from({ length: 12 }, (_, index) => index + 1)
 const data = ref(null)
 const loading = ref(true)
@@ -45,7 +49,10 @@ async function api(path, options = {}) {
 function syncDraft(targets = {}) {
   const values = {}
   for (const item of data.value?.metrics || []) {
-    const value = targets[item.key]
+    let value = targets[item.key]
+    if (item.format === "percent" && value !== null && value !== undefined && value !== "") {
+      value = String(Number((Number(value) * 100).toFixed(8)))
+    }
     values[item.key] = value === null || value === undefined ? "" : String(value)
   }
   targetDraft.value = values
@@ -56,7 +63,7 @@ async function loadDashboard({ refresh = false } = {}) {
   loading.value = true
   error.value = ""
   try {
-    const query = new URLSearchParams({ year: String(year.value), month: String(month.value), model: model.value })
+    const query = new URLSearchParams({ year: String(year.value), month: String(month.value), model: model.value, site: site.value })
     if (refresh) query.set("refresh", "true")
     data.value = await api(`/api/amazon/sales-dashboard?${query}`)
     syncDraft(data.value.targets)
@@ -73,20 +80,35 @@ function confirmScopeChange() {
 }
 
 function changeYear(delta) {
-  if (!confirmScopeChange()) return
-  const next = year.value + delta
+  const next = pickerYear.value + delta
   if (next < 2000 || next > 2100) return
-  year.value = next
+  pickerYear.value = next
 }
 
-function changeMonth(nextMonth) {
-  if (nextMonth === month.value || !confirmScopeChange()) return
+function toggleDatePicker() {
+  pickerYear.value = year.value
+  datePanelOpen.value = !datePanelOpen.value
+}
+
+function chooseMonth(nextMonth) {
+  if (nextMonth === month.value && pickerYear.value === year.value) {
+    datePanelOpen.value = false
+    return
+  }
+  if (!confirmScopeChange()) return
+  year.value = pickerYear.value
   month.value = nextMonth
+  datePanelOpen.value = false
 }
 
 function changeModel(nextModel) {
   if (nextModel === model.value || !confirmScopeChange()) return
   model.value = nextModel
+}
+
+function changeSite(nextSite) {
+  if (nextSite === site.value || !confirmScopeChange()) return
+  site.value = nextSite
 }
 
 async function saveTargets() {
@@ -96,11 +118,18 @@ async function saveTargets() {
   try {
     const targets = {}
     for (const item of metricRows.value) {
-      targets[item.key] = targetDraft.value[item.key] ?? ""
+      const value = targetDraft.value[item.key] ?? ""
+      if (item.format === "percent" && value !== "") {
+        const percent = Number(value)
+        if (!Number.isFinite(percent)) throw new Error(`${item.label}目标必须是数字`)
+        targets[item.key] = percent / 100
+      } else {
+        targets[item.key] = value
+      }
     }
     await api("/api/amazon/sales-dashboard/targets", {
       method: "POST",
-      body: JSON.stringify({ year: year.value, month: month.value, model: model.value, targets }),
+      body: JSON.stringify({ year: year.value, month: month.value, model: model.value, site: site.value, targets }),
     })
     await loadDashboard()
     notice.value = "月度目标已保存"
@@ -151,8 +180,16 @@ function displayPercent(value) {
   return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(Number(value))}%`
 }
 
-onMounted(() => loadDashboard())
-watch([year, month, model], () => loadDashboard())
+function closeDatePicker(event) {
+  if (!event.target.closest?.(".sales-date-field")) datePanelOpen.value = false
+}
+
+onMounted(() => {
+  document.addEventListener("click", closeDatePicker)
+  loadDashboard()
+})
+onBeforeUnmount(() => document.removeEventListener("click", closeDatePicker))
+watch([year, month, model, site], () => loadDashboard())
 </script>
 
 <template>
@@ -170,18 +207,33 @@ watch([year, month, model], () => loadDashboard())
     </section>
 
     <section class="sales-filter-bar" aria-label="销售看板筛选">
-      <div class="sales-year-picker" aria-label="年份筛选">
-        <button type="button" :disabled="year <= 2000" @click="changeYear(-1)">‹</button>
-        <strong>{{ year }}年</strong>
-        <button type="button" :disabled="year >= 2100" @click="changeYear(1)">›</button>
-      </div>
-      <div class="sales-month-grid" aria-label="月份筛选">
-        <button v-for="item in months" :key="item" :class="{ active: item === month }" type="button" @click="changeMonth(item)">{{ item }}月</button>
+      <div class="sales-date-field">
+        <button class="sales-date-trigger" type="button" @click.stop="toggleDatePicker">
+          <span>日期</span>
+          <strong>{{ year }}年{{ month }}月</strong>
+          <i :class="{ open: datePanelOpen }">‹</i>
+        </button>
+        <div v-if="datePanelOpen" class="sales-date-panel" @click.stop>
+          <div class="sales-year-picker" aria-label="年份筛选">
+            <button type="button" :disabled="pickerYear <= 2000" @click="changeYear(-1)">‹</button>
+            <strong>{{ pickerYear }}年</strong>
+            <button type="button" :disabled="pickerYear >= 2100" @click="changeYear(1)">›</button>
+          </div>
+          <div class="sales-month-grid" aria-label="月份筛选">
+            <button v-for="item in months" :key="item" :class="{ active: item === month && pickerYear === year }" type="button" @click="chooseMonth(item)">{{ item }}月</button>
+          </div>
+        </div>
       </div>
       <label class="sales-model-field">
         <span>型号</span>
         <select :value="model" @change="changeModel($event.target.value)">
           <option v-for="item in models" :key="item" :value="item">{{ item }}</option>
+        </select>
+      </label>
+      <label class="sales-model-field">
+        <span>站点</span>
+        <select :value="site" @change="changeSite($event.target.value)">
+          <option v-for="item in siteOptions" :key="item" :value="item">{{ item }}</option>
         </select>
       </label>
       <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
@@ -214,7 +266,7 @@ watch([year, month, model], () => loadDashboard())
           <span class="section-label">月度目标完成度</span>
           <h2>月度目标完成度看板</h2>
         </div>
-        <small>百分比目标请按小数填写：10% 填 0.1。目标保存后完成率立即重算。</small>
+        <small>百分比目标请直接填写百分数：10% 填 10。目标保存后完成率立即重算。</small>
       </header>
       <div class="sales-table-wrap">
         <table class="sales-target-table">
@@ -225,7 +277,11 @@ watch([year, month, model], () => loadDashboard())
             <tr v-for="row in metricRows" :key="row.key">
               <th scope="row">{{ row.label }}</th>
               <td>
-                <input v-model="targetDraft[row.key]" type="number" min="0" step="any" :placeholder="row.format === 'percent' ? '如 0.1' : '请输入目标'" aria-label="{{ row.label }} 月度目标">
+                <div v-if="row.format === 'percent'" class="sales-percent-input">
+                  <input v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="如 10" aria-label="{{ row.label }} 月度目标（百分比）">
+                  <span>%</span>
+                </div>
+                <input v-else v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="请输入目标" aria-label="{{ row.label }} 月度目标">
               </td>
               <td>{{ formatMetric(row, "actual") }}</td>
               <td><span :class="['sales-completion', row.completion?.status]">{{ formatCompletion(row) }}</span></td>

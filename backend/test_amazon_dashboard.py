@@ -2,17 +2,24 @@ import asyncio
 import json
 import os
 import unittest
-from datetime import date
+from decimal import Decimal
+from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 import httpx
+from sqlalchemy import create_engine, inspect, text
 from app import (
+    AMAZON_SALES_ALL_SITES,
     AMAZON_PRODUCTS,
     AMAZON_STRATEGY_OPTIONS,
     AMAZON_METRIC_SOURCES,
     AMAZON_SERIES,
     AMAZON_SOURCE_FIELDS,
+    AMAZON_SALES_TARGET_FIELDS,
     ASIN_MAPPING,
     AMAZON_SITE_CODES,
+    AmazonMonthlyTarget,
+    Base,
     amazon_empty_row,
     amazon_dashboard_periodic,
     amazon_periods,
@@ -23,8 +30,11 @@ from app import (
     amazon_sales_actuals,
     amazon_sales_completion,
     amazon_sales_metric_rows,
+    amazon_sales_selected_sites,
     amazon_sales_scope,
+    amazon_sales_target_values,
     amazon_sales_target_number,
+    migrate_amazon_monthly_targets,
     amazon_sid_accounts,
     amazon_strategy_board_groups,
     finalize_strategy_metrics,
@@ -400,6 +410,73 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         for invalid in (-1, "abc", float("inf")):
             with self.assertRaises(ValueError):
                 amazon_sales_target_number(invalid)
+
+    def test_sales_target_number_accepts_percent_strings(self):
+        self.assertEqual(amazon_sales_target_number("10%"), 0.1)
+        self.assertEqual(amazon_sales_target_number("20 %"), 0.2)
+        self.assertEqual(amazon_sales_target_number("12.5"), 12.5)
+
+    def test_sales_targets_are_numeric_after_database_round_trip(self):
+        item = SimpleNamespace(
+            **{f"target_{key}": Decimal("10") if key == "units" else None
+               for key in AMAZON_SALES_TARGET_FIELDS}
+        )
+        values = amazon_sales_target_values(item)
+        self.assertIsInstance(values["units"], float)
+        self.assertEqual(values["units"], 10.0)
+
+    def test_sales_dashboard_site_scope_is_validated(self):
+        self.assertEqual(amazon_sales_selected_sites("美国"), ["美国"])
+        self.assertEqual(amazon_sales_selected_sites(AMAZON_SALES_ALL_SITES), list(AMAZON_SITE_CODES))
+        with self.assertRaisesRegex(ValueError, "站点无效"):
+            amazon_sales_selected_sites("火星")
+
+    def test_monthly_target_migration_adds_site_without_losing_legacy_rows(self):
+        database = create_engine("sqlite:///:memory:")
+        with database.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE amazon_monthly_targets (
+                    id INTEGER PRIMARY KEY,
+                    year INTEGER NOT NULL,
+                    month INTEGER NOT NULL,
+                    model VARCHAR(16) NOT NULL,
+                    target_units NUMERIC(18, 4),
+                    UNIQUE (year, month, model)
+                )
+            """))
+            connection.execute(text(
+                "INSERT INTO amazon_monthly_targets (year, month, model, target_units) VALUES (2026, 9, 'TN10', 100)"
+            ))
+
+        migrate_amazon_monthly_targets(database)
+
+        inspector = inspect(database)
+        columns = {column["name"] for column in inspector.get_columns(AmazonMonthlyTarget.__tablename__)}
+        indexes = inspector.get_indexes(AmazonMonthlyTarget.__tablename__)
+        with database.connect() as connection:
+            row = connection.execute(text(
+                "SELECT year, month, model, site, target_units FROM amazon_monthly_targets"
+            )).one()
+        self.assertIn("site", columns)
+        self.assertEqual(row.site, AMAZON_SALES_ALL_SITES)
+        self.assertEqual(row.target_units, 100)
+        self.assertTrue(any(index["name"] == "uq_amazon_monthly_target_scope_site" and index["unique"] for index in indexes))
+        self.assertFalse(any(index["unique"] and set(index["column_names"] or []) == {"year", "month", "model"} for index in indexes))
+
+    def test_monthly_targets_can_store_the_same_scope_for_different_sites(self):
+        database = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(database, tables=[AmazonMonthlyTarget.__table__])
+        migrate_amazon_monthly_targets(database)
+        from sqlalchemy.orm import Session
+        with Session(database) as db:
+            timestamp = datetime(2026, 9, 17, tzinfo=timezone.utc)
+            db.add_all([
+                AmazonMonthlyTarget(year=2026, month=9, model="TN10", site=AMAZON_SALES_ALL_SITES, target_units=100, updated_at=timestamp),
+                AmazonMonthlyTarget(year=2026, month=9, model="TN10", site="美国", target_units=30, updated_at=timestamp),
+            ])
+            db.commit()
+            count = db.execute(text("SELECT COUNT(*) FROM amazon_monthly_targets")).scalar_one()
+        self.assertEqual(count, 2)
 
     def test_sales_actuals_recalculate_ratios_from_totals(self):
         rows = [

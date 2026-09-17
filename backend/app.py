@@ -39,6 +39,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy import inspect as sql_inspect
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 
@@ -138,6 +139,7 @@ AMAZON_PRODUCTS = [
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
 AMAZON_SALES_MODELS = ("TN10", "TN20")
+AMAZON_SALES_ALL_SITES = "全部站点"
 AMAZON_SALES_TN20_SMALL_SERIES = "TN20系列（小链接）汇总"
 AMAZON_SALES_METRICS = (
     {"key": "units", "label": "销量", "format": "count", "completion": "ratio"},
@@ -345,14 +347,15 @@ class AmazonStrategyNote(Base):
 class AmazonMonthlyTarget(Base):
     __tablename__ = "amazon_monthly_targets"
     __table_args__ = (
-        UniqueConstraint("year", "month", "model", name="uq_amazon_monthly_target_scope"),
-        Index("ix_amazon_monthly_target_scope", "year", "month", "model"),
+        UniqueConstraint("year", "month", "model", "site", name="uq_amazon_monthly_target_scope_site"),
+        Index("ix_amazon_monthly_target_scope", "year", "month", "model", "site"),
     )
 
     id = Column(Integer, primary_key=True)
     year = Column(Integer, nullable=False)
     month = Column(Integer, nullable=False)
     model = Column(String(16), nullable=False)
+    site = Column(String(32), nullable=False, default=AMAZON_SALES_ALL_SITES)
     target_units = Column(Numeric(18, 4), nullable=True)
     target_net_sales = Column(Numeric(18, 4), nullable=True)
     target_cpc = Column(Numeric(18, 4), nullable=True)
@@ -497,6 +500,15 @@ def amazon_sales_scope(model: str) -> tuple[set[str], set[str]]:
     return products, series
 
 
+def amazon_sales_selected_sites(site: str) -> list[str]:
+    normalized = str(site or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
+    if normalized == AMAZON_SALES_ALL_SITES:
+        return list(AMAZON_SITE_CODES)
+    if normalized not in AMAZON_SITE_CODES:
+        raise ValueError("销售看板站点无效")
+    return [normalized]
+
+
 def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     """Aggregate product rows from totals so derived ratios stay correct."""
     additive = ("units", "net_sales", "clicks", "ad_cost", "ad_units", "sessions", "ad_orders")
@@ -525,7 +537,10 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
 def amazon_sales_target_values(item: AmazonMonthlyTarget | None) -> dict[str, float | None]:
     if item is None:
         return {key: None for key in AMAZON_SALES_TARGET_FIELDS}
-    return {key: getattr(item, f"target_{key}") for key in AMAZON_SALES_TARGET_FIELDS}
+    return {
+        key: float(value) if (value := getattr(item, f"target_{key}")) is not None else None
+        for key in AMAZON_SALES_TARGET_FIELDS
+    }
 
 
 def amazon_sales_completion(
@@ -579,10 +594,20 @@ def amazon_sales_metric_rows(
 def amazon_sales_target_number(raw: Any) -> float | None:
     if raw is None or raw == "":
         return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        is_percent = text.endswith("%")
+        if is_percent:
+            text = text[:-1].strip()
+    else:
+        text = raw
+        is_percent = False
     try:
-        value = float(raw)
+        value = float(text)
     except (TypeError, ValueError) as exc:
         raise ValueError("月度目标必须是数字") from exc
+    if is_percent:
+        value /= 100
     if not math.isfinite(value) or value < 0:
         raise ValueError("月度目标必须是不小于 0 的数字")
     return value
@@ -1061,6 +1086,47 @@ def lingxing_auth_params(token: str, business: dict[str, Any]) -> dict[str, Any]
     return params
 
 
+def migrate_amazon_monthly_targets(engine) -> None:
+    """Add the site dimension to target rows created before this release."""
+    table = AmazonMonthlyTarget.__tablename__
+    unique_name = "uq_amazon_monthly_target_scope_site"
+    with engine.begin() as connection:
+        inspector = sql_inspect(connection)
+        if table not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns(table)}
+        is_mysql = engine.dialect.name == "mysql"
+        site_added = False
+        if "site" not in columns:
+            site_added = True
+            if is_mysql:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN site VARCHAR(32) NULL"))
+            else:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN site VARCHAR(32) NOT NULL DEFAULT '{AMAZON_SALES_ALL_SITES}'"))
+        connection.execute(
+            text(f"UPDATE {table} SET site = :site WHERE site IS NULL OR site = ''"),
+            {"site": AMAZON_SALES_ALL_SITES},
+        )
+        if is_mysql:
+            site_column = next(column for column in sql_inspect(connection).get_columns(table) if column["name"] == "site")
+            if site_added or site_column.get("nullable", True):
+                connection.execute(text(f"ALTER TABLE {table} MODIFY site VARCHAR(32) NOT NULL"))
+
+        indexes = sql_inspect(connection).get_indexes(table)
+        wanted = {"year", "month", "model"}
+        for index in indexes:
+            index_columns = set(index.get("column_names") or [])
+            if index.get("unique") and index.get("name") and wanted.issubset(index_columns) and "site" not in index_columns:
+                connection.execute(text(f"ALTER TABLE {table} DROP INDEX {index['name']}"))
+
+        indexes = sql_inspect(connection).get_indexes(table)
+        if not any(index.get("name") == unique_name for index in indexes):
+            if is_mysql:
+                connection.execute(text(f"ALTER TABLE {table} ADD CONSTRAINT {unique_name} UNIQUE (year, month, model, site)"))
+            else:
+                connection.execute(text(f"CREATE UNIQUE INDEX {unique_name} ON {table} (year, month, model, site)"))
+
+
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
@@ -1078,6 +1144,7 @@ def engine():
         _engine = create_engine(url, pool_pre_ping=True, pool_recycle=300)
         _session_factory = sessionmaker(bind=_engine, expire_on_commit=False)
         Base.metadata.create_all(_engine)
+        migrate_amazon_monthly_targets(_engine)
     return _engine
 
 
@@ -3061,6 +3128,7 @@ async def amazon_sales_dashboard(
     year: int = Query(default=datetime.now(timezone.utc).year),
     month: int = Query(default=datetime.now(timezone.utc).month),
     model: str = Query(default="TN10"),
+    site: str = Query(default=AMAZON_SALES_ALL_SITES),
     refresh: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
@@ -3071,6 +3139,10 @@ async def amazon_sales_dashboard(
     model = model.strip().upper()
     if model not in AMAZON_SALES_MODELS:
         raise HTTPException(status_code=422, detail="销售看板型号无效")
+    try:
+        selected_sites = amazon_sales_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     products, selected_series = amazon_sales_scope(model)
     if not products or not selected_series:
@@ -3078,13 +3150,13 @@ async def amazon_sales_dashboard(
 
     month_start = date(year, month, 1)
     month_end = date(year, month, calendar.monthrange(year, month)[1])
-    # All sites are queried, then product/series filters retain only the model.
-    # The minimum site-local date is the dashboard's conservative "today"; it
-    # also prevents a future site-local day from leaking into other sites.
+    # A specific site uses that site's local date. “All sites” uses the minimum
+    # site-local date so a future site day cannot leak into other sites.
     site_today = min(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
-        for site_name in AMAZON_SITE_CODES
+        for site_name in selected_sites
     )
+    timezone_basis = selected_sites[0] if len(selected_sites) == 1 else "全部站点站点日期的最小值"
     selected_month = (year, month)
     current_month = (site_today.year, site_today.month)
     if selected_month < current_month:
@@ -3100,6 +3172,7 @@ async def amazon_sales_dashboard(
                 AmazonMonthlyTarget.year == year,
                 AmazonMonthlyTarget.month == month,
                 AmazonMonthlyTarget.model == model,
+                AmazonMonthlyTarget.site == site,
             )
         )
         targets = amazon_sales_target_values(item)
@@ -3139,7 +3212,7 @@ async def amazon_sales_dashboard(
                 "月",
                 month_start,
                 actual_end,
-                list(AMAZON_SITE_CODES),
+                selected_sites,
                 selected_series,
                 products,
                 sid_map,
@@ -3162,6 +3235,8 @@ async def amazon_sales_dashboard(
         "month": month,
         "model": model,
         "models": list(AMAZON_SALES_MODELS),
+        "site": site,
+        "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
         "currency": "USD",
         "period": {
             "start": month_start.isoformat(),
@@ -3171,7 +3246,7 @@ async def amazon_sales_dashboard(
         "scope": {
             "products": sorted(products),
             "series": sorted(selected_series),
-            "sites": list(AMAZON_SITE_CODES),
+            "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
         "metrics": amazon_sales_metric_rows(targets, actuals),
@@ -3186,7 +3261,7 @@ async def amazon_sales_dashboard(
                 "current_day": site_today.day if selected_month == current_month else None,
                 "days_in_month": month_end.day,
                 "site_date": site_today.isoformat(),
-                "timezone_basis": "全部站点站点日期的最小值",
+                "timezone_basis": timezone_basis,
             },
         },
         "data_quality": data_quality,
@@ -3199,7 +3274,7 @@ def save_amazon_sales_targets(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
-    """Upsert all editable monthly targets for one year/month/model scope."""
+    """Upsert all editable monthly targets for one year/month/model/site scope."""
     require_business_access(x_sync_key, allow_public=True)
     try:
         year = int(payload.get("year"))
@@ -3207,8 +3282,13 @@ def save_amazon_sales_targets(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="年月参数无效") from exc
     model = str(payload.get("model") or "").strip().upper()
+    site = str(payload.get("site") or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
     if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODELS:
         raise HTTPException(status_code=422, detail="月度目标保存参数无效")
+    try:
+        amazon_sales_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     raw_targets = payload.get("targets")
     if not isinstance(raw_targets, dict):
         raise HTTPException(status_code=422, detail="月度目标格式无效")
@@ -3226,10 +3306,11 @@ def save_amazon_sales_targets(
                 AmazonMonthlyTarget.year == year,
                 AmazonMonthlyTarget.month == month,
                 AmazonMonthlyTarget.model == model,
+                AmazonMonthlyTarget.site == site,
             )
         )
         if item is None:
-            item = AmazonMonthlyTarget(year=year, month=month, model=model)
+            item = AmazonMonthlyTarget(year=year, month=month, model=model, site=site)
             db.add(item)
         for key, value in normalized.items():
             setattr(item, f"target_{key}", value)
@@ -3241,6 +3322,7 @@ def save_amazon_sales_targets(
         "year": year,
         "month": month,
         "model": model,
+        "site": site,
         "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
     }
 
