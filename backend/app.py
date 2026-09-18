@@ -132,6 +132,7 @@ KEYWORD_CATEGORIES = (
 )
 KEYWORD_FETCH_TERM_BATCH_SIZE = 20
 KEYWORD_FETCH_WEEK_CHUNK = 5
+KEYWORD_DASHBOARD_FETCH_LOCK_NAME = "bi_dashboard_keyword_fetch"
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
@@ -4115,6 +4116,34 @@ def keyword_history_index(
     return history
 
 
+@contextmanager
+def keyword_dashboard_cross_process_lock():
+    """Prevent duplicate Xiyou credit use across deployment workers.
+
+    The in-process asyncio lock cannot coordinate multiple IdeaDock workers.
+    MySQL named locks follow the underlying connection, so hold this dedicated
+    connection until all missing cells in the request have been persisted.
+    A zero-second timeout lets another viewer return cached rows immediately
+    instead of stacking requests behind a potentially slow API fetch.
+    """
+
+    with engine().connect() as connection:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:lock_name, 0)"),
+            {"lock_name": KEYWORD_DASHBOARD_FETCH_LOCK_NAME},
+        ).scalar()
+        if acquired != 1:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            connection.execute(
+                text("SELECT RELEASE_LOCK(:lock_name)"),
+                {"lock_name": KEYWORD_DASHBOARD_FETCH_LOCK_NAME},
+            )
+
+
 def keyword_fetch_groups(
     terms: list[KeywordDashboardTerm],
     weeks: list[dict[str, str]],
@@ -4436,48 +4465,54 @@ async def keyword_dashboard(
     warnings: list[str] = []
     requested_fetch_count = 0
     fetched_record_count = 0
+    fetch_in_progress_elsewhere = False
 
     # Compute missing ranges while holding the fetch lock. A completed request
-    # persists its history before the next viewer can compute its own gaps, so
-    # concurrent viewers never spend credits on the same cells twice.
-    async with _keyword_dashboard_fetch_lock:
-        with session_factory()() as db:
-            history_rows = db.scalars(
-                select(KeywordDashboardWeeklyRecord)
-                .where(KeywordDashboardWeeklyRecord.site_code == site_code)
-                .where(KeywordDashboardWeeklyRecord.week_start >= start)
-                .where(KeywordDashboardWeeklyRecord.week_start <= end)
-            ).all()
-            history = keyword_history_index(list(history_rows))
-            groups = keyword_fetch_groups(term_rows, weeks, history, refresh=refresh)
-        requested_fetch_count = len(groups)
-        for range_start, range_end, keywords in groups:
-            group_weeks = [
-                week for week in weeks
-                if range_start <= date.fromisoformat(week["start"]) <= range_end
-            ]
-            try:
-                fetched = await fetch_xiyou_weekly_records(
-                    site_code,
-                    keywords,
-                    range_start,
-                    range_end,
-                )
-                fetched_record_count += len(fetched)
-                fetched_at = datetime.now(timezone.utc)
+    # persists its history before the next viewer can compute its own gaps. The
+    # MySQL named lock extends that guarantee to a future multi-worker deploy.
+    with keyword_dashboard_cross_process_lock() as lock_acquired:
+        if not lock_acquired:
+            fetch_in_progress_elsewhere = True
+            warnings.append("另一个请求正在抓取西柚数据，本次先展示已缓存数据。")
+        else:
+            async with _keyword_dashboard_fetch_lock:
                 with session_factory()() as db:
-                    persist_keyword_weekly_records(
-                        db,
-                        site_code,
-                        keywords,
-                        group_weeks,
-                        fetched,
-                        fetched_at=fetched_at,
-                    )
-            except (httpx.HTTPError, RuntimeError) as exc:
-                message = str(exc) or "西柚关键词数据获取失败"
-                if message not in warnings:
-                    warnings.append(message)
+                    history_rows = db.scalars(
+                        select(KeywordDashboardWeeklyRecord)
+                        .where(KeywordDashboardWeeklyRecord.site_code == site_code)
+                        .where(KeywordDashboardWeeklyRecord.week_start >= start)
+                        .where(KeywordDashboardWeeklyRecord.week_start <= end)
+                    ).all()
+                    history = keyword_history_index(list(history_rows))
+                    groups = keyword_fetch_groups(term_rows, weeks, history, refresh=refresh)
+                requested_fetch_count = len(groups)
+                for range_start, range_end, keywords in groups:
+                    group_weeks = [
+                        week for week in weeks
+                        if range_start <= date.fromisoformat(week["start"]) <= range_end
+                    ]
+                    try:
+                        fetched = await fetch_xiyou_weekly_records(
+                            site_code,
+                            keywords,
+                            range_start,
+                            range_end,
+                        )
+                        fetched_record_count += len(fetched)
+                        fetched_at = datetime.now(timezone.utc)
+                        with session_factory()() as db:
+                            persist_keyword_weekly_records(
+                                db,
+                                site_code,
+                                keywords,
+                                group_weeks,
+                                fetched,
+                                fetched_at=fetched_at,
+                            )
+                    except (httpx.HTTPError, RuntimeError) as exc:
+                        message = str(exc) or "西柚关键词数据获取失败"
+                        if message not in warnings:
+                            warnings.append(message)
 
     with session_factory()() as db:
         history_rows = db.scalars(
@@ -4504,7 +4539,8 @@ async def keyword_dashboard(
         "weeks": weeks,
         "terms": term_payload,
         "rows": rows,
-        "cached": requested_fetch_count == 0,
+        "cached": requested_fetch_count == 0 and not fetch_in_progress_elsewhere,
+        "fetch_in_progress": fetch_in_progress_elsewhere,
         "history_cell_count": len(history_rows),
         "requested_fetch_count": requested_fetch_count,
         "fetched_record_count": fetched_record_count,

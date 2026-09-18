@@ -2,7 +2,8 @@ import asyncio
 import os
 import unittest
 from datetime import date, datetime
-from unittest.mock import AsyncMock, patch
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from app import (
     KeywordDashboardWeeklyRecord,
     app,
     fetch_xiyou_weekly_records,
+    keyword_dashboard_cross_process_lock,
     keyword_fetch_groups,
     keyword_dashboard_rows,
     keyword_history_index,
@@ -26,6 +28,42 @@ from app import (
 
 
 class KeywordDashboardTests(unittest.TestCase):
+    @staticmethod
+    def lock_engine(connection):
+        @contextmanager
+        def connect():
+            yield connection
+
+        database_engine = MagicMock()
+        database_engine.connect.side_effect = connect
+        return database_engine
+
+    def test_keyword_fetch_lock_is_nonblocking_and_released(self):
+        connection = MagicMock()
+        connection.execute.side_effect = [
+            MagicMock(scalar=MagicMock(return_value=1)),
+            MagicMock(),
+        ]
+
+        with patch("app.engine", return_value=self.lock_engine(connection)):
+            with keyword_dashboard_cross_process_lock() as acquired:
+                self.assertTrue(acquired)
+
+        self.assertEqual(connection.execute.call_count, 2)
+        self.assertIn("GET_LOCK", str(connection.execute.call_args_list[0].args[0]))
+        self.assertIn("RELEASE_LOCK", str(connection.execute.call_args_list[1].args[0]))
+
+    def test_keyword_fetch_lock_returns_cached_when_already_running(self):
+        connection = MagicMock()
+        connection.execute.return_value = MagicMock(scalar=MagicMock(return_value=0))
+
+        with patch("app.engine", return_value=self.lock_engine(connection)):
+            with keyword_dashboard_cross_process_lock() as acquired:
+                self.assertFalse(acquired)
+
+        self.assertEqual(connection.execute.call_count, 1)
+        self.assertIn("GET_LOCK", str(connection.execute.call_args.args[0]))
+
     def test_xiyou_official_nested_response_is_parsed_with_null_gaps(self):
         payload = {
             "entities": [
