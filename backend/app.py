@@ -90,9 +90,11 @@ _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
+_keyword_dashboard_fetch_lock = asyncio.Lock()
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+KEYWORD_CACHE_TTL_SECONDS = 15 * 60
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
@@ -113,6 +115,7 @@ DEFAULT_SYNC_COOLDOWN_SECONDS = 600
 AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/")
 
 LINGXING_API_BASE = "https://openapi.lingxing.com"
+XIYOU_API_BASE = os.environ.get("XIYOU_API_BASE", "https://openapi.xydc.com").rstrip("/")
 LINGXING_MCP_URL = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
 LINGXING_MCP_PRODUCT_TOOL = "query_product_performance_asin_lists"
 LINGXING_MCP_CAMPAIGN_TOOL = "ad_campaign_report"
@@ -492,6 +495,24 @@ class AmazonWeeklyTarget(Base):
     target_cpc = Column(Numeric(18, 4), nullable=True)
     target_ad_sales_share = Column(Numeric(18, 8), nullable=True)
     target_ad_cvr = Column(Numeric(18, 8), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class KeywordDashboardTerm(Base):
+    """Cloud-managed search terms for the Xiyou ABA keyword dashboard."""
+
+    __tablename__ = "keyword_dashboard_terms"
+    __table_args__ = (
+        UniqueConstraint("site_code", "keyword", name="uq_keyword_dashboard_term_site_keyword"),
+        Index("ix_keyword_dashboard_terms_site_category", "site_code", "category"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(12), nullable=False)
+    category = Column(String(80), nullable=False, default="未分类")
+    keyword = Column(String(255), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0)
+    enabled = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
@@ -3821,6 +3842,425 @@ def amazon_week_label(period_start: str) -> str | None:
     except ValueError:
         return None
     return f"W{week:02d}"
+
+
+def normalize_keyword(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def normalize_keyword_lookup(value: Any) -> str:
+    return normalize_keyword(value).casefold()
+
+
+def keyword_dashboard_site(site: Any) -> str:
+    normalized = str(site or "").strip()
+    if normalized not in AMAZON_SITE_CODES:
+        raise ValueError("关键词看板站点无效")
+    return normalized
+
+
+def keyword_week_columns(start: date, end: date) -> list[dict[str, str]]:
+    return [
+        {
+            "start": (start + timedelta(days=offset * 7)).isoformat(),
+            "end": (start + timedelta(days=offset * 7 + 6)).isoformat(),
+            "label": amazon_week_label((start + timedelta(days=offset * 7)).isoformat()) or "",
+        }
+        for offset in range((end - start).days // 7 + 1)
+    ]
+
+
+def keyword_date_value(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()[:10].replace(".", "-").replace("/", "-")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def xiyou_business_payload(payload: dict[str, Any]) -> Any:
+    """Return Xiyou's business data while turning API errors into text."""
+
+    code = payload.get("code")
+    success = payload.get("success")
+    successful_code = code in (None, 0, 200, "0", "200", "success", "SUCCESS")
+    if success is False or (code is not None and not successful_code):
+        message = payload.get("msg") or payload.get("message") or f"错误码 {code}"
+        raise RuntimeError(f"西柚接口返回错误：{message}")
+    data = payload.get("data", payload)
+    if isinstance(data, dict):
+        for key in ("list", "records", "rows", "items", "data"):
+            if key in data:
+                return data[key]
+    return data
+
+
+def xiyou_weekly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse Xiyou's weekly ABA response without guessing a single schema.
+
+    The endpoint documentation exposes ``searchFrequencyRank`` and
+    ``weeklySearchVolume``.  Its nesting, however, has changed between API
+    revisions, so walk the business payload and keep every dated record that
+    carries either field.
+    """
+
+    records: list[dict[str, Any]] = []
+
+    def first_value(source: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in source and source[key] not in (None, ""):
+                return source[key]
+        return None
+
+    def walk(value: Any, term_hint: str | None = None) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item, term_hint)
+            return
+        if not isinstance(value, dict):
+            return
+        term = first_value(value, ("searchTerm", "searchTerms", "keyword", "keywordName")) or term_hint
+        term = normalize_keyword(term) if term else term_hint
+        nested = False
+        for key in ("weeklyData", "weekly_data", "trends", "list", "records", "rows", "items", "data"):
+            child = value.get(key)
+            if isinstance(child, (list, dict)):
+                nested = True
+                walk(child, term)
+        rank = first_value(value, ("searchFrequencyRank", "searchFrequencyRankWeekly", "rank"))
+        volume = first_value(value, ("weeklySearchVolume", "searchVolumeWeekly", "searchVolume"))
+        report_date = keyword_date_value(first_value(value, ("reportFromDate", "startDate", "reportStart", "weekStart")))
+        if report_date and (rank is not None or volume is not None):
+            try:
+                rank_number = int(rank) if rank is not None else None
+            except (TypeError, ValueError):
+                rank_number = None
+            try:
+                volume_number = int(volume) if volume is not None else None
+            except (TypeError, ValueError):
+                volume_number = None
+            if rank_number is not None or volume_number is not None:
+                records.append({
+                    "keyword": normalize_keyword(term or ""),
+                    "week_start": normalize_week_start(report_date),
+                    "rank": rank_number,
+                    "volume": volume_number,
+                })
+        if not nested:
+            for key in ("searchFrequencyRankList", "weeklySearchVolumeList", "weeklyList"):
+                if isinstance(value.get(key), list):
+                    walk(value[key], term)
+
+    walk(xiyou_business_payload(payload))
+    return records
+
+
+def keyword_dashboard_rows(
+    terms: list[KeywordDashboardTerm],
+    weeks: list[dict[str, str]],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_term: dict[str, dict[date, dict[str, int | None]]] = {
+        normalize_keyword_lookup(term.keyword): {} for term in terms
+    }
+    for record in records:
+        term = by_term.get(normalize_keyword_lookup(record.get("keyword")))
+        if term is None:
+            continue
+        # Prefer a rank and later a volume; overwrite only when the new record
+        # supplies a value that the previous one did not have.
+        current = term.setdefault(record["week_start"], {"rank": None, "volume": None})
+        for metric in ("rank", "volume"):
+            value = record.get(metric)
+            if value is not None:
+                current[metric] = value
+
+    output: list[dict[str, Any]] = []
+    for term in terms:
+        values = by_term[normalize_keyword_lookup(term.keyword)]
+        weekly = [
+            {
+                "week_start": week["start"],
+                "week_end": week["end"],
+                "label": week["label"],
+                "search_volume": values.get(date.fromisoformat(week["start"]), {}).get("volume"),
+                "search_rank": values.get(date.fromisoformat(week["start"]), {}).get("rank"),
+            }
+            for week in weeks
+        ]
+        present_ranks = [item["search_rank"] for item in weekly if item["search_rank"] is not None]
+        rank_change = None
+        if len(present_ranks) >= 2:
+            rank_change = present_ranks[-1] - present_ranks[-2]
+        output.append({
+            "id": term.id,
+            "site_code": term.site_code,
+            "category": term.category,
+            "keyword": term.keyword,
+            "sort_order": term.sort_order,
+            "weekly": weekly,
+            "rank_change": rank_change,
+        })
+    return output
+
+
+async def fetch_xiyou_weekly_records(
+    country: str,
+    terms: list[str],
+    start: date,
+    end: date,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, Any]]:
+    api_key = os.environ.get("XIYOU_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("西柚 API Key 尚未配置")
+
+    async def request(client_value: httpx.AsyncClient) -> list[dict[str, Any]]:
+        response = await client_value.post(
+            f"{XIYOU_API_BASE}/v1/searchTerms/abaReport/trends/weekly",
+            headers={"X-Auth-Version": "2.0", "X-Api-Key": api_key},
+            json={
+                "country": country,
+                "searchTerms": terms,
+                "startWeek": {"startDate": start.isoformat(), "endDate": (start + timedelta(days=6)).isoformat()},
+                "endWeek": {"startDate": end.isoformat(), "endDate": (end + timedelta(days=6)).isoformat()},
+            },
+        )
+        if response.status_code == 401:
+            raise RuntimeError("西柚 API Key 无效或未授权")
+        if response.status_code == 402:
+            raise RuntimeError("西柚接口余额不足或超出扣费限制")
+        if response.status_code == 429:
+            raise RuntimeError("西柚接口请求过于频繁，请稍后刷新")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            response.raise_for_status()
+            raise RuntimeError("西柚接口返回了非 JSON 数据") from exc
+        if response.status_code >= 400:
+            message = payload.get("msg") or payload.get("message") or response.text[:200]
+            raise RuntimeError(f"西柚接口请求失败：HTTP {response.status_code} {message}")
+        return xiyou_weekly_records(payload)
+
+    if client is not None:
+        return await request(client)
+    async with httpx.AsyncClient(timeout=45) as created:
+        return await request(created)
+
+
+def keyword_terms_payload(rows: list[KeywordDashboardTerm]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": row.id,
+            "category": row.category,
+            "keyword": row.keyword,
+            "sort_order": row.sort_order,
+            "enabled": row.enabled,
+            "updated_at": row.updated_at.isoformat() if row.updated_at and row.updated_at.tzinfo else (
+                row.updated_at.replace(tzinfo=timezone.utc).isoformat() if row.updated_at else None
+            ),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/keyword-dashboard/terms")
+def get_keyword_dashboard_terms(
+    site: str = Query(default="美国"),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        site_name = keyword_dashboard_site(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    site_code = AMAZON_SITE_CODES[site_name]
+    with session_factory()() as db:
+        rows = db.scalars(
+            select(KeywordDashboardTerm)
+            .where(KeywordDashboardTerm.site_code == site_code)
+            .order_by(KeywordDashboardTerm.sort_order, KeywordDashboardTerm.id)
+        ).all()
+        payload = keyword_terms_payload(rows)
+    return {"site": site_name, "site_code": site_code, "terms": payload}
+
+
+@app.post("/api/keyword-dashboard/terms")
+def save_keyword_dashboard_terms(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Replace all keywords for one site so additions/deletes stay explicit."""
+
+    require_business_access(x_sync_key, allow_public=True)
+    global _amazon_cache
+    try:
+        site_name = keyword_dashboard_site(payload.get("site"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    site_code = AMAZON_SITE_CODES[site_name]
+    raw_terms = payload.get("terms")
+    if not isinstance(raw_terms, list):
+        raise HTTPException(status_code=422, detail="关键词列表格式无效")
+    if len(raw_terms) > 100:
+        raise HTTPException(status_code=422, detail="每个站点最多支持 100 个关键词")
+
+    normalized: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_terms):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="关键词格式无效")
+        keyword = normalize_keyword(raw.get("keyword"))
+        category = normalize_keyword(raw.get("category")) or "未分类"
+        if not keyword:
+            raise HTTPException(status_code=422, detail="关键词不能为空")
+        if len(keyword) > 255 or len(category) > 80:
+            raise HTTPException(status_code=422, detail="关键词或分类长度超出限制")
+        lookup = normalize_keyword_lookup(keyword)
+        if lookup in seen:
+            raise HTTPException(status_code=422, detail=f"关键词重复：{keyword}")
+        seen.add(lookup)
+        try:
+            sort_order = int(raw.get("sort_order", index))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="关键词排序无效") from None
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=422, detail="关键词启用状态无效")
+        if enabled:
+            normalized.append((category, keyword, sort_order))
+
+    now = utcnow()
+    with session_factory()() as db:
+        db.execute(delete(KeywordDashboardTerm).where(KeywordDashboardTerm.site_code == site_code))
+        for category, keyword, sort_order in normalized:
+            db.add(KeywordDashboardTerm(
+                site_code=site_code,
+                category=category,
+                keyword=keyword,
+                sort_order=sort_order,
+                enabled=True,
+                updated_at=now,
+            ))
+        db.commit()
+        rows = db.scalars(
+            select(KeywordDashboardTerm)
+            .where(KeywordDashboardTerm.site_code == site_code)
+            .order_by(KeywordDashboardTerm.sort_order, KeywordDashboardTerm.id)
+        ).all()
+        saved = keyword_terms_payload(rows)
+
+    _amazon_cache = {key: value for key, value in _amazon_cache.items() if key[0:2] != ("keyword-dashboard", site_code)}
+    return {"ok": True, "site": site_name, "site_code": site_code, "terms": saved, "saved": len(saved)}
+
+
+@app.get("/api/keyword-dashboard")
+async def keyword_dashboard(
+    site: str = Query(default="美国"),
+    start_week: date | None = Query(default=None),
+    end_week: date | None = Query(default=None),
+    refresh: bool = Query(default=False),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        site_name = keyword_dashboard_site(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    site_code = AMAZON_SITE_CODES[site_name]
+    try:
+        start = normalize_week_start(start_week)
+        end = normalize_week_start(end_week)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="关键词看板周格式无效") from exc
+    if not start_week or not end_week or start > end:
+        raise HTTPException(status_code=422, detail="关键词看板周范围无效")
+    week_count = (end - start).days // 7 + 1
+    if week_count > 52:
+        raise HTTPException(status_code=422, detail="关键词看板最多支持 52 周")
+
+    weeks = keyword_week_columns(start, end)
+    with session_factory()() as db:
+        terms = db.scalars(
+            select(KeywordDashboardTerm)
+            .where(KeywordDashboardTerm.site_code == site_code)
+            .order_by(KeywordDashboardTerm.sort_order, KeywordDashboardTerm.id)
+        ).all()
+        term_rows = list(terms)
+    term_payload = keyword_terms_payload(term_rows)
+    if not term_rows:
+        return {
+            "site": site_name,
+            "site_code": site_code,
+            "period": {"start": start.isoformat(), "end": end.isoformat()},
+            "weeks": weeks,
+            "terms": term_payload,
+            "rows": [],
+            "cached": False,
+            "source": "xiyou",
+            "field_availability": {"rank": False, "volume": False},
+            "refreshed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    cache_key = (
+        "keyword-dashboard",
+        site_code,
+        start.isoformat(),
+        end.isoformat(),
+        tuple(normalize_keyword_lookup(term.keyword) for term in term_rows),
+    )
+    if refresh:
+        _amazon_cache.pop(cache_key, None)
+    cached = _amazon_cache.get(cache_key)
+    from_cache = bool(cached and time.monotonic() - cached[0] < KEYWORD_CACHE_TTL_SECONDS)
+    if from_cache:
+        records = cached[1]
+    else:
+        # Serialize cache misses: two users opening the same dashboard must not
+        # trigger two billable Xiyou requests for the identical keyword scope.
+        async with _keyword_dashboard_fetch_lock:
+            cached = _amazon_cache.get(cache_key)
+            from_cache = bool(cached and time.monotonic() - cached[0] < KEYWORD_CACHE_TTL_SECONDS)
+            if from_cache:
+                records = cached[1]
+            else:
+                try:
+                    records = await fetch_xiyou_weekly_records(
+                        site_code,
+                        [term.keyword for term in term_rows],
+                        start,
+                        end,
+                    )
+                except httpx.HTTPError as exc:
+                    raise HTTPException(status_code=502, detail="西柚关键词数据获取失败") from exc
+                except RuntimeError as exc:
+                    status_code = 503 if str(exc) == "西柚 API Key 尚未配置" else 502
+                    raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+                _amazon_cache[cache_key] = (time.monotonic(), records)
+
+    rows = keyword_dashboard_rows(term_rows, weeks, records)
+    return {
+        "site": site_name,
+        "site_code": site_code,
+        "period": {"start": start.isoformat(), "end": end.isoformat()},
+        "weeks": weeks,
+        "terms": term_payload,
+        "rows": rows,
+        "cached": from_cache,
+        "cache_ttl_seconds": KEYWORD_CACHE_TTL_SECONDS,
+        "source": "xiyou",
+        "field_availability": {
+            "rank": any(item["search_rank"] is not None for row in rows for item in row["weekly"]),
+            "volume": any(item["search_volume"] is not None for row in rows for item in row["weekly"]),
+        },
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:

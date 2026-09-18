@@ -43,6 +43,19 @@
       ]
     },
     {
+      "path": "/api/keyword-dashboard",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/keyword-dashboard/terms",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
       "path": "/api/amazon/sales-dashboard",
       "methods": [
         "GET"
