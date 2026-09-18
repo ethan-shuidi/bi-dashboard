@@ -26,6 +26,8 @@ from app import (
     Base,
     amazon_empty_row,
     amazon_dashboard_periodic,
+    amazon_dashboard_selected_sites,
+    amazon_dashboard_sites_or_all,
     amazon_periods,
     amazon_product,
     product_performance_ad_breakdown,
@@ -514,6 +516,15 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "站点无效"):
             amazon_sales_selected_sites("火星")
 
+    def test_dashboard_site_parser_rejects_scope_widening_values(self):
+        self.assertEqual(amazon_dashboard_selected_sites(["美国"]), ["美国"])
+        self.assertEqual(amazon_dashboard_selected_sites(["美国,加拿大"]), ["美国", "加拿大"])
+        self.assertEqual(amazon_dashboard_sites_or_all([]), list(AMAZON_SITE_CODES))
+        with self.assertRaisesRegex(ValueError, "站点参数无效"):
+            amazon_dashboard_selected_sites([""])
+        with self.assertRaisesRegex(ValueError, "不支持的 Amazon 站点"):
+            amazon_dashboard_selected_sites(["火星"])
+
     def test_sales_dashboard_all_model_scope_includes_every_product(self):
         products, series = amazon_sales_scope(AMAZON_SALES_ALL_MODEL)
         self.assertEqual(products, set(AMAZON_PRODUCTS))
@@ -627,6 +638,22 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             amazon_sales_validate_money_reconciliation(
                 rows, {("美国", AMAZON_SERIES[0]): 54982.14}
             )
+
+    def test_sales_money_reconciliation_merges_primary_and_small_campaign_series(self):
+        rows = [
+            {"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 42358.18},
+            {"site": "美国", "series": AMAZON_SERIES[1], "currency": "USD", "ad_cost": 8116.02},
+        ]
+        reconciliation = amazon_sales_validate_money_reconciliation(rows, {
+            ("美国", AMAZON_SERIES[0]): 50014.96,
+            ("美国", AMAZON_SERIES[1]): 5131.82,
+        })
+        self.assertTrue(reconciliation["complete"])
+        self.assertEqual(len(reconciliation["checks"]), 1)
+        self.assertEqual(reconciliation["checks"][0]["model"], "TN10")
+        self.assertAlmostEqual(reconciliation["checks"][0]["campaign_report"], 55146.78)
+        self.assertAlmostEqual(reconciliation["checks"][0]["product_performance"], 50474.20)
+        self.assertTrue(reconciliation["checks"][0]["passed"])
 
     def test_sales_actual_rows_replace_product_performance_money(self):
         series = AMAZON_SERIES[0]
@@ -973,6 +1000,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["page_views"], 120)
         self.assertEqual(row["asin"], asin)
         self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)
+
+    def test_dashboard_rejects_mixed_currency_in_one_product_group(self):
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+        performance = [
+            {"asin": asin, "currency_code": "USD", "spend": 10},
+            {"asin": asin, "currency_code": "CNY", "spend": 70},
+        ]
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)):
+            with self.assertRaisesRegex(RuntimeError, "产品表现同一分组返回混合币种"):
+                asyncio.run(amazon_dashboard_periodic(
+                    "日",
+                    date(2026, 9, 4),
+                    date(2026, 9, 4),
+                    "美国",
+                    {series},
+                    {product},
+                    {"US": {"sid": 1}},
+                ))
 
     def test_ads_chart_rows_recalculate_ratios_from_period_totals(self):
         periodic = {

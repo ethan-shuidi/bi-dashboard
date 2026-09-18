@@ -618,6 +618,41 @@ def amazon_series(product: str | None) -> str | None:
     return None
 
 
+def amazon_sales_series_model(series: str) -> str:
+    """Return the target-dashboard model that owns a campaign series."""
+    if series.startswith("TN10"):
+        return "TN10"
+    if series.startswith("TN20"):
+        return "TN20"
+    return series
+
+
+def amazon_dashboard_selected_sites(values: list[str]) -> list[str]:
+    """Parse site query values without silently widening their scope."""
+    selected: list[str] = []
+    supplied = False
+    for raw in values:
+        supplied = True
+        for value in str(raw or "").split(","):
+            site_name = value.strip()
+            if not site_name:
+                continue
+            if site_name not in AMAZON_SITE_CODES:
+                raise ValueError(f"不支持的 Amazon 站点：{site_name}")
+            if site_name not in selected:
+                selected.append(site_name)
+    if not supplied or not selected:
+        raise ValueError("站点参数无效")
+    return selected
+
+
+def amazon_dashboard_sites_or_all(values: list[str]) -> list[str]:
+    """Keep endpoint defaults backward-compatible while rejecting bad input."""
+    if not values:
+        return list(AMAZON_SITE_CODES)
+    return amazon_dashboard_selected_sites(values)
+
+
 def amazon_sales_scope(model: str) -> tuple[set[str], set[str]]:
     """Map a sales-dashboard model to every currently known product variant."""
     if model == AMAZON_SALES_ALL_MODEL:
@@ -838,9 +873,18 @@ def amazon_sales_validate_money_reconciliation(
     if len(currencies) > 1:
         raise RuntimeError(f"销售看板实际值存在多币种，拒绝相加：{', '.join(sorted(currencies))}")
 
+    # Target dashboards merge primary and small variants into TN10/TN20.
+    # Campaign assignments identify a variant series while product performance
+    # attributes marketplace spend by ASIN; those variant allocations can
+    # legitimately differ. Reconcile the merged model total that the dashboard
+    # actually consumes, rather than failing on a variant-level attribution
+    # shift between the two upstream sources.
     product_costs: dict[tuple[str, str], float] = {}
     for row in rows:
-        key = (str(row.get("site") or ""), str(row.get("series") or ""))
+        key = (
+            str(row.get("site") or ""),
+            amazon_sales_series_model(str(row.get("series") or "")),
+        )
         value = row.get("ad_cost")
         if value is not None:
             product_costs[key] = product_costs.get(key, 0.0) + float(value)
@@ -850,15 +894,24 @@ def amazon_sales_validate_money_reconciliation(
     # unclassified campaign spend remain on product-performance money because
     # forcing those campaigns into a series would create a worse attribution
     # error; that fallback is exposed through data_quality instead.
-    for key in sorted(campaign_costs):
-        campaign_value = float(campaign_costs.get(key, 0.0))
-        product_value = float(product_costs.get(key, 0.0))
+    campaign_model_costs: dict[tuple[str, str], float] = {}
+    for (site_name, series), value in campaign_costs.items():
+        model_key = (site_name, amazon_sales_series_model(series))
+        campaign_model_costs[model_key] = (
+            campaign_model_costs.get(model_key, 0.0) + float(value or 0.0)
+        )
+
+    for key in sorted(campaign_model_costs):
+        campaign_value = float(campaign_model_costs.get(key, 0.0))
+        model = key[1]
+        product_key = key
+        product_value = float(product_costs.get(product_key, 0.0))
         difference = abs(campaign_value - product_value)
         tolerance = max(50.0, 0.1 * max(abs(campaign_value), abs(product_value)))
         passed = difference <= tolerance
         checks.append({
             "site": key[0],
-            "series": key[1],
+            "model": model,
             "campaign_report": campaign_value,
             "product_performance": product_value,
             "difference": difference,
@@ -867,7 +920,7 @@ def amazon_sales_validate_money_reconciliation(
         })
         if not passed:
             raise RuntimeError(
-                f"广告金额交叉校验失败：{key[0]} {key[1]} "
+                f"广告金额交叉校验失败：{key[0]} {model} "
                 f"广告活动 {campaign_value:.2f} / 产品表现 {product_value:.2f}"
             )
     return {
@@ -1488,6 +1541,10 @@ def strategy_metrics(row: dict[str, Any]) -> dict[str, float]:
         "ad_units": ad_units,
         "ad_orders": ad_orders,
     }
+
+
+def ad_report_currency(row: dict[str, Any], default_currency: str) -> str:
+    return str(row.get("currency") or row.get("currency_code") or default_currency).strip().upper() or default_currency
 
 
 def strategy_campaign_id(row: dict[str, Any]) -> str:
@@ -2485,11 +2542,12 @@ async def amazon_dashboard_periodic(
     display_currency: str = "original",
 ) -> dict[str, Any]:
     periods = amazon_periods(start_date, end_date, comparison)
-    if isinstance(site, str):
-        selected_sites = [site] if site else list(AMAZON_SITE_CODES)
+    if site is None or site == "" or site == []:
+        selected_sites = list(AMAZON_SITE_CODES)
     else:
-        selected_sites = list(site or AMAZON_SITE_CODES)
-    selected_sites = list(dict.fromkeys(item for item in selected_sites if item in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
+        selected_sites = amazon_dashboard_selected_sites(
+            [site] if isinstance(site, str) else [str(value) for value in site]
+        )
     is_multi_site = len(selected_sites) > 1
     requested_currency = str(display_currency or "original").upper()
     currency_mode = requested_currency
@@ -2505,7 +2563,7 @@ async def amazon_dashboard_periodic(
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v7-currency-normalized", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v8-currency-integrity", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -2606,6 +2664,11 @@ async def amazon_dashboard_periodic(
             row_currency = str(raw.get("currency_code") or raw.get("currencyCode") or default_currency).strip() or default_currency
             key = (period_label, site_name, group, product)
             item = aggregate.setdefault(key, {"period": period_label, "site": site_name, "site_code": site_code, "period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "currency": row_currency, "asins": set(), "ad_breakdown": {ad_type: {metric: None for metric in fields} for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items()}})
+            if str(item.get("currency") or "") != row_currency:
+                raise RuntimeError(
+                    f"产品表现同一分组返回混合币种，拒绝相加：{period_label} {site_name} {group} "
+                    f"{item.get('currency')} / {row_currency}"
+                )
             item["asins"].update(amazon_asins_for_product(site_code, product))
             source = raw.get("_source", "performance")
             if source not in AMAZON_SOURCE_FIELDS:
@@ -3308,10 +3371,12 @@ async def amazon_strategy_board_payload(
     independently from the selected date range.  The report itself remains a
     date-scoped snapshot, and campaigns with zero clicks are omitted.
     """
-    selected_sites = list(dict.fromkeys(selected_sites))
+    selected_sites = amazon_dashboard_selected_sites(
+        [str(value) for value in selected_sites]
+    )
     selected_store_sids = {str(value) for value in (selected_store_sids or set()) if str(value).strip()}
     series_filter = None if selected_series is None else set(selected_series)
-    cache_key = ("amazon-strategy-board-v4-orders-units", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), tuple(sorted(selected_store_sids)), tuple(sorted(series_filter or set())))
+    cache_key = ("amazon-strategy-board-v5-currency-integrity", start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), tuple(sorted(selected_store_sids)), tuple(sorted(series_filter or set())))
     if refresh:
         _amazon_cache.pop(cache_key, None)
     cached = _amazon_cache.get(cache_key)
@@ -3323,6 +3388,7 @@ async def amazon_strategy_board_payload(
         async def fetch_site(site_name: str):
             site_code = strategy_site_code(site_name)
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
+            native_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
             rows: list[dict[str, Any]] = []
             account_quality: list[dict[str, Any]] = []
             for account in accounts:
@@ -3369,6 +3435,14 @@ async def amazon_strategy_board_payload(
                     merged = dict(metadata or {})
                     merged.update({key: value for key, value in row.items() if value not in (None, "", [], {})})
                     previous = combined_by_campaign.get(campaign_key)
+                    if previous is not None:
+                        previous_currency = ad_report_currency(previous, native_currency)
+                        row_report_currency = ad_report_currency(row, native_currency)
+                        if previous_currency != row_report_currency:
+                            raise RuntimeError(
+                                f"广告活动同一分组返回混合币种，拒绝相加：{site_name} "
+                                f"{ad_report_campaign_name(row) or campaign_key} {previous_currency} / {row_report_currency}"
+                            )
                     if previous is None or (mcp_result and row in mcp_result.rows):
                         combined_by_campaign[campaign_key] = merged
                 account_rows = list(combined_by_campaign.values())
@@ -3452,7 +3526,14 @@ async def amazon_strategy_board_payload(
             metrics = strategy_metrics(raw)
             store_name = str(raw.get("_store_name") or "未命名店铺")
             key = (site_code, store_sid, campaign_id)
-            item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "store_sid": store_sid, "store_name": store_name, "campaign_id": campaign_id, "campaign_name": campaign_name, "ad_type": ad_report_type(raw), "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": str(raw.get("currency") or raw.get("currency_code") or AMAZON_CURRENCY_CODES.get(site_name, "USD"))})
+            default_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
+            row_currency = ad_report_currency(raw, default_currency)
+            item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "store_sid": store_sid, "store_name": store_name, "campaign_id": campaign_id, "campaign_name": campaign_name, "ad_type": ad_report_type(raw), "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": row_currency})
+            if str(item.get("currency") or "") != row_currency:
+                raise RuntimeError(
+                    f"广告活动同一分组返回混合币种，拒绝相加：{site_name} {campaign_name} "
+                    f"{item.get('currency')} / {row_currency}"
+                )
             if campaign_name != "未命名广告活动":
                 item["campaign_name"] = campaign_name
             if item["ad_type"] == "" and ad_report_type(raw):
@@ -3498,7 +3579,12 @@ async def amazon_strategy_board(
 ):
     require_business_access(x_sync_key, allow_public=True)
     start_date, end_date = strategy_date_range(start_date, end_date)
-    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
+    try:
+        selected_sites = amazon_dashboard_sites_or_all(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if any(value not in AMAZON_SERIES for value in series):
+        raise HTTPException(status_code=422, detail="广告策略看板系列参数无效")
     if not os.environ.get("LINGXING_APP_ID") or not os.environ.get("LINGXING_APP_SECRET"):
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:
@@ -3957,9 +4043,10 @@ async def amazon_dashboard(
 ):
     """Return read-only Amazon dashboard data; credentials stay server-side."""
     require_business_access(x_sync_key, allow_public=True)
-    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
-    if not selected_sites:
-        selected_sites = list(AMAZON_SITE_CODES)
+    try:
+        selected_sites = amazon_dashboard_sites_or_all(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     today = min(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
         for site_name in selected_sites
@@ -3990,6 +4077,10 @@ async def amazon_dashboard(
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     selected_series = set(series or AMAZON_SERIES)
     selected_products = {re.sub(r"-(黑|银|橙)$", r"-\1色", str(value)) for value in (products or AMAZON_PRODUCTS)}
+    if not selected_series or any(value not in AMAZON_SERIES for value in selected_series):
+        raise HTTPException(status_code=422, detail="产品表现看板系列参数无效")
+    if not selected_products or any(value not in AMAZON_PRODUCTS for value in selected_products):
+        raise HTTPException(status_code=422, detail="产品表现看板产品参数无效")
     try:
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
     except json.JSONDecodeError as exc:
@@ -4395,9 +4486,10 @@ async def amazon_date_context(
 ):
     """Return the current calendar date for the selected marketplace site."""
     require_business_access(x_sync_key, allow_public=True)
-    selected_sites = list(dict.fromkeys(value for raw in site for value in str(raw).split(",") if value in AMAZON_SITE_CODES))
-    if not selected_sites:
-        raise HTTPException(status_code=422, detail="不支持的 Amazon 站点")
+    try:
+        selected_sites = amazon_dashboard_selected_sites(site)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     dates = {
         site_name: datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date().isoformat()
         for site_name in selected_sites
