@@ -210,7 +210,7 @@ function startColumnResize(event, key, getWidth) {
 function resetColumnWidths() {
   columnWidths.value = {}
   window.localStorage.removeItem(columnWidthStorageKey)
-  notice.value = "搜索词看板列宽已恢复默认"
+  notice.value = "Amazon-ABA排名列宽已恢复默认"
   error.value = ""
 }
 
@@ -568,11 +568,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="keyword-dashboard" aria-label="搜索词看板">
+  <section class="keyword-dashboard" aria-label="Amazon-ABA排名">
     <header class="keyword-head">
       <div>
         <span>西柚 ABA 数据</span>
-        <h1>搜索词看板</h1>
+        <h1>Amazon-ABA排名</h1>
         <p>按分类与最新排名自动排序，历史 ABA 数据入云端后不再重复抓取。</p>
       </div>
       <div class="keyword-head-actions">
