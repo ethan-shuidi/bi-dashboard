@@ -94,7 +94,16 @@ _keyword_dashboard_fetch_lock = asyncio.Lock()
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
-KEYWORD_CACHE_TTL_SECONDS = 15 * 60
+KEYWORD_CATEGORIES = (
+    "comu品牌词",
+    "AI核心词",
+    "类目词",
+    "Plaud品牌词",
+    "Pocket品牌词",
+    "其他品牌词",
+)
+KEYWORD_FETCH_TERM_BATCH_SIZE = 20
+KEYWORD_FETCH_WEEK_CHUNK = 5
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
@@ -514,6 +523,33 @@ class KeywordDashboardTerm(Base):
     sort_order = Column(Integer, nullable=False, default=0)
     enabled = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class KeywordDashboardWeeklyRecord(Base):
+    """Persistent Xiyou ABA history; null values mean a successful fetch had no data."""
+
+    __tablename__ = "keyword_dashboard_weekly_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "site_code",
+            "keyword",
+            "week_start",
+            name="uq_keyword_dashboard_weekly_site_keyword_week",
+        ),
+        Index(
+            "ix_keyword_dashboard_weekly_scope",
+            "site_code",
+            "week_start",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(12), nullable=False)
+    keyword = Column(String(255), nullable=False)
+    week_start = Column(Date, nullable=False)
+    search_rank = Column(Integer, nullable=True)
+    search_volume = Column(Integer, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
 
 
 SHOPIFY_ORDERS_QUERY = """#graphql
@@ -3879,6 +3915,19 @@ def keyword_week_columns(start: date, end: date) -> list[dict[str, str]]:
     ]
 
 
+def latest_completed_keyword_week_start(selected: date | datetime | None = None) -> date:
+    """Return the most recent complete Sunday-to-Saturday Xiyou week.
+
+    Xiyou rejects a range containing the in-progress week with
+    ``InvalidTrendsRange``.  The keyword dashboard deliberately treats a week as
+    complete only after its Saturday has passed.
+    """
+
+    selected = selected.date() if isinstance(selected, datetime) else (selected or datetime.now(timezone.utc).date())
+    current_start = normalize_keyword_week_start(selected)
+    return current_start - timedelta(days=7)
+
+
 def keyword_date_value(value: Any) -> date | None:
     if value is None:
         return None
@@ -4007,6 +4056,7 @@ def keyword_dashboard_rows(
         rank_change = None
         if len(present_ranks) >= 2:
             rank_change = present_ranks[-1] - present_ranks[-2]
+        latest_rank = weekly[-1]["search_rank"] if weekly else None
         output.append({
             "id": term.id,
             "site_code": term.site_code,
@@ -4015,8 +4065,133 @@ def keyword_dashboard_rows(
             "sort_order": term.sort_order,
             "weekly": weekly,
             "rank_change": rank_change,
+            "latest_search_rank": latest_rank,
         })
+    category_order = {category: index for index, category in enumerate(KEYWORD_CATEGORIES)}
+    output.sort(key=lambda row: (
+        category_order.get(row["category"], len(KEYWORD_CATEGORIES)),
+        row["latest_search_rank"] is None,
+        row["latest_search_rank"] if row["latest_search_rank"] is not None else 0,
+        normalize_keyword_lookup(row["keyword"]),
+    ))
     return output
+
+
+def keyword_history_index(
+    rows: list[KeywordDashboardWeeklyRecord],
+) -> dict[str, dict[date, KeywordDashboardWeeklyRecord]]:
+    history: dict[str, dict[date, KeywordDashboardWeeklyRecord]] = {}
+    for row in rows:
+        history.setdefault(normalize_keyword_lookup(row.keyword), {})[row.week_start] = row
+    return history
+
+
+def keyword_fetch_groups(
+    terms: list[KeywordDashboardTerm],
+    weeks: list[dict[str, str]],
+    history: dict[str, dict[date, KeywordDashboardWeeklyRecord]],
+    *,
+    refresh: bool,
+) -> list[tuple[date, date, list[str]]]:
+    """Build exact consecutive missing-week runs, chunked for Xiyou limits."""
+
+    by_run: dict[tuple[date, date], set[str]] = {}
+    week_dates = [date.fromisoformat(week["start"]) for week in weeks]
+    for term in terms:
+        keyword = term.keyword
+        missing = [
+            week
+            for week in week_dates
+            if refresh or week not in history.get(normalize_keyword_lookup(keyword), {})
+        ]
+        if not missing:
+            continue
+        run_start = missing[0]
+        previous = missing[0]
+        runs: list[tuple[date, date]] = []
+        for week in missing[1:]:
+            if (week - previous).days != 7:
+                runs.append((run_start, previous))
+                run_start = week
+            previous = week
+        runs.append((run_start, previous))
+
+        for run_end_start, run_end in runs:
+            cursor = run_end_start
+            while cursor <= run_end:
+                chunk_end = min(cursor + timedelta(days=7 * (KEYWORD_FETCH_WEEK_CHUNK - 1)), run_end)
+                by_run.setdefault((cursor, chunk_end), set()).add(keyword)
+                cursor = chunk_end + timedelta(days=7)
+
+    groups: list[tuple[date, date, list[str]]] = []
+    for (range_start, range_end), keyword_set in sorted(by_run.items()):
+        keywords = sorted(keyword_set, key=normalize_keyword_lookup)
+        for index in range(0, len(keywords), KEYWORD_FETCH_TERM_BATCH_SIZE):
+            groups.append((range_start, range_end, keywords[index:index + KEYWORD_FETCH_TERM_BATCH_SIZE]))
+    return groups
+
+
+def persist_keyword_weekly_records(
+    db: Session,
+    site_code: str,
+    terms: list[str],
+    weeks: list[dict[str, str]],
+    records: list[dict[str, Any]],
+    *,
+    fetched_at: datetime,
+) -> None:
+    """Upsert actual values and mark successful no-data keyword/week cells."""
+
+    keyword_set = {normalize_keyword_lookup(term) for term in terms}
+    week_set = {date.fromisoformat(week["start"]) for week in weeks}
+    existing = db.scalars(
+        select(KeywordDashboardWeeklyRecord)
+        .where(KeywordDashboardWeeklyRecord.site_code == site_code)
+        .where(KeywordDashboardWeeklyRecord.week_start >= min(week_set))
+        .where(KeywordDashboardWeeklyRecord.week_start <= max(week_set))
+    ).all()
+    existing_index = keyword_history_index(existing)
+    actual: set[tuple[str, date]] = set()
+
+    def row_for(keyword: str, week: date) -> KeywordDashboardWeeklyRecord | None:
+        return existing_index.get(normalize_keyword_lookup(keyword), {}).get(week)
+
+    for record in records:
+        keyword = normalize_keyword_lookup(record.get("keyword"))
+        week = record.get("week_start")
+        if keyword not in keyword_set or week not in week_set:
+            continue
+        actual.add((keyword, week))
+        stored = row_for(keyword, week)
+        if stored is None:
+            stored = KeywordDashboardWeeklyRecord(
+                site_code=site_code,
+                keyword=keyword,
+                week_start=week,
+                fetched_at=fetched_at,
+            )
+            db.add(stored)
+            existing_index.setdefault(keyword, {})[week] = stored
+        stored.keyword = keyword
+        stored.search_rank = record.get("rank")
+        stored.search_volume = record.get("volume")
+        stored.fetched_at = fetched_at
+
+    # A successful response without a term/week value is itself history: keep a
+    # null marker so later views do not spend another credit on the same cell.
+    for keyword in keyword_set:
+        for week in week_set:
+            if (keyword, week) in actual or row_for(keyword, week) is not None:
+                continue
+            db.add(KeywordDashboardWeeklyRecord(
+                site_code=site_code,
+                keyword=keyword,
+                week_start=week,
+                search_rank=None,
+                search_volume=None,
+                fetched_at=fetched_at,
+            ))
+    db.commit()
 
 
 async def fetch_xiyou_weekly_records(
@@ -4053,6 +4228,9 @@ async def fetch_xiyou_weekly_records(
             response.raise_for_status()
             raise RuntimeError("西柚接口返回了非 JSON 数据") from exc
         if response.status_code >= 400:
+            error_code = str(payload.get("code") or "")
+            if error_code == "InvalidTrendsRange":
+                raise RuntimeError("西柚接口暂不支持所选周范围，请选择已完成周")
             message = payload.get("msg") or payload.get("message") or response.text[:200]
             raise RuntimeError(f"西柚接口请求失败：HTTP {response.status_code} {message}")
         return xiyou_weekly_records(payload)
@@ -4129,6 +4307,8 @@ def save_keyword_dashboard_terms(
         category = normalize_keyword(raw.get("category")) or "未分类"
         if not keyword:
             raise HTTPException(status_code=422, detail="关键词不能为空")
+        if category not in KEYWORD_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"关键词分类无效：{category}")
         if len(keyword) > 255 or len(category) > 80:
             raise HTTPException(status_code=422, detail="关键词或分类长度超出限制")
         lookup = normalize_keyword_lookup(keyword)
@@ -4165,7 +4345,6 @@ def save_keyword_dashboard_terms(
         ).all()
         saved = keyword_terms_payload(rows)
 
-    _amazon_cache = {key: value for key, value in _amazon_cache.items() if key[0:2] != ("keyword-dashboard", site_code)}
     return {"ok": True, "site": site_name, "site_code": site_code, "terms": saved, "saved": len(saved)}
 
 
@@ -4217,42 +4396,69 @@ async def keyword_dashboard(
             "refreshed_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    cache_key = (
-        "keyword-dashboard",
-        site_code,
-        start.isoformat(),
-        end.isoformat(),
-        tuple(normalize_keyword_lookup(term.keyword) for term in term_rows),
-    )
-    if refresh:
-        _amazon_cache.pop(cache_key, None)
-    cached = _amazon_cache.get(cache_key)
-    from_cache = bool(cached and time.monotonic() - cached[0] < KEYWORD_CACHE_TTL_SECONDS)
-    if from_cache:
-        records = cached[1]
-    else:
-        # Serialize cache misses: two users opening the same dashboard must not
-        # trigger two billable Xiyou requests for the identical keyword scope.
-        async with _keyword_dashboard_fetch_lock:
-            cached = _amazon_cache.get(cache_key)
-            from_cache = bool(cached and time.monotonic() - cached[0] < KEYWORD_CACHE_TTL_SECONDS)
-            if from_cache:
-                records = cached[1]
-            else:
-                try:
-                    records = await fetch_xiyou_weekly_records(
-                        site_code,
-                        [term.keyword for term in term_rows],
-                        start,
-                        end,
-                    )
-                except httpx.HTTPError as exc:
-                    raise HTTPException(status_code=502, detail="西柚关键词数据获取失败") from exc
-                except RuntimeError as exc:
-                    status_code = 503 if str(exc) == "西柚 API Key 尚未配置" else 502
-                    raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-                _amazon_cache[cache_key] = (time.monotonic(), records)
+    warnings: list[str] = []
+    requested_fetch_count = 0
+    fetched_record_count = 0
 
+    # Compute missing ranges while holding the fetch lock. A completed request
+    # persists its history before the next viewer can compute its own gaps, so
+    # concurrent viewers never spend credits on the same cells twice.
+    async with _keyword_dashboard_fetch_lock:
+        with session_factory()() as db:
+            history_rows = db.scalars(
+                select(KeywordDashboardWeeklyRecord)
+                .where(KeywordDashboardWeeklyRecord.site_code == site_code)
+                .where(KeywordDashboardWeeklyRecord.week_start >= start)
+                .where(KeywordDashboardWeeklyRecord.week_start <= end)
+            ).all()
+            history = keyword_history_index(list(history_rows))
+            groups = keyword_fetch_groups(term_rows, weeks, history, refresh=refresh)
+        requested_fetch_count = len(groups)
+        for range_start, range_end, keywords in groups:
+            group_weeks = [
+                week for week in weeks
+                if range_start <= date.fromisoformat(week["start"]) <= range_end
+            ]
+            try:
+                fetched = await fetch_xiyou_weekly_records(
+                    site_code,
+                    keywords,
+                    range_start,
+                    range_end,
+                )
+                fetched_record_count += len(fetched)
+                fetched_at = datetime.now(timezone.utc)
+                with session_factory()() as db:
+                    persist_keyword_weekly_records(
+                        db,
+                        site_code,
+                        keywords,
+                        group_weeks,
+                        fetched,
+                        fetched_at=fetched_at,
+                    )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                message = str(exc) or "西柚关键词数据获取失败"
+                if message not in warnings:
+                    warnings.append(message)
+
+    with session_factory()() as db:
+        history_rows = db.scalars(
+            select(KeywordDashboardWeeklyRecord)
+            .where(KeywordDashboardWeeklyRecord.site_code == site_code)
+            .where(KeywordDashboardWeeklyRecord.week_start >= start)
+            .where(KeywordDashboardWeeklyRecord.week_start <= end)
+        ).all()
+    records = [
+        {
+            "keyword": row.keyword,
+            "week_start": row.week_start,
+            "rank": row.search_rank,
+            "volume": row.search_volume,
+        }
+        for row in history_rows
+        if row.search_rank is not None or row.search_volume is not None
+    ]
     rows = keyword_dashboard_rows(term_rows, weeks, records)
     return {
         "site": site_name,
@@ -4261,8 +4467,11 @@ async def keyword_dashboard(
         "weeks": weeks,
         "terms": term_payload,
         "rows": rows,
-        "cached": from_cache,
-        "cache_ttl_seconds": KEYWORD_CACHE_TTL_SECONDS,
+        "cached": requested_fetch_count == 0,
+        "history_cell_count": len(history_rows),
+        "requested_fetch_count": requested_fetch_count,
+        "fetched_record_count": fetched_record_count,
+        "warnings": warnings,
         "source": "xiyou",
         "field_availability": {
             "rank": any(item["search_rank"] is not None for row in rows for item in row["weekly"]),

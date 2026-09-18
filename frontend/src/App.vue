@@ -27,7 +27,7 @@ const dashboardNavDefaults = [
   { key: "commerce", label: "Shopify数据看板", icon: "⌁" },
   { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
   { key: "amazon-sales", label: "Amazon-销售看板", icon: "◎" },
-  { key: "keyword", label: "关键词看板", icon: "⌕" },
+  { key: "keyword", label: "搜索词看板", icon: "⌕" },
 ]
 const dashboardNavStorageKey = "ideadock.dashboard.navigation-order.v1"
 const dashboardNavItems = ref(normalizeDashboardNavOrder(readDashboardNavOrder()))

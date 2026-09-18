@@ -1,18 +1,23 @@
 import asyncio
 import os
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi.testclient import TestClient
 
 from app import (
+    KEYWORD_CATEGORIES,
     KeywordDashboardTerm,
+    KeywordDashboardWeeklyRecord,
     app,
     fetch_xiyou_weekly_records,
+    keyword_fetch_groups,
     keyword_dashboard_rows,
+    keyword_history_index,
     keyword_week_columns,
+    latest_completed_keyword_week_start,
     normalize_keyword_week_start,
     normalize_week_start,
     xiyou_weekly_records,
@@ -72,6 +77,29 @@ class KeywordDashboardTests(unittest.TestCase):
         self.assertEqual(normalize_keyword_week_start(date(2026, 9, 20)), date(2026, 9, 20))
         self.assertEqual(normalize_week_start(date(2026, 9, 20)), date(2026, 9, 14))
 
+    def test_latest_completed_keyword_week_excludes_in_progress_week(self):
+        self.assertEqual(latest_completed_keyword_week_start(date(2026, 9, 18)), date(2026, 9, 6))
+        self.assertEqual(latest_completed_keyword_week_start(date(2026, 9, 20)), date(2026, 9, 13))
+
+    def test_keyword_rows_sort_by_fixed_category_then_latest_rank(self):
+        terms = [
+            KeywordDashboardTerm(id=1, site_code="US", category="Pocket品牌词", keyword="pocket", sort_order=0),
+            KeywordDashboardTerm(id=2, site_code="US", category="comu品牌词", keyword="comu", sort_order=1),
+            KeywordDashboardTerm(id=3, site_code="US", category="AI核心词", keyword="ai", sort_order=2),
+        ]
+        records = [
+            {"keyword": "pocket", "week_start": date(2026, 9, 20), "rank": 2, "volume": 100},
+            {"keyword": "comu", "week_start": date(2026, 9, 20), "rank": 10, "volume": 200},
+            {"keyword": "ai", "week_start": date(2026, 9, 20), "rank": 3, "volume": 300},
+        ]
+        rows = keyword_dashboard_rows(
+            terms,
+            keyword_week_columns(date(2026, 9, 20), date(2026, 9, 20)),
+            records,
+        )
+        self.assertEqual([row["keyword"] for row in rows], ["comu", "ai", "pocket"])
+        self.assertEqual(KEYWORD_CATEGORIES[0], "comu品牌词")
+
     def test_fetch_xiyou_uses_official_batched_contract_and_server_key(self):
         client = AsyncMock()
         client.post.return_value = httpx.Response(
@@ -118,6 +146,53 @@ class KeywordDashboardTests(unittest.TestCase):
                     client,
                 ))
 
+    def test_fetch_xiyou_translates_invalid_range_error(self):
+        client = AsyncMock()
+        client.post.return_value = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://example.test/weekly"),
+            json={"code": "InvalidTrendsRange", "msg": "Internal Server Error"},
+        )
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
+            with self.assertRaisesRegex(RuntimeError, "已完成周"):
+                asyncio.run(fetch_xiyou_weekly_records(
+                    "US",
+                    ["power bank"],
+                    date(2026, 9, 13),
+                    date(2026, 9, 20),
+                    client,
+                ))
+
+    def test_fetch_groups_reuse_history_and_only_fetch_missing_runs(self):
+        weeks = keyword_week_columns(date(2026, 9, 13), date(2026, 9, 27))
+        terms = [
+            KeywordDashboardTerm(id=1, site_code="US", category="AI核心词", keyword="A", sort_order=0),
+            KeywordDashboardTerm(id=2, site_code="US", category="AI核心词", keyword="B", sort_order=1),
+        ]
+        history = keyword_history_index([
+            KeywordDashboardWeeklyRecord(
+                site_code="US",
+                keyword="A",
+                week_start=date(2026, 9, 13),
+                fetched_at=datetime(2026, 9, 20),
+            ),
+            KeywordDashboardWeeklyRecord(
+                site_code="US",
+                keyword="B",
+                week_start=date(2026, 9, 20),
+                fetched_at=datetime(2026, 9, 27),
+            ),
+        ])
+        groups = keyword_fetch_groups(terms, weeks, history, refresh=False)
+        self.assertEqual(groups, [
+            (date(2026, 9, 13), date(2026, 9, 13), ["B"]),
+            (date(2026, 9, 20), date(2026, 9, 27), ["A"]),
+            (date(2026, 9, 27), date(2026, 9, 27), ["B"]),
+        ])
+
+        refreshed = keyword_fetch_groups(terms, weeks, history, refresh=True)
+        self.assertEqual(refreshed, [(date(2026, 9, 13), date(2026, 9, 27), ["A", "B"])])
+
     def test_rejects_all_site_and_ranges_over_52_weeks(self):
         client = TestClient(app)
         response = client.get("/api/keyword-dashboard", params={"site": "全部站点"})
@@ -137,12 +212,21 @@ class KeywordDashboardTests(unittest.TestCase):
         response = client.post("/api/keyword-dashboard/terms", json={
             "site": "美国",
             "terms": [
-                {"category": "核心词", "keyword": "Power Bank"},
-                {"category": "核心词", "keyword": "power   bank"},
+                {"category": "AI核心词", "keyword": "Power Bank"},
+                {"category": "AI核心词", "keyword": "power   bank"},
             ],
         })
         self.assertEqual(response.status_code, 422)
         self.assertIn("关键词重复", response.json()["detail"])
+
+    def test_rejects_keyword_category_outside_fixed_options(self):
+        client = TestClient(app)
+        response = client.post("/api/keyword-dashboard/terms", json={
+            "site": "美国",
+            "terms": [{"category": "核心词", "keyword": "Power Bank"}],
+        })
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("关键词分类无效", response.json()["detail"])
 
 
 if __name__ == "__main__":
