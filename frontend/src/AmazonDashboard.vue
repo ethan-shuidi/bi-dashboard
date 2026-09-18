@@ -96,6 +96,7 @@ const columnConfigPosition = ref({ top: 0, left: 0 })
 const columnConfigButton = ref(null)
 const visibleDataColumns = computed(() => dataColumns.value.filter((column) => column.visible))
 const adBreakdownMetricKeys = new Set(["clicks", "ad_cost", "ad_units", "ad_orders"])
+const authoritativeBreakdownMetricKeys = new Set(["clicks", "ad_units", "ad_orders"])
 const adBreakdownTypes = [
   { key: "sp", label: "SP" },
   { key: "sb", label: "SB" },
@@ -154,6 +155,7 @@ function breakdownMetricValue(item, columnKey, typeKey) {
 
 function breakdownTotal(item, columnKey) {
   if (!adBreakdownMetricKeys.has(columnKey) || !item?.ad_breakdown) return null
+  if (!authoritativeBreakdownMetricKeys.has(columnKey)) return null
   const metricKey = adBreakdownMetricMap[columnKey]
   const values = adBreakdownTypes.map(({ key }) => item.ad_breakdown?.[key]?.[metricKey])
   if (!values.some((value) => value !== undefined && value !== null)) return null
@@ -534,7 +536,7 @@ function aggregate(items) {
       out.ad_breakdown ||= {}
       for (const { key: typeKey } of adBreakdownTypes) {
         out.ad_breakdown[typeKey] ||= {}
-        for (const metricKey of ["impressions", "clicks", "ad_cost", "ad_units", "ad_orders", "ad_sales"]) {
+        for (const metricKey of ["impressions", "clicks", "ad_units", "ad_orders"]) {
           const value = item.ad_breakdown[typeKey]?.[metricKey]
           if (value != null) out.ad_breakdown[typeKey][metricKey] = (out.ad_breakdown[typeKey][metricKey] || 0) + Number(value)
         }

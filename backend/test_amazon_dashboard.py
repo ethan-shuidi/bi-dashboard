@@ -924,20 +924,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
 
     def test_product_performance_ad_metrics_sum_sp_sb_sbv_and_sd(self):
         raw = {
-            # Deliberately leave the generic fields at SP-only values.  The
-            # dashboard must use the typed product-performance dimensions.
+            # Deliberately leave the generic count fields at SP-only values.
+            # Counts use the typed product-performance dimensions, while money
+            # stays on the requested-currency generic fields.
             "clicks": 10,
-            "spend": 1,
+            "spend": 10,
+            "ad_sales_amount": 20,
             "ads_sales_volume_quantity": 2,
             "ad_order_quantity": 1,
             "ad_clicks_sp": 10,
             "ad_clicks_sb": 3,
             "ad_clicks_sbv": 2,
             "ad_clicks_sd": 1,
-            "ads_sp_cost": 1,
-            "shared_ads_sb_cost": 0.3,
-            "shared_ads_sbv_cost": 0.2,
-            "ads_sd_cost": 0.1,
+            "ads_sp_cost": 10,
+            "shared_ads_sb_cost": 3,
+            "shared_ads_sbv_cost": 2,
+            "ads_sd_cost": 1,
+            "ads_sp_sales": 20,
+            "shared_ads_sb_sales": 6,
+            "shared_ads_sbv_sales": 4,
+            "ads_sd_sales": 2,
             "ads_sp_sales_volume_quantity": 2,
             "shared_ads_sb_sales_volume_quantity": 1,
             "shared_ads_sbv_sales_volume_quantity": 1,
@@ -948,13 +954,58 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "ad_order_quantity_sd": 1,
         }
         self.assertEqual(product_performance_ad_totals(raw)["clicks"], 16)
-        self.assertAlmostEqual(product_performance_ad_totals(raw)["ad_cost"], 1.6)
+        self.assertNotIn("ad_cost", product_performance_ad_totals(raw))
+        self.assertNotIn("ad_sales", product_performance_ad_totals(raw))
         self.assertEqual(product_performance_ad_totals(raw)["ad_units"], 5)
         self.assertEqual(product_performance_ad_totals(raw)["ad_orders"], 4)
         breakdown = product_performance_ad_breakdown(raw)
         self.assertEqual(breakdown["sb"]["clicks"], 3)
         self.assertEqual(breakdown["sbv"]["ad_units"], 1)
         self.assertEqual(breakdown["sd"]["ad_orders"], 1)
+        self.assertIsNone(breakdown["sp"]["ad_cost"])
+        self.assertIsNone(breakdown["sb"]["ad_sales"])
+
+    def test_dashboard_uses_generic_money_but_typed_ad_counts(self):
+        site_name = next(iter(AMAZON_SITE_CODES))
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+        performance = [{
+            "asin": asin,
+            "clicks": 10,
+            "spend": 10,
+            "ad_sales_amount": 20,
+            "ad_clicks_sp": 10,
+            "ad_clicks_sb": 3,
+            "ad_clicks_sbv": 2,
+            "ad_clicks_sd": 1,
+            "ads_sp_cost": 10,
+            "shared_ads_sb_cost": 3,
+            "shared_ads_sbv_cost": 2,
+            "ads_sd_cost": 1,
+            "ads_sp_sales": 20,
+            "shared_ads_sb_sales": 6,
+            "shared_ads_sbv_sales": 4,
+            "ads_sd_sales": 2,
+        }]
+
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日",
+                date(2026, 9, 4),
+                date(2026, 9, 4),
+                site_name,
+                {series},
+                {product},
+                {"US": {"sid": 1}},
+            ))
+
+        row = result["rows"][0]
+        self.assertEqual(row["clicks"], 16)
+        self.assertEqual(row["ad_cost"], 10)
+        self.assertEqual(row["ad_sales"], 20)
+        self.assertIsNone(row["ad_breakdown"]["sp"]["ad_cost"])
+        self.assertIsNone(row["ad_breakdown"]["sb"]["ad_sales"])
 
     def test_multi_site_original_currency_keeps_site_rows_separate(self):
         site_names = ["美国", "加拿大"]

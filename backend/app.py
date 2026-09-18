@@ -2128,6 +2128,14 @@ AMAZON_AD_BREAKDOWN_FIELDS = {
     },
 }
 
+# LingXing's typed product-performance money fields are returned in the store's
+# settlement currency even when the generic product-performance money fields are
+# requested in USD (or another site currency).  The campaign report confirms the
+# generic fields carry the requested-currency values.  Keep typed dimensions
+# only for additive non-money metrics; otherwise a US spend of about $76k is
+# displayed as roughly CNY 387k.
+PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS = {"ad_cost", "ad_sales"}
+
 
 def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str, float | None]]:
     """Normalize LingXing's product-performance advertising dimensions."""
@@ -2135,6 +2143,9 @@ def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str,
     for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items():
         result[ad_type] = {}
         for metric, names in fields.items():
+            if metric in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS:
+                result[ad_type][metric] = None
+                continue
             # Keep an absent upstream field as null. Filling missing fields
             # with zero makes the frontend mistake an incomplete breakdown for
             # a complete zero-valued breakdown and overwrite the generic total.
@@ -2161,9 +2172,9 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
     """Sum the four product-performance ad types when those fields are present.
 
     LingXing's generic ``clicks``/``spend`` fields can be incomplete for some
-    accounts.  The typed fields are the authoritative product-performance
-    dimensions for this dashboard, so prefer their sum and let the caller
-    fall back to the generic field only when no typed field was returned.
+    accounts.  Typed fields are authoritative for additive counts such as
+    clicks and orders.  They are intentionally not used for money: those typed
+    values can be in a different currency from the requested generic totals.
     """
     totals: dict[str, float] = {}
     generic_fields = {
@@ -2173,6 +2184,8 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
         "ad_orders": AMAZON_SOURCE_FIELDS["performance"]["ad_orders"],
     }
     for metric, _ in next(iter(AMAZON_AD_BREAKDOWN_FIELDS.values())).items():
+        if metric in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS:
+            continue
         present = False
         total = 0.0
         for fields in AMAZON_AD_BREAKDOWN_FIELDS.values():
