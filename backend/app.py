@@ -10,6 +10,8 @@ import hashlib
 import hmac
 import math
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import Body, FastAPI, Header, HTTPException, Query
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
     Boolean,
@@ -91,9 +94,34 @@ _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
+_xiyou_keyword_dashboard_scope: ContextVar[bool] = ContextVar(
+    "xiyou_keyword_dashboard_scope",
+    default=False,
+)
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
 _amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+
+
+@contextmanager
+def xiyou_keyword_dashboard_scope():
+    """Allow Xiyou requests only inside the keyword-dashboard request scope."""
+
+    token = _xiyou_keyword_dashboard_scope.set(True)
+    try:
+        yield
+    finally:
+        _xiyou_keyword_dashboard_scope.reset(token)
+
+
+@app.middleware("http")
+async def restrict_xiyou_to_keyword_dashboard(request: Request, call_next):
+    """Keep the Xiyou API boundary independent from Amazon/LingXing routes."""
+
+    if request.url.path.rstrip("/") == "/api/keyword-dashboard":
+        with xiyou_keyword_dashboard_scope():
+            return await call_next(request)
+    return await call_next(request)
 KEYWORD_CATEGORIES = (
     "comu品牌词",
     "AI核心词",
@@ -4201,6 +4229,8 @@ async def fetch_xiyou_weekly_records(
     end: date,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
+    if not _xiyou_keyword_dashboard_scope.get():
+        raise RuntimeError("西柚接口仅允许搜索词看板调用")
     api_key = os.environ.get("XIYOU_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("西柚 API Key 尚未配置")

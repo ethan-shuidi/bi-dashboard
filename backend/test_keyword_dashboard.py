@@ -21,6 +21,7 @@ from app import (
     normalize_keyword_week_start,
     normalize_week_start,
     xiyou_weekly_records,
+    xiyou_keyword_dashboard_scope,
 )
 
 
@@ -107,7 +108,7 @@ class KeywordDashboardTests(unittest.TestCase):
             request=httpx.Request("POST", "https://example.test/weekly"),
             json={"entities": []},
         )
-        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
             result = asyncio.run(fetch_xiyou_weekly_records(
                 "US",
                 ["power bank", "usb c cable"],
@@ -136,7 +137,7 @@ class KeywordDashboardTests(unittest.TestCase):
             request=httpx.Request("POST", "https://example.test/weekly"),
             json={"code": "APICredentialNotFound", "msg": "invalid key"},
         )
-        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
             with self.assertRaisesRegex(RuntimeError, "无效或未授权"):
                 asyncio.run(fetch_xiyou_weekly_records(
                     "US",
@@ -153,7 +154,7 @@ class KeywordDashboardTests(unittest.TestCase):
             request=httpx.Request("POST", "https://example.test/weekly"),
             json={"code": "InvalidTrendsRange", "msg": "Internal Server Error"},
         )
-        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
             with self.assertRaisesRegex(RuntimeError, "已完成周"):
                 asyncio.run(fetch_xiyou_weekly_records(
                     "US",
@@ -162,6 +163,19 @@ class KeywordDashboardTests(unittest.TestCase):
                     date(2026, 9, 20),
                     client,
                 ))
+
+    def test_fetch_xiyou_is_rejected_outside_keyword_dashboard_scope(self):
+        client = AsyncMock()
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
+            with self.assertRaisesRegex(RuntimeError, "仅允许搜索词看板"):
+                asyncio.run(fetch_xiyou_weekly_records(
+                    "US",
+                    ["power bank"],
+                    date(2026, 9, 13),
+                    date(2026, 9, 19),
+                    client,
+                ))
+        client.post.assert_not_called()
 
     def test_fetch_groups_reuse_history_and_only_fetch_missing_runs(self):
         weeks = keyword_week_columns(date(2026, 9, 13), date(2026, 9, 27))
