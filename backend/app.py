@@ -2238,7 +2238,6 @@ async def fetch_product_performance(
     asin_list: list[str] | None = None,
     currency_code: str | None = None,
     quality: dict[str, Any] | None = None,
-    native_currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read LingXing's product-performance endpoint for operating metrics."""
     # An explicitly empty list means the selected products have no ASINs
@@ -2247,14 +2246,13 @@ async def fetch_product_performance(
         return []
     if lingxing_mcp_key():
         try:
-            rows = await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
-            # The MCP product tool has no currency parameter. Its row-level
-            # currency can reflect an account-level default rather than the
-            # marketplace money actually returned. Normalize each per-store
-            # request to the known site currency before aggregation or FX.
-            if native_currency:
+            rows = await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list, currency_code)
+            # LingXing defaults its product-performance currency to CNY. The
+            # explicit request above makes money follow currency_code; preserve
+            # that contract even when a row omits or mislabels the currency.
+            if currency_code:
                 for row in rows:
-                    row["currency_code"] = native_currency
+                    row["currency_code"] = currency_code
                     row.pop("currencyCode", None)
             if quality is not None:
                 _record_performance_quality(quality, "mcp", True, None, rows)
@@ -2592,7 +2590,7 @@ async def amazon_dashboard_periodic(
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v9-marketplace-currency", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v10-explicit-mcp-currency", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -2627,7 +2625,6 @@ async def amazon_dashboard_periodic(
                         period_rows = await fetch_product_performance(
                             int(sid_value), period_start, period_end, comparison,
                             client, semaphore, asin_filter, query_currency, performance_quality,
-                            native_currency=native_currency,
                         )
                         for period_row in period_rows:
                             if isinstance(period_row, dict):
@@ -3127,6 +3124,7 @@ async def fetch_mcp_product_performance(
     end_date: date,
     client: httpx.AsyncClient,
     asin_list: list[str] | None = None,
+    currency_code: str | None = None,
 ) -> list[dict[str, Any]]:
     params: dict[str, Any] = {
         "offset": 0,
@@ -3141,6 +3139,9 @@ async def fetch_mcp_product_performance(
         "turn_on_summary": 1,
         "query_order_profit": True,
     }
+    if currency_code:
+        # Omitting this parameter silently requests LingXing's default CNY.
+        params["currency_code"] = currency_code
     if asin_list is not None:
         params["search_field"] = "asin"
         params["search_value"] = asin_list

@@ -169,6 +169,23 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertTrue(product_performance_typed_clicks_present(rows[0]))
         self.assertEqual(client.post.call_count, 3)
 
+    def test_mcp_product_performance_explicitly_requests_currency(self):
+        captured: list[dict] = []
+
+        async def fake_call(tool_id, params, client):
+            captured.append(params)
+            return {"list": []}
+
+        with patch("app.lingxing_mcp_call", new=fake_call):
+            rows = asyncio.run(fetch_mcp_product_performance(
+                101, date(2026, 9, 4), date(2026, 9, 4),
+                AsyncMock(), None, "USD",
+            ))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["currency_code"], "USD")
+
     def test_mcp_campaign_report_resolves_profile_and_keeps_real_name(self):
         shops_response = mcp_response({
             "success": True,
@@ -1010,17 +1027,23 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_mcp_product_money_uses_marketplace_currency_not_account_default(self):
         raw = [{"currency_code": "CNY", "currencyCode": "EUR", "spend": 10}]
         quality = {}
+        requests: list[tuple[str | None, str | None]] = []
+
+        async def fake_mcp_product(sid, start, end, client, asin_list, currency_code):
+            requests.append((sid, currency_code))
+            return raw
 
         async def call():
             return await fetch_product_performance(
                 101, date(2026, 9, 4), date(2026, 9, 4), "日",
                 AsyncMock(), asyncio.Semaphore(1), None, "USD", quality,
-                native_currency="USD",
             )
 
         with patch("app.lingxing_mcp_key", return_value="test-key"), \
-             patch("app.fetch_mcp_product_performance", new=AsyncMock(return_value=raw)):
+             patch("app.fetch_mcp_product_performance", new=fake_mcp_product):
             rows = asyncio.run(call())
+
+        self.assertEqual(requests, [(101, "USD")])
         self.assertEqual(rows, [{"currency_code": "USD", "spend": 10}])
         self.assertEqual(quality["sources"], {"mcp"})
 
@@ -1394,14 +1417,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             AMAZON_SITE_CODES[site_names[0]]: {"sid": 101},
             AMAZON_SITE_CODES[site_names[1]]: {"sid": 102},
         }
-        calls: list[int] = []
+        calls: list[tuple[int, str]] = []
 
-        async def fake_mcp_product(sid, *args, **kwargs):
-            calls.append(sid)
+        async def fake_mcp_product(sid, start, end, client, asin_list, currency_code):
+            calls.append((sid, currency_code))
             return [{
                 "asin": asin,
-                # LingXing MCP currently omits a currency request parameter and
-                # can label marketplace money with an account default.
+                # Exercise an upstream label that differs from the explicit MCP
+                # currency request used by this dashboard period.
                 "currency_code": "CNY",
                 "currencyCode": "EUR",
                 "net_amount": 100,
@@ -1419,7 +1442,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 {series}, {product}, sid_map, [], "native",
             ))
 
-        self.assertEqual(calls, [101, 102])
+        self.assertEqual(calls, [(101, "USD"), (102, "CAD")])
         self.assertEqual(result["currency"], "native")
         self.assertEqual(
             {(row["site"], row["currency"], row["net_sales"], row["ad_cost"]) for row in result["rows"]},
