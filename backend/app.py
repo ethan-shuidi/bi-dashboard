@@ -2238,6 +2238,7 @@ async def fetch_product_performance(
     asin_list: list[str] | None = None,
     currency_code: str | None = None,
     quality: dict[str, Any] | None = None,
+    native_currency: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read LingXing's product-performance endpoint for operating metrics."""
     # An explicitly empty list means the selected products have no ASINs
@@ -2247,6 +2248,14 @@ async def fetch_product_performance(
     if lingxing_mcp_key():
         try:
             rows = await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list)
+            # The MCP product tool has no currency parameter. Its row-level
+            # currency can reflect an account-level default rather than the
+            # marketplace money actually returned. Normalize each per-store
+            # request to the known site currency before aggregation or FX.
+            if native_currency:
+                for row in rows:
+                    row["currency_code"] = native_currency
+                    row.pop("currencyCode", None)
             if quality is not None:
                 _record_performance_quality(quality, "mcp", True, None, rows)
             return rows
@@ -2583,7 +2592,7 @@ async def amazon_dashboard_periodic(
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v8-currency-integrity", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v9-marketplace-currency", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -2618,6 +2627,7 @@ async def amazon_dashboard_periodic(
                         period_rows = await fetch_product_performance(
                             int(sid_value), period_start, period_end, comparison,
                             client, semaphore, asin_filter, query_currency, performance_quality,
+                            native_currency=native_currency,
                         )
                         for period_row in period_rows:
                             if isinstance(period_row, dict):

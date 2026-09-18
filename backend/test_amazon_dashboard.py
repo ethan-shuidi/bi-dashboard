@@ -128,6 +128,7 @@ def reset_mcp_test_state():
 class AmazonDashboardPeriodTests(unittest.TestCase):
     def setUp(self):
         reset_mcp_test_state()
+        _amazon_cache.clear()
 
     def tearDown(self):
         reset_mcp_test_state()
@@ -1006,6 +1007,23 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             self.assertIn(field, AMAZON_METRIC_SOURCES["performance"])
         self.assertNotIn("ad_report", AMAZON_METRIC_SOURCES)
 
+    def test_mcp_product_money_uses_marketplace_currency_not_account_default(self):
+        raw = [{"currency_code": "CNY", "currencyCode": "EUR", "spend": 10}]
+        quality = {}
+
+        async def call():
+            return await fetch_product_performance(
+                101, date(2026, 9, 4), date(2026, 9, 4), "日",
+                AsyncMock(), asyncio.Semaphore(1), None, "USD", quality,
+                native_currency="USD",
+            )
+
+        with patch("app.lingxing_mcp_key", return_value="test-key"), \
+             patch("app.fetch_mcp_product_performance", new=AsyncMock(return_value=raw)):
+            rows = asyncio.run(call())
+        self.assertEqual(rows, [{"currency_code": "USD", "spend": 10}])
+        self.assertEqual(quality["sources"], {"mcp"})
+
     def test_dashboard_aggregates_product_performance_metrics(self):
         site_name = next(iter(AMAZON_SITE_CODES))
         product = next(iter(ASIN_MAPPING["US"].values()))
@@ -1366,6 +1384,47 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         for row in result["rows"]:
             self.assertAlmostEqual(row["net_sales"], 10)
             self.assertAlmostEqual(row["ad_cost"], 2)
+
+    def test_dashboard_mcp_rows_normalize_to_each_site_currency(self):
+        site_names = ["美国", "加拿大"]
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+        sid_map = {
+            AMAZON_SITE_CODES[site_names[0]]: {"sid": 101},
+            AMAZON_SITE_CODES[site_names[1]]: {"sid": 102},
+        }
+        calls: list[int] = []
+
+        async def fake_mcp_product(sid, *args, **kwargs):
+            calls.append(sid)
+            return [{
+                "asin": asin,
+                # LingXing MCP currently omits a currency request parameter and
+                # can label marketplace money with an account default.
+                "currency_code": "CNY",
+                "currencyCode": "EUR",
+                "net_amount": 100,
+                "spend": 10,
+            }]
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "CAD": 0.7}
+
+        with patch("app.lingxing_mcp_key", return_value="test-key"), \
+             patch("app.fetch_mcp_product_performance", new=fake_mcp_product), \
+             patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日", date(2026, 9, 4), date(2026, 9, 4), site_names,
+                {series}, {product}, sid_map, [], "native",
+            ))
+
+        self.assertEqual(calls, [101, 102])
+        self.assertEqual(result["currency"], "native")
+        self.assertEqual(
+            {(row["site"], row["currency"], row["net_sales"], row["ad_cost"]) for row in result["rows"]},
+            {("美国", "USD", 100, 10), ("加拿大", "CAD", 100, 10)},
+        )
 
 
 if __name__ == "__main__":
