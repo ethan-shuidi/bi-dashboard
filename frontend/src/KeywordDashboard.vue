@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
+import { ElMessageBox } from "element-plus"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 import WeekPicker from "./WeekPicker.vue"
 
@@ -31,9 +32,26 @@ const endWeek = ref("")
 const startWeek = ref("")
 const addRowCount = ref(10)
 const rowGap = ref(10)
+const columnWidths = ref({})
 const contextMenu = ref({ visible: false, sourceIndex: -1, x: 0, y: 0 })
 const trendTooltip = ref(null)
 const rowGapStorageKey = "ideadock.keyword-dashboard.row-gap.v1"
+const columnWidthStorageKey = "ideadock.keyword-dashboard.column-widths.v1"
+const columnWidthDefaults = {
+  category: 150,
+  keyword: 240,
+  rankTrend: 150,
+  volumeTrend: 150,
+  weeklyMetric: 90,
+}
+const columnWidthBounds = {
+  category: [110, 260],
+  keyword: [180, 460],
+  rankTrend: [110, 280],
+  volumeTrend: [110, 280],
+  weeklyMetric: [70, 190],
+}
+let resizeCleanup = null
 
 function parseDate(value) {
   const parsed = new Date(`${value}T00:00:00`)
@@ -121,10 +139,80 @@ const latestDataWeekIndex = computed(() => {
 const visibleWeekIndices = computed(() => weeks.value.slice(0, latestDataWeekIndex.value + 1).map((_, index) => index))
 const displayWeeks = computed(() => visibleWeekIndices.value.slice().reverse().map((index) => weeks.value[index]))
 const weekIndexByStart = computed(() => new Map(weeks.value.map((week, index) => [week.start, index])))
-const tableMinWidth = computed(() => (
-  760 + (showRank.value ? 150 : 0) + (showVolume.value ? 150 : 0) +
-  displayWeeks.value.length * visibleMetricCount.value * 90
-))
+const tableMinWidth = computed(() => {
+  const widths = [
+    columnWidth("category"),
+    columnWidth("keyword"),
+    ...(showRank.value ? [columnWidth("rankTrend")] : []),
+    ...(showVolume.value ? [columnWidth("volumeTrend")] : []),
+  ]
+  for (const week of displayWeeks.value) {
+    if (showRank.value) widths.push(weekColumnWidth(week, "rank"))
+    if (showVolume.value) widths.push(weekColumnWidth(week, "volume"))
+  }
+  return widths.reduce((total, width) => total + width, 0)
+})
+
+function columnWidth(key) {
+  const bounds = columnWidthBounds[key]
+  const fallback = columnWidthDefaults[key]
+  const value = Number(columnWidths.value[key])
+  if (!bounds || !Number.isFinite(value)) return fallback
+  return Math.round(Math.max(bounds[0], Math.min(bounds[1], value)))
+}
+
+function weeklyColumnKey(week, field) {
+  return `week:${week.start}:${field}`
+}
+
+function weekColumnWidth(week, field) {
+  const key = weeklyColumnKey(week, field)
+  const value = Number(columnWidths.value[key])
+  const fallback = columnWidthDefaults.weeklyMetric
+  if (!Number.isFinite(value)) return fallback
+  return Math.round(Math.max(columnWidthBounds.weeklyMetric[0], Math.min(columnWidthBounds.weeklyMetric[1], value)))
+}
+
+function saveColumnWidths() {
+  window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(columnWidths.value))
+}
+
+function startColumnResize(event, key, getWidth) {
+  event.preventDefault()
+  event.stopPropagation()
+  resizeCleanup?.()
+  const startX = event.clientX
+  const startWidth = getWidth()
+  const previousUserSelect = document.body.style.userSelect
+  const previousCursor = document.body.style.cursor
+  const move = (moveEvent) => {
+    const bounds = columnWidthBounds[key] || columnWidthBounds.weeklyMetric
+    columnWidths.value = {
+      ...columnWidths.value,
+      [key]: Math.max(bounds[0], Math.min(bounds[1], Math.round(startWidth + moveEvent.clientX - startX))),
+    }
+  }
+  const stop = () => {
+    window.removeEventListener("pointermove", move)
+    window.removeEventListener("pointerup", stop)
+    document.body.style.userSelect = previousUserSelect
+    document.body.style.cursor = previousCursor
+    resizeCleanup = null
+    saveColumnWidths()
+  }
+  resizeCleanup = stop
+  document.body.style.userSelect = "none"
+  document.body.style.cursor = "col-resize"
+  window.addEventListener("pointermove", move)
+  window.addEventListener("pointerup", stop, { once: true })
+}
+
+function resetColumnWidths() {
+  columnWidths.value = {}
+  window.localStorage.removeItem(columnWidthStorageKey)
+  notice.value = "搜索词看板列宽已恢复默认"
+  error.value = ""
+}
 
 function normalizeCategory(value) {
   const category = String(value || "").trim()
@@ -292,10 +380,22 @@ async function saveTerms() {
 
 async function refreshDashboard() {
   if (!terms.value.length) {
-    error.value = "请先添加关键词"
+    error.value = "请先添加并保存关键词"
     return
   }
-  if (!window.confirm("数据已经抓取完成，抓取需要消耗Credit，是否继续？")) return
+  if (dirty.value) {
+    error.value = "关键词配置有未保存修改，请先保存后再刷新"
+    return
+  }
+  try {
+    await ElMessageBox.confirm("数据已经抓取完成，抓取需要消耗Credit，是否继续？", "刷新确认", {
+      confirmButtonText: "继续",
+      cancelButtonText: "取消",
+      type: "warning",
+    })
+  } catch {
+    return
+  }
   loading.value = true
   error.value = ""
   notice.value = ""
@@ -307,6 +407,7 @@ async function refreshDashboard() {
       refresh: "true",
     })
     data.value = await api(`/api/keyword-dashboard?${query}`)
+    if (!dirty.value) applySavedDashboardOrder()
     const warnings = data.value?.warnings || []
     if (warnings.length) error.value = warnings.join("；")
     else notice.value = "ABA 数据已重新抓取并写入历史库"
@@ -444,6 +545,12 @@ applyQuickRange(10)
 onMounted(() => {
   const savedRowGap = Number(window.localStorage.getItem(rowGapStorageKey))
   if (Number.isFinite(savedRowGap) && savedRowGap >= 4 && savedRowGap <= 18) rowGap.value = savedRowGap
+  try {
+    const savedWidths = JSON.parse(window.localStorage.getItem(columnWidthStorageKey) || "{}")
+    if (savedWidths && typeof savedWidths === "object" && !Array.isArray(savedWidths)) columnWidths.value = savedWidths
+  } catch {
+    columnWidths.value = {}
+  }
   document.addEventListener("click", closeContextMenu)
   document.addEventListener("scroll", closeContextMenu, true)
   document.addEventListener("scroll", hideTrendTooltip, true)
@@ -453,6 +560,7 @@ watch(rowGap, (value) => {
   window.localStorage.setItem(rowGapStorageKey, String(value))
 })
 onBeforeUnmount(() => {
+  resizeCleanup?.()
   document.removeEventListener("click", closeContextMenu)
   document.removeEventListener("scroll", closeContextMenu, true)
   document.removeEventListener("scroll", hideTrendTooltip, true)
@@ -500,6 +608,9 @@ onBeforeUnmount(() => {
         <input v-model.number="rowGap" type="range" min="4" max="18" step="1">
         <small>{{ rowGap }}px</small>
       </label>
+      <div class="column-width-control">
+        <button type="button" @click="resetColumnWidths">恢复默认列宽</button>
+      </div>
     </section>
 
     <section v-if="error" class="keyword-message error" role="alert">{{ error }}</section>
@@ -508,13 +619,59 @@ onBeforeUnmount(() => {
 
     <section class="keyword-table-panel" aria-label="搜索词周度数据">
       <div class="keyword-table-wrap">
-        <table :style="{ minWidth: `${tableMinWidth}px`, '--keyword-row-gap': `${rowGap}px` }">
+        <table :style="{ width: `${tableMinWidth}px`, minWidth: `${tableMinWidth}px`, '--keyword-row-gap': `${rowGap}px` }">
+          <colgroup>
+            <col :style="{ width: `${columnWidth('category')}px` }">
+            <col :style="{ width: `${columnWidth('keyword')}px` }">
+            <col v-if="showRank" :style="{ width: `${columnWidth('rankTrend')}px` }">
+            <col v-if="showVolume" :style="{ width: `${columnWidth('volumeTrend')}px` }">
+            <template v-for="week in displayWeeks" :key="`${week.start}-columns`">
+              <col v-if="showRank" :style="{ width: `${weekColumnWidth(week, 'rank')}px` }">
+              <col v-if="showVolume" :style="{ width: `${weekColumnWidth(week, 'volume')}px` }">
+            </template>
+          </colgroup>
           <thead>
             <tr>
-              <th class="category" rowspan="2">分类</th>
-              <th class="keyword" rowspan="2">关键词</th>
-              <th v-if="showRank" class="trend" rowspan="2">搜索排名趋势</th>
-              <th v-if="showVolume" class="trend" rowspan="2">搜索量趋势</th>
+              <th class="category" rowspan="2">
+                <span>分类</span>
+                <i
+                  class="column-resize-handle"
+                  role="separator"
+                  aria-orientation="vertical"
+                  title="拖动调整分类列宽"
+                  @pointerdown="startColumnResize($event, 'category', () => columnWidth('category'))"
+                ></i>
+              </th>
+              <th class="keyword" rowspan="2">
+                <span>关键词</span>
+                <i
+                  class="column-resize-handle"
+                  role="separator"
+                  aria-orientation="vertical"
+                  title="拖动调整关键词列宽"
+                  @pointerdown="startColumnResize($event, 'keyword', () => columnWidth('keyword'))"
+                ></i>
+              </th>
+              <th v-if="showRank" class="trend" rowspan="2">
+                <span>搜索排名趋势</span>
+                <i
+                  class="column-resize-handle"
+                  role="separator"
+                  aria-orientation="vertical"
+                  title="拖动调整搜索排名趋势列宽"
+                  @pointerdown="startColumnResize($event, 'rankTrend', () => columnWidth('rankTrend'))"
+                ></i>
+              </th>
+              <th v-if="showVolume" class="trend" rowspan="2">
+                <span>搜索量趋势</span>
+                <i
+                  class="column-resize-handle"
+                  role="separator"
+                  aria-orientation="vertical"
+                  title="拖动调整搜索量趋势列宽"
+                  @pointerdown="startColumnResize($event, 'volumeTrend', () => columnWidth('volumeTrend'))"
+                ></i>
+              </th>
               <th
                 v-for="week in displayWeeks"
                 :key="week.start"
@@ -527,8 +684,26 @@ onBeforeUnmount(() => {
             </tr>
             <tr>
               <template v-for="week in displayWeeks" :key="`${week.start}-metrics`">
-                <th v-if="showRank" class="metric-head rank">周搜索排名</th>
-                <th v-if="showVolume" class="metric-head volume">周搜索量</th>
+                <th v-if="showRank" class="metric-head rank">
+                  <span>周搜索排名</span>
+                  <i
+                    class="column-resize-handle"
+                    role="separator"
+                    aria-orientation="vertical"
+                    title="拖动调整周搜索排名列宽"
+                    @pointerdown="startColumnResize($event, weeklyColumnKey(week, 'rank'), () => weekColumnWidth(week, 'rank'))"
+                  ></i>
+                </th>
+                <th v-if="showVolume" class="metric-head volume">
+                  <span>周搜索量</span>
+                  <i
+                    class="column-resize-handle"
+                    role="separator"
+                    aria-orientation="vertical"
+                    title="拖动调整周搜索量列宽"
+                    @pointerdown="startColumnResize($event, weeklyColumnKey(week, 'volume'), () => weekColumnWidth(week, 'volume'))"
+                  ></i>
+                </th>
               </template>
             </tr>
           </thead>
@@ -558,7 +733,7 @@ onBeforeUnmount(() => {
                     :key="point.index"
                     :cx="point.x"
                     :cy="point.y"
-                    r="3"
+                    r="1.8"
                     :class="{ extreme: point.is_min || point.is_max }"
                     @mouseenter="showTrendTooltip($event, point, 'search_rank')"
                     @mousemove="moveTrendTooltip"
@@ -575,7 +750,7 @@ onBeforeUnmount(() => {
                     :key="point.index"
                     :cx="point.x"
                     :cy="point.y"
-                    r="3"
+                    r="1.8"
                     :class="{ extreme: point.is_min || point.is_max }"
                     @mouseenter="showTrendTooltip($event, point, 'search_volume')"
                     @mousemove="moveTrendTooltip"
@@ -642,9 +817,9 @@ onBeforeUnmount(() => {
 <style scoped>
 .keyword-dashboard{min-width:0;padding:22px;color:#17324d}
 .keyword-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.keyword-head span{color:#6d7f95;font-size:12px;font-weight:750}.keyword-head h1{margin:3px 0 0;color:#12315d;font-size:24px}.keyword-head p{margin:6px 0 0;color:#6d7f95;font-size:13px}.keyword-head-actions{display:flex;align-items:center;gap:8px}.keyword-head-actions button{height:36px;padding:0 14px;border:1px solid #c9dbf0;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.keyword-head-actions .primary{border-color:#1e57c8;background:#1e57c8;color:#fff}.keyword-head-actions button:disabled{opacity:.6;cursor:not-allowed}.keyword-cache{height:28px;display:inline-flex;align-items:center;padding:0 10px;border-radius:999px;background:#eef3f9;color:#65778c;font-size:12px;font-weight:750}.keyword-cache.cached{background:#e8f7ef;color:#19704b}
-.keyword-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}.row-gap-control{align-content:center}.row-gap-control input{width:100%;height:24px;margin:5px 0;accent-color:#1e57c8}.row-gap-control small{color:#526b88;font-size:12px;font-weight:750;text-align:right}
+.keyword-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label,.column-width-control{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}.row-gap-control{align-content:center}.row-gap-control input{width:100%;height:24px;margin:5px 0;accent-color:#1e57c8}.row-gap-control small{color:#526b88;font-size:12px;font-weight:750;text-align:right}.column-width-control{align-content:end}.column-width-control button{height:42px;padding:0 12px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:750;cursor:pointer}.column-width-control button:hover{background:#f2f8ff}
 .keyword-message{margin-top:16px;padding:12px 14px;border-radius:10px;font-size:13px}.keyword-message.error{background:#fff2f4;color:#ad2745}.keyword-message.success{background:#edfaf3;color:#17724c}.keyword-message.muted{background:#f7fafd;color:#6d7f95}
-.keyword-table-panel{position:relative;z-index:1;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow:auto;overscroll-behavior-x:contain;border-radius:16px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle}thead tr:nth-child(1) th{position:sticky;top:0;z-index:4;background:#f4f8fd;color:#455f7c;font-size:12px}thead tr:nth-child(2) th{position:sticky;top:40px;z-index:4;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750}.category{width:150px}.keyword{width:240px}.keyword input,.category-select{width:100%;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.week-group{min-width:180px;text-align:center}.week-group.single{min-width:90px}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{min-width:90px;text-align:right}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend{width:150px}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2}.trend circle{cursor:pointer;fill:#fff;stroke:#2f80ed;stroke-width:1.5}.trend circle.extreme{fill:#d93025;stroke:#d93025}.volume-trend path{stroke:#12a05f}.volume-trend circle{stroke:#12a05f}.no-trend{color:#93a2b4;font-size:12px}tbody th,tbody td{padding-top:var(--keyword-row-gap,10px);padding-bottom:var(--keyword-row-gap,10px)}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:right;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
+.keyword-table-panel{position:relative;z-index:1;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow:auto;overscroll-behavior-x:contain;border-radius:16px}table{border-collapse:collapse;table-layout:fixed}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle;overflow:hidden}thead tr:nth-child(1) th{position:sticky;top:0;z-index:4;background:#f4f8fd;color:#455f7c;font-size:12px}thead tr:nth-child(2) th{position:sticky;top:40px;z-index:4;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750}thead th>span{display:inline-block;max-width:calc(100% - 12px);vertical-align:middle}.keyword input,.category-select{width:100%;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.week-group{text-align:center}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{text-align:right;padding-right:14px}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2;vector-effect:non-scaling-stroke}.trend circle{cursor:pointer;fill:#fff;stroke:#2f80ed;stroke-width:1;vector-effect:non-scaling-stroke}.trend circle.extreme{fill:#d93025;stroke:#d93025}.volume-trend path{stroke:#12a05f}.volume-trend circle{stroke:#12a05f}.no-trend{color:#93a2b4;font-size:12px}.column-resize-handle{position:absolute;top:0;right:0;bottom:0;z-index:6;width:9px;margin-right:-4.5px;cursor:col-resize;touch-action:none;background:linear-gradient(90deg,transparent 3px,rgba(30,87,200,.28) 3px,rgba(30,87,200,.28) 5px,transparent 5px)}.column-resize-handle:hover,.column-resize-handle:active{background:linear-gradient(90deg,transparent 2px,#1e57c8 2px,#1e57c8 6px,transparent 6px)}tbody th,tbody td{padding-top:var(--keyword-row-gap,10px);padding-bottom:var(--keyword-row-gap,10px)}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:right;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
 .table-footer{position:sticky;left:0;display:flex;align-items:center;gap:10px;padding:12px 14px;background:#fff}.add-row-control{display:flex;align-items:center;gap:8px}.add-row-control input{width:76px;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit;font-size:13px}.add-row-control input:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.add-row{width:34px;height:34px;border:1px dashed #9dbbe0;border-radius:50%;background:#f7fbff;color:#2567b7;font-size:20px;line-height:1;cursor:pointer}.add-row:hover{border-style:solid;background:#edf5ff}.table-footer span{color:#71819a;font-size:12px}
 .keyword-context-menu{position:fixed;z-index:3000;min-width:96px;padding:6px;border:1px solid #d8e3ef;border-radius:9px;background:#fff;box-shadow:0 14px 30px rgba(25,58,102,.18)}.keyword-context-menu button{width:100%;height:30px;border:0;border-radius:6px;background:transparent;color:#26466d;font:inherit;font-size:13px;cursor:pointer}.keyword-context-menu button:hover{background:#f2f7ff;color:#b32638}
 .trend-tooltip{position:fixed;z-index:4000;max-width:184px;padding:7px 9px;border:1px solid #d8e3ef;border-radius:8px;background:#fff;color:#26466d;font-size:12px;font-weight:700;line-height:1.35;box-shadow:0 12px 26px rgba(25,58,102,.18);pointer-events:none;white-space:nowrap}
