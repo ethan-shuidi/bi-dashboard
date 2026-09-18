@@ -11,11 +11,13 @@ import httpx
 from sqlalchemy import create_engine, inspect, text
 from app import (
     AMAZON_SALES_ALL_SITES,
+    AMAZON_SALES_ALL_MODEL,
     AMAZON_PRODUCTS,
     AMAZON_STRATEGY_OPTIONS,
     AMAZON_METRIC_SOURCES,
     AMAZON_SERIES,
     AMAZON_SOURCE_FIELDS,
+    AMAZON_SALES_TN20_SMALL_SERIES,
     AMAZON_SALES_TARGET_FIELDS,
     ASIN_MAPPING,
     AMAZON_SITE_CODES,
@@ -502,6 +504,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "站点无效"):
             amazon_sales_selected_sites("火星")
 
+    def test_sales_dashboard_all_model_scope_includes_every_product(self):
+        products, series = amazon_sales_scope(AMAZON_SALES_ALL_MODEL)
+        self.assertEqual(products, set(AMAZON_PRODUCTS))
+        self.assertIn(AMAZON_SERIES[0], series)
+        self.assertIn(AMAZON_SALES_TN20_SMALL_SERIES, series)
+
     def test_sales_dashboard_currency_follows_site_scope(self):
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("全部站点")), "USD")
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("美国")), "USD")
@@ -897,15 +905,18 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "LINGXING_APP_SECRET": "test-secret",
             "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
         }
-        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=AsyncMock(return_value=periodic)):
+        periodic_mock = AsyncMock(return_value=periodic)
+        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=periodic_mock):
             result = asyncio.run(amazon_ads_charts(
                 date(2026, 9, 7),
                 date(2026, 9, 7),
                 "全部站点",
-                "TN20",
+                AMAZON_SALES_ALL_MODEL,
                 False,
             ))
-        self.assertEqual(result["model"], "TN20")
+        self.assertEqual(result["model"], AMAZON_SALES_ALL_MODEL)
+        self.assertEqual(periodic_mock.call_args.args[5], set(AMAZON_PRODUCTS))
+        self.assertEqual(periodic_mock.call_args.args[4], set(AMAZON_SERIES) | {AMAZON_SALES_TN20_SMALL_SERIES})
         self.assertEqual(result["currency"], "USD")
         self.assertTrue(result["field_availability"]["sessions_present"])
         self.assertFalse(result["field_availability"]["page_views_present"])

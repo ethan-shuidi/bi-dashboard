@@ -25,7 +25,11 @@ const datePanelOpen = ref(false)
 const dateTriggerRef = ref(null)
 const datePanelPosition = ref({})
 const model = ref("TN10")
-const models = ["TN10", "TN20"]
+const modelOptions = [
+  { label: "全部型号", value: "ALL" },
+  { label: "TN10", value: "TN10" },
+  { label: "TN20", value: "TN20" },
+]
 const site = ref("全部站点")
 const siteOptions = ["全部站点", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
 const months = Array.from({ length: 12 }, (_, index) => index + 1)
@@ -321,7 +325,7 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
       <label class="sales-model-field">
         <span>型号</span>
         <select :value="model" @change="changeModel($event.target.value)">
-          <option v-for="item in models" :key="item" :value="item">{{ item }}</option>
+          <option v-for="item in modelOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
         </select>
       </label>
       <label class="sales-model-field">

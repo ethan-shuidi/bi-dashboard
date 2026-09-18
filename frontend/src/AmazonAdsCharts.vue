@@ -7,7 +7,11 @@ import WeekPicker from "./WeekPicker.vue"
 const props = defineProps({ apiBase: { type: String, default: "" } })
 
 const siteOptions = ["全部站点", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
-const modelOptions = ["TN10", "TN20"]
+const modelOptions = [
+  { label: "全部型号", value: "ALL" },
+  { label: "TN10", value: "TN10" },
+  { label: "TN20", value: "TN20" },
+]
 const quickRangeOptions = [
   { label: "近5周", value: 5 },
   { label: "近10周", value: 10 },
@@ -270,7 +274,7 @@ onBeforeUnmount(() => {
       <label><span>开始周</span><WeekPicker v-model="startWeek" /></label>
       <label><span>结束周</span><WeekPicker v-model="endWeek" /></label>
       <label><span>站点</span><el-select v-model="site"><el-option v-for="item in siteOptions" :key="item" :label="item" :value="item" /></el-select></label>
-      <label><span>型号</span><el-select v-model="model"><el-option v-for="item in modelOptions" :key="item" :label="item" :value="item" /></el-select></label>
+      <label><span>型号</span><el-select v-model="model"><el-option v-for="item in modelOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></label>
     </div>
     <div v-if="error" class="ads-chart-error">{{ error }}</div>
     <div v-else-if="loading && !rows.length" class="ads-chart-loading">正在同步领星产品表现数据…</div>

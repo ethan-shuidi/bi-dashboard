@@ -156,6 +156,8 @@ AMAZON_PRODUCTS = [
     "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红",
 ]
 AMAZON_SALES_MODELS = ("TN10", "TN20")
+AMAZON_SALES_ALL_MODEL = "ALL"
+AMAZON_SALES_MODEL_CHOICES = (AMAZON_SALES_ALL_MODEL, *AMAZON_SALES_MODELS)
 AMAZON_SALES_ALL_SITES = "全部站点"
 AMAZON_SALES_TN20_SMALL_SERIES = "TN20系列（小链接）汇总"
 AMAZON_SALES_METRICS = (
@@ -617,6 +619,11 @@ def amazon_series(product: str | None) -> str | None:
 
 def amazon_sales_scope(model: str) -> tuple[set[str], set[str]]:
     """Map a sales-dashboard model to every currently known product variant."""
+    if model == AMAZON_SALES_ALL_MODEL:
+        products = set(AMAZON_PRODUCTS)
+        series = {amazon_series(product) for product in products}
+        series.discard(None)
+        return products, series
     prefix = f"{model}-"
     products = {product for product in AMAZON_PRODUCTS if product.startswith(prefix)}
     series = {amazon_series(product) for product in products}
@@ -3399,7 +3406,7 @@ async def amazon_ads_charts(
     if (end - start).days + 7 > AMAZON_MAX_DATE_RANGE_DAYS:
         raise HTTPException(status_code=422, detail=f"广告图表周范围无效，最多支持 {AMAZON_MAX_DATE_RANGE_DAYS} 天")
     model = model.strip().upper()
-    if model not in AMAZON_SALES_MODELS:
+    if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="广告图表型号无效")
     try:
         selected_sites = amazon_sales_selected_sites(site)
@@ -3658,7 +3665,7 @@ async def amazon_sales_dashboard(
     if year < 2000 or year > 2100 or month < 1 or month > 12:
         raise HTTPException(status_code=422, detail="年月参数无效")
     model = model.strip().upper()
-    if model not in AMAZON_SALES_MODELS:
+    if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="销售看板型号无效")
     try:
         selected_sites = amazon_sales_selected_sites(site)
@@ -3725,7 +3732,7 @@ async def amazon_sales_dashboard(
         "year": year,
         "month": month,
         "model": model,
-        "models": list(AMAZON_SALES_MODELS),
+        "models": list(AMAZON_SALES_MODEL_CHOICES),
         "site": site,
         "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
         "currency": amazon_sales_currency(selected_sites),
@@ -3775,7 +3782,7 @@ async def amazon_sales_weekly_dashboard(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="销售看板周格式无效") from exc
     model = model.strip().upper()
-    if model not in AMAZON_SALES_MODELS:
+    if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="销售看板型号无效")
     try:
         selected_sites = amazon_sales_selected_sites(site)
@@ -3832,7 +3839,7 @@ async def amazon_sales_weekly_dashboard(
         "week_start": week.isoformat(),
         "week_end": week_end.isoformat(),
         "model": model,
-        "models": list(AMAZON_SALES_MODELS),
+        "models": list(AMAZON_SALES_MODEL_CHOICES),
         "site": site,
         "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
         "currency": amazon_sales_currency(selected_sites),
@@ -3880,7 +3887,7 @@ def save_amazon_sales_weekly_targets(
         raise HTTPException(status_code=422, detail="周度目标保存周格式无效") from exc
     model = str(payload.get("model") or "").strip().upper()
     site = str(payload.get("site") or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
-    if model not in AMAZON_SALES_MODELS:
+    if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="周度目标保存参数无效")
     try:
         amazon_sales_selected_sites(site)
@@ -3939,7 +3946,7 @@ def save_amazon_sales_targets(
         raise HTTPException(status_code=422, detail="年月参数无效") from exc
     model = str(payload.get("model") or "").strip().upper()
     site = str(payload.get("site") or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
-    if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODELS:
+    if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="月度目标保存参数无效")
     try:
         amazon_sales_selected_sites(site)
