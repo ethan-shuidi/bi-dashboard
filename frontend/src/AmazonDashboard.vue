@@ -160,7 +160,10 @@ function breakdownTotal(item, columnKey) {
   if (!authoritativeBreakdownMetricKeys.has(columnKey)) return null
   const metricKey = adBreakdownMetricMap[columnKey]
   const values = adBreakdownTypes.map(({ key }) => item.ad_breakdown?.[key]?.[metricKey])
-  if (!values.some((value) => value !== undefined && value !== null)) return null
+  // A partial typed matrix cannot replace the generic total: LingXing omits a
+  // dimension rather than implying that it is zero. Keep the authoritative
+  // total and let the popover show "—" for the missing ad type.
+  if (values.length !== adBreakdownTypes.length || values.some((value) => value === undefined || value === null)) return null
   const typedTotal = values.reduce((sum, value) => sum + Number(value || 0), 0)
   const genericTotal = item?.[columnKey]
   if (typedTotal === 0 && Number(genericTotal || 0) !== 0) return null

@@ -2389,18 +2389,28 @@ def _record_performance_quality(
     if rows is not None:
         quality["raw_rows"] = quality.get("raw_rows", 0) + len(rows)
         quality["typed_rows"] = quality.get("typed_rows", 0) + sum(
-            product_performance_typed_clicks_present(row) for row in rows if isinstance(row, dict)
+            product_performance_typed_metrics_present(row) for row in rows if isinstance(row, dict)
         )
 
 
-def product_performance_typed_clicks_present(raw: dict[str, Any]) -> bool:
-    """Return whether all four authoritative product ad-click fields exist."""
+def product_performance_typed_metrics_present(raw: dict[str, Any]) -> bool:
+    """Return whether every non-money product ad dimension is available."""
 
     try:
         breakdown = product_performance_ad_breakdown(raw)
-        return all(breakdown[ad_type]["clicks"] is not None for ad_type in ("sp", "sb", "sbv", "sd"))
+        return all(
+            breakdown[ad_type][metric] is not None
+            for ad_type in AMAZON_AD_BREAKDOWN_FIELDS
+            for metric in AMAZON_AD_BREAKDOWN_FIELDS[ad_type]
+            if metric not in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS
+        )
     except (KeyError, TypeError, ValueError):
         return False
+
+
+# Compatibility name retained for existing API callers and tests. It now means
+# the full non-money typed matrix is present, not only the four click fields.
+product_performance_typed_clicks_present = product_performance_typed_metrics_present
 
 
 def _performance_data_quality(quality: dict[str, Any]) -> dict[str, Any]:
@@ -2410,12 +2420,15 @@ def _performance_data_quality(quality: dict[str, Any]) -> dict[str, Any]:
     errors = [str(error) for error in quality.get("errors", [])]
     typed_present = raw_rows > 0 and raw_rows == typed_rows
     mcp_ok = bool(quality.get("mcp_ok", False))
+    if raw_rows > 0 and not typed_present:
+        errors.append("产品表现缺少完整 SP/SB/SBV/SD 分类字段")
     return {
         "source": "openapi_fallback" if "openapi_fallback" in sources else ("mcp" if sources else "unknown"),
         "mcp_ok": mcp_ok,
         "raw_rows": raw_rows,
         "typed_rows": typed_rows,
         "typed_clicks_present": typed_present,
+        "typed_metrics_present": typed_present,
         "complete": mcp_ok and not errors and (raw_rows == 0 or typed_present),
         "errors": errors,
     }
@@ -2543,16 +2556,17 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
     for metric, _ in next(iter(AMAZON_AD_BREAKDOWN_FIELDS.values())).items():
         if metric in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS:
             continue
-        present = False
         total = 0.0
+        typed_values: list[float] = []
         for fields in AMAZON_AD_BREAKDOWN_FIELDS.values():
             names = fields[metric]
             value = optional_metric(raw, *names)
             if value is not None:
-                present = True
+                typed_values.append(value)
                 total += value
         generic_total = optional_metric(raw, *generic_fields.get(metric, ()))
-        if present and not (total == 0 and generic_total and metric in generic_fields):
+        complete = len(typed_values) == len(AMAZON_AD_BREAKDOWN_FIELDS)
+        if complete and not (total == 0 and generic_total and metric in generic_fields):
             totals[metric] = total
     return totals
 

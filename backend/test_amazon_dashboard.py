@@ -150,10 +150,22 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "data": {"list": [{
                 "asin": "B0TEST",
                 "clicks": 4226,
+                "ad_impressions_sp": 100,
+                "shared_ad_impressions_sb": 20,
+                "shared_ad_impressions_sbv": 10,
+                "ad_impressions_sd": 5,
                 "ad_clicks_sp": 3239,
                 "ad_clicks_sb": 417,
                 "ad_clicks_sbv": 100,
                 "ad_clicks_sd": 470,
+                "ads_sp_sales_volume_quantity": 30,
+                "shared_ads_sb_sales_volume_quantity": 4,
+                "shared_ads_sbv_sales_volume_quantity": 1,
+                "ads_sd_sales_volume_quantity": 2,
+                "ad_order_quantity_sp": 29,
+                "shared_ad_order_quantity_sb": 4,
+                "shared_ad_order_quantity_sbv": 1,
+                "ad_order_quantity_sd": 2,
             }]},
         })
         client = AsyncMock()
@@ -395,6 +407,32 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         }
         breakdown = product_performance_ad_breakdown(raw)
         self.assertTrue(all(breakdown[key]["clicks"] is None for key in ("sp", "sb", "sbv", "sd")))
+
+    def test_partial_typed_breakdown_keeps_generic_total(self):
+        raw = {
+            "clicks": 20,
+            "ad_units": 8,
+            "ad_orders": 6,
+            "ad_clicks_sp": 10,
+            "shared_ad_clicks_sb": 3,
+            "ads_sp_sales_volume_quantity": 4,
+            "shared_ads_sb_sales_volume_quantity": 1,
+            "ad_order_quantity_sp": 3,
+            "shared_ad_order_quantity_sb": 1,
+        }
+        totals = product_performance_ad_totals(raw)
+        self.assertNotIn("clicks", totals)
+        self.assertNotIn("ad_units", totals)
+        self.assertNotIn("ad_orders", totals)
+
+        breakdown = product_performance_ad_breakdown(raw)
+        self.assertEqual(breakdown["sp"]["clicks"], 10)
+        self.assertEqual(breakdown["sb"]["clicks"], 3)
+        self.assertIsNone(breakdown["sbv"]["clicks"])
+        self.assertIsNone(breakdown["sd"]["clicks"])
+        self.assertFalse(product_performance_typed_clicks_present(raw))
+
+
     def test_business_access_does_not_require_key_for_internal_app(self):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))
