@@ -490,7 +490,14 @@ const displayRows = computed(() => {
     if (periodRows.length) periodRows[0].periodFirst = true
     result.push(...periodRows)
   }
-  return summaryOnly.value ? result.filter((row) => row.type === "period-total") : result
+  if (!summaryOnly.value) return result
+  const summaryRows = result.filter((row) => row.type === "period-total")
+  const displayedPeriods = new Set()
+  for (const row of summaryRows) {
+    row.periodFirst = !displayedPeriods.has(row.period)
+    displayedPeriods.add(row.period)
+  }
+  return summaryRows
 })
 
 function compareSortable(left, right, direction, leftIndex, rightIndex) {
