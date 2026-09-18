@@ -655,6 +655,20 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertAlmostEqual(reconciliation["checks"][0]["product_performance"], 50474.20)
         self.assertTrue(reconciliation["checks"][0]["passed"])
 
+    def test_sales_money_reconciliation_allows_short_week_attribution_drift(self):
+        rows = [
+            {"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 7459.41},
+            {"site": "美国", "series": AMAZON_SERIES[1], "currency": "USD", "ad_cost": 1543.07},
+        ]
+        reconciliation = amazon_sales_validate_money_reconciliation(rows, {
+            ("美国", AMAZON_SERIES[0]): 9014.72,
+            ("美国", AMAZON_SERIES[1]): 1087.81,
+        })
+        check = reconciliation["checks"][0]
+        self.assertEqual(check["status"], "warning")
+        self.assertTrue(check["passed"])
+        self.assertEqual(len(reconciliation["warnings"]), 1)
+
     def test_sales_actual_rows_replace_product_performance_money(self):
         series = AMAZON_SERIES[0]
         periodic = {

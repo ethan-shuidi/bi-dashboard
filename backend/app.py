@@ -907,15 +907,29 @@ def amazon_sales_validate_money_reconciliation(
         product_key = key
         product_value = float(product_costs.get(product_key, 0.0))
         difference = abs(campaign_value - product_value)
-        tolerance = max(50.0, 0.1 * max(abs(campaign_value), abs(product_value)))
-        passed = difference <= tolerance
+        # Campaign-series attribution and ASIN performance attribution can
+        # legitimately drift by more than ten percent in a short week.  Keep
+        # that visible as a warning, but only block order-of-magnitude gaps
+        # that indicate conversion or source-grain corruption.  Campaign money
+        # remains authoritative whenever this check passes.
+        basis = max(abs(campaign_value), abs(product_value))
+        warning_tolerance = max(50.0, 0.1 * basis)
+        block_tolerance = max(100.0, 0.5 * basis)
+        status = (
+            "failure" if difference > block_tolerance
+            else "warning" if difference > warning_tolerance
+            else "pass"
+        )
+        passed = status != "failure"
         checks.append({
             "site": key[0],
             "model": model,
             "campaign_report": campaign_value,
             "product_performance": product_value,
             "difference": difference,
-            "tolerance": tolerance,
+            "warning_tolerance": warning_tolerance,
+            "block_tolerance": block_tolerance,
+            "status": status,
             "passed": passed,
         })
         if not passed:
@@ -926,6 +940,7 @@ def amazon_sales_validate_money_reconciliation(
     return {
         "source": "campaign_report_vs_product_performance",
         "complete": True,
+        "warnings": [check for check in checks if check["status"] == "warning"],
         "checks": checks,
     }
 
