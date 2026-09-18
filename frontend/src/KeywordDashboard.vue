@@ -12,8 +12,14 @@ const quickRangeOptions = [
   { label: "前10周", value: 10 },
   { label: "前15周", value: 15 },
 ]
+const abaDataOptions = [
+  { label: "全部", value: "ALL" },
+  { label: "仅周搜索排名", value: "RANK" },
+  { label: "仅周搜索量", value: "VOLUME" },
+]
 const site = ref("美国")
 const quickRange = ref(10)
+const abaData = ref("ALL")
 const loading = ref(false)
 const saving = ref(false)
 const error = ref("")
@@ -23,6 +29,7 @@ const terms = ref([])
 const savedTerms = ref([])
 const endWeek = ref("")
 const startWeek = ref("")
+const addRowCount = ref(10)
 const contextMenu = ref({ visible: false, sourceIndex: -1, x: 0, y: 0 })
 
 function parseDate(value) {
@@ -93,6 +100,28 @@ const weeks = computed(() => data.value?.weeks || [])
 const dirty = computed(() => JSON.stringify(termPayload()) !== JSON.stringify(savedTerms.value))
 const dataRows = computed(() => data.value?.rows || [])
 const dataRowMap = computed(() => new Map(dataRows.value.map((row) => [String(row.keyword || "").trim().toLowerCase(), row])))
+const showRank = computed(() => abaData.value === "ALL" || abaData.value === "RANK")
+const showVolume = computed(() => abaData.value === "ALL" || abaData.value === "VOLUME")
+const visibleMetricCount = computed(() => Number(showRank.value) + Number(showVolume.value))
+const latestDataWeekIndex = computed(() => {
+  for (let index = weeks.value.length - 1; index >= 0; index -= 1) {
+    const hasData = dataRows.value.some((row) => {
+      const item = row.weekly?.[index]
+      const hasRank = showRank.value && item?.search_rank !== null && item?.search_rank !== undefined
+      const hasVolume = showVolume.value && item?.search_volume !== null && item?.search_volume !== undefined
+      return hasRank || hasVolume
+    })
+    if (hasData) return index
+  }
+  return weeks.value.length ? weeks.value.length - 1 : 0
+})
+const visibleWeekIndices = computed(() => weeks.value.slice(0, latestDataWeekIndex.value + 1).map((_, index) => index))
+const displayWeeks = computed(() => visibleWeekIndices.value.slice().reverse().map((index) => weeks.value[index]))
+const weekIndexByStart = computed(() => new Map(weeks.value.map((week, index) => [week.start, index])))
+const tableMinWidth = computed(() => (
+  760 + (showRank.value ? 150 : 0) + (showVolume.value ? 150 : 0) +
+  displayWeeks.value.length * visibleMetricCount.value * 90
+))
 
 function normalizeCategory(value) {
   const category = String(value || "").trim()
@@ -166,11 +195,21 @@ function changeSite(nextSite) {
   notice.value = ""
 }
 
-function addTerm() {
-  terms.value.push({
-    category: terms.value[terms.value.length - 1]?.category || categoryOptions[0],
-    keyword: "",
-  })
+function addTerms() {
+  const count = Number(addRowCount.value)
+  if (!Number.isInteger(count) || count < 1) {
+    error.value = "新增行数必须为正整数"
+    return
+  }
+  if (terms.value.length + count > 100) {
+    error.value = `每个站点最多支持 100 个关键词，当前还可新增 ${Math.max(100 - terms.value.length, 0)} 行`
+    return
+  }
+  const category = terms.value[terms.value.length - 1]?.category || categoryOptions[0]
+  for (let index = 0; index < count; index += 1) {
+    terms.value.push({ category, keyword: "" })
+  }
+  error.value = ""
   notice.value = ""
 }
 
@@ -314,10 +353,11 @@ function metricClass(row, index, field) {
   return "flat"
 }
 
-function sparkline(row) {
-  const values = row.weekly.map((item) => item.search_rank)
+function sparkline(row, field) {
+  const values = row.weekly.map((item) => item[field])
   const points = values
     .map((value, index) => ({ value, index }))
+    .filter((item) => visibleWeekIndices.value.includes(item.index))
     .filter((item) => item.value !== null && item.value !== undefined)
   if (points.length < 2) return null
   const min = Math.min(...points.map((item) => item.value))
@@ -332,6 +372,16 @@ function sparkline(row) {
     path: coordinates.map((item, index) => `${index ? "L" : "M"}${item.x.toFixed(2)},${item.y.toFixed(2)}`).join(" "),
     points: coordinates,
   }
+}
+
+function weekIndex(start) {
+  return weekIndexByStart.value.get(start) ?? -1
+}
+
+function sparklineTitle(index, field, value) {
+  const week = weeks.value[index]
+  const label = week?.label || `W${String(isoWeek(week?.start || new Date())).padStart(2, "0")}`
+  return `${label} · ${field === "search_rank" ? "排名" : "搜索量"} ${formatNumber(value)}`
 }
 
 watch(startWeek, (value) => {
@@ -400,6 +450,12 @@ onBeforeUnmount(() => {
           <option v-for="item in siteOptions" :key="item" :value="item">{{ item }}</option>
         </select>
       </label>
+      <label>
+        <span>ABA数据</span>
+        <select v-model="abaData">
+          <option v-for="item in abaDataOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+        </select>
+      </label>
     </section>
 
     <section v-if="error" class="keyword-message error" role="alert">{{ error }}</section>
@@ -408,21 +464,27 @@ onBeforeUnmount(() => {
 
     <section class="keyword-table-panel" aria-label="搜索词周度数据">
       <div class="keyword-table-wrap">
-        <table :style="{ minWidth: `${760 + weeks.length * 180}px` }">
+        <table :style="{ minWidth: `${tableMinWidth}px` }">
           <thead>
             <tr>
               <th class="category" rowspan="2">分类</th>
               <th class="keyword" rowspan="2">关键词</th>
-              <th class="trend" rowspan="2">趋势</th>
-              <th v-for="week in weeks" :key="week.start" class="week-group" colspan="2">
+              <th v-if="showRank" class="trend" rowspan="2">搜索排名趋势</th>
+              <th v-if="showVolume" class="trend" rowspan="2">搜索量趋势</th>
+              <th
+                v-for="week in displayWeeks"
+                :key="week.start"
+                :class="['week-group', { single: visibleMetricCount === 1 }]"
+                :colspan="visibleMetricCount"
+              >
                 <strong>{{ week.label || `W${String(isoWeek(week.start)).padStart(2, "0")}` }}</strong>
                 <small>{{ week.start.slice(5) }}~{{ week.end.slice(5) }}</small>
               </th>
             </tr>
             <tr>
-              <template v-for="week in weeks" :key="`${week.start}-metrics`">
-                <th class="metric-head rank">周搜索排名</th>
-                <th class="metric-head volume">周搜索量</th>
+              <template v-for="week in displayWeeks" :key="`${week.start}-metrics`">
+                <th v-if="showRank" class="metric-head rank">周搜索排名</th>
+                <th v-if="showVolume" class="metric-head volume">周搜索量</th>
               </template>
             </tr>
           </thead>
@@ -444,29 +506,54 @@ onBeforeUnmount(() => {
                   @contextmenu.prevent="openKeywordMenu($event, row.sourceIndex)"
                 >
               </th>
-              <td class="trend">
-                <svg v-if="sparkline(row)" viewBox="0 0 100 36" preserveAspectRatio="none" role="img" :aria-label="`${row.keyword} ABA 搜索排名趋势`">
-                  <path :d="sparkline(row).path" />
-                  <circle v-for="point in sparkline(row).points" :key="point.index" :cx="point.x" :cy="point.y" r="2">
-                    <title>{{ weeks[point.index]?.label }} · 排名 {{ point.value }}</title>
+              <td v-if="showRank" class="trend">
+                <svg v-if="sparkline(row, 'search_rank')" viewBox="0 0 100 36" preserveAspectRatio="none" role="img" :aria-label="`${row.keyword} ABA 搜索排名趋势`">
+                  <path :d="sparkline(row, 'search_rank').path" />
+                  <circle v-for="point in sparkline(row, 'search_rank').points" :key="point.index" :cx="point.x" :cy="point.y" r="2">
+                    <title>{{ sparklineTitle(point.index, 'search_rank', point.value) }}</title>
                   </circle>
                 </svg>
                 <span v-else class="no-trend">数据不足</span>
               </td>
-              <template v-for="(week, weekIndex) in weeks" :key="week.start">
-                <td :class="['metric', metricClass(row, weekIndex, 'search_rank')]">
-                  {{ formatNumber(row.weekly[weekIndex]?.search_rank) }}
+              <td v-if="showVolume" class="trend volume-trend">
+                <svg v-if="sparkline(row, 'search_volume')" viewBox="0 0 100 36" preserveAspectRatio="none" role="img" :aria-label="`${row.keyword} ABA 搜索量趋势`">
+                  <path :d="sparkline(row, 'search_volume').path" />
+                  <circle v-for="point in sparkline(row, 'search_volume').points" :key="point.index" :cx="point.x" :cy="point.y" r="2">
+                    <title>{{ sparklineTitle(point.index, 'search_volume', point.value) }}</title>
+                  </circle>
+                </svg>
+                <span v-else class="no-trend">数据不足</span>
+              </td>
+              <template v-for="week in displayWeeks" :key="week.start">
+                <td
+                  v-if="showRank"
+                  :class="['metric', metricClass(row, weekIndex(week.start), 'search_rank')]"
+                >
+                  {{ formatNumber(row.weekly[weekIndex(week.start)]?.search_rank) }}
                 </td>
-                <td :class="['metric', metricClass(row, weekIndex, 'search_volume')]">
-                  {{ formatNumber(row.weekly[weekIndex]?.search_volume) }}
+                <td
+                  v-if="showVolume"
+                  :class="['metric', metricClass(row, weekIndex(week.start), 'search_volume')]"
+                >
+                  {{ formatNumber(row.weekly[weekIndex(week.start)]?.search_volume) }}
                 </td>
               </template>
             </tr>
           </tbody>
         </table>
         <div class="table-footer">
-          <button type="button" class="add-row" title="新增关键词" aria-label="新增关键词" @click="addTerm">+</button>
-          <span>新增关键词；支持粘贴换行/逗号/分号批量录入，右键关键词可删除。</span>
+          <div class="add-row-control">
+            <input
+              v-model.number="addRowCount"
+              type="number"
+              min="1"
+              max="100"
+              step="1"
+              aria-label="新增行数"
+            >
+            <button type="button" class="add-row" title="新增关键词" aria-label="新增关键词" @click="addTerms">+</button>
+          </div>
+          <span>输入行数后点击 + 新增；新增/删除仅保存在当前表格，点击右上角“保存”后才写入云端。</span>
         </div>
         <div v-if="tableRows.length && !weeks.length" class="keyword-empty">当前周范围没有数据</div>
         <div v-else-if="!tableRows.length && !loading" class="keyword-empty">点击左下角 + 添加关键词，选择分类后保存。</div>
@@ -487,10 +574,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .keyword-dashboard{min-width:0;padding:22px;color:#17324d}
 .keyword-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.keyword-head span{color:#6d7f95;font-size:12px;font-weight:750}.keyword-head h1{margin:3px 0 0;color:#12315d;font-size:24px}.keyword-head p{margin:6px 0 0;color:#6d7f95;font-size:13px}.keyword-head-actions{display:flex;align-items:center;gap:8px}.keyword-head-actions button{height:36px;padding:0 14px;border:1px solid #c9dbf0;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.keyword-head-actions .primary{border-color:#1e57c8;background:#1e57c8;color:#fff}.keyword-head-actions button:disabled{opacity:.6;cursor:not-allowed}.keyword-cache{height:28px;display:inline-flex;align-items:center;padding:0 10px;border-radius:999px;background:#eef3f9;color:#65778c;font-size:12px;font-weight:750}.keyword-cache.cached{background:#e8f7ef;color:#19704b}
-.keyword-filters{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}
+.keyword-filters{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}
 .keyword-message{margin-top:16px;padding:12px 14px;border-radius:10px;font-size:13px}.keyword-message.error{background:#fff2f4;color:#ad2745}.keyword-message.success{background:#edfaf3;color:#17724c}.keyword-message.muted{background:#f7fafd;color:#6d7f95}
-.keyword-table-panel{position:relative;z-index:1;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow:auto;overscroll-behavior-x:contain;border-radius:16px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle}thead tr:nth-child(1) th{position:sticky;top:0;z-index:4;background:#f4f8fd;color:#455f7c;font-size:12px}thead tr:nth-child(2) th{position:sticky;top:40px;z-index:4;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750}.category{width:150px}.keyword{width:240px}.keyword input,.category-select{width:100%;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.week-group{min-width:180px;text-align:center}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{min-width:90px;text-align:right}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend{width:150px}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2}.trend circle{fill:#fff;stroke:#2f80ed;stroke-width:1.5}.no-trend{color:#93a2b4;font-size:12px}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:right;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
-.table-footer{position:sticky;left:0;display:flex;align-items:center;gap:10px;padding:12px 14px;background:#fff}.add-row{width:34px;height:34px;border:1px dashed #9dbbe0;border-radius:50%;background:#f7fbff;color:#2567b7;font-size:20px;line-height:1;cursor:pointer}.add-row:hover{border-style:solid;background:#edf5ff}.table-footer span{color:#71819a;font-size:12px}
+.keyword-table-panel{position:relative;z-index:1;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow:auto;overscroll-behavior-x:contain;border-radius:16px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle}thead tr:nth-child(1) th{position:sticky;top:0;z-index:4;background:#f4f8fd;color:#455f7c;font-size:12px}thead tr:nth-child(2) th{position:sticky;top:40px;z-index:4;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750}.category{width:150px}.keyword{width:240px}.keyword input,.category-select{width:100%;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.week-group{min-width:180px;text-align:center}.week-group.single{min-width:90px}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{min-width:90px;text-align:right}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend{width:150px}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2}.trend circle{fill:#fff;stroke:#2f80ed;stroke-width:1.5}.volume-trend path{stroke:#12a05f}.volume-trend circle{stroke:#12a05f}.no-trend{color:#93a2b4;font-size:12px}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:right;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
+.table-footer{position:sticky;left:0;display:flex;align-items:center;gap:10px;padding:12px 14px;background:#fff}.add-row-control{display:flex;align-items:center;gap:8px}.add-row-control input{width:76px;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit;font-size:13px}.add-row-control input:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.add-row{width:34px;height:34px;border:1px dashed #9dbbe0;border-radius:50%;background:#f7fbff;color:#2567b7;font-size:20px;line-height:1;cursor:pointer}.add-row:hover{border-style:solid;background:#edf5ff}.table-footer span{color:#71819a;font-size:12px}
 .keyword-context-menu{position:fixed;z-index:3000;min-width:96px;padding:6px;border:1px solid #d8e3ef;border-radius:9px;background:#fff;box-shadow:0 14px 30px rgba(25,58,102,.18)}.keyword-context-menu button{width:100%;height:30px;border:0;border-radius:6px;background:transparent;color:#26466d;font:inherit;font-size:13px;cursor:pointer}.keyword-context-menu button:hover{background:#f2f7ff;color:#b32638}
 .keyword-empty{padding:24px;border-radius:10px;background:#f8fbff;color:#71819a;font-size:13px;text-align:center}
 @media (max-width:1100px){.keyword-filters{grid-template-columns:1fr 1fr}.keyword-head{align-items:flex-start}.keyword-head-actions{flex-wrap:wrap}}
