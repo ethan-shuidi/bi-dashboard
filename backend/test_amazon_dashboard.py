@@ -32,6 +32,8 @@ from app import (
     product_performance_ad_totals,
     amazon_series,
     amazon_sales_actuals,
+    amazon_sales_apply_campaign_ad_cost,
+    amazon_sales_campaign_cost_by_series,
     amazon_sales_completion,
     amazon_sales_currency,
     amazon_sales_derived_targets,
@@ -39,6 +41,7 @@ from app import (
     amazon_sales_selected_sites,
     amazon_sales_scope,
     amazon_sales_week_time_progress,
+    amazon_sales_actual_rows,
     amazon_sales_target_values,
     amazon_sales_target_number,
     amazon_week_label,
@@ -515,6 +518,97 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("美国")), "USD")
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("德国")), "EUR")
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("日本")), "JPY")
+
+    def test_sales_actuals_use_campaign_report_money(self):
+        series = AMAZON_SERIES[0]
+        rows = [
+            {"site": "美国", "series": series, "product": "TN10-主链接-黑色", "ad_cost": 300000.0, "clicks": 9000},
+            {"site": "美国", "series": series, "product": "TN10-主链接-银色", "ad_cost": 87034.42, "clicks": 3000},
+        ]
+        result = amazon_sales_apply_campaign_ad_cost(rows, {("美国", series): 54982.14})
+        self.assertAlmostEqual(amazon_sales_actuals(result)["ad_cost"], 54982.14)
+        self.assertAlmostEqual(amazon_sales_actuals(result)["cpc"], 54982.14 / 12000)
+        self.assertTrue(all(row["ad_cost_source"] == "campaign_report" for row in result))
+
+    def test_sales_campaign_money_converts_all_site_native_currency(self):
+        async def strategy_payload(*args, **kwargs):
+            return {
+                "data_quality": {"complete": True, "errors": []},
+                "strategies": [
+                    {"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "metrics": {"ad_cost": 100}},
+                    {"site": "德国", "series": AMAZON_SERIES[0], "currency": "EUR", "metrics": {"ad_cost": 100}},
+                ],
+            }
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "EUR": 1.15}
+
+        with patch("app.amazon_strategy_board_payload", new=AsyncMock(side_effect=strategy_payload)), \
+             patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
+            totals, quality = asyncio.run(amazon_sales_campaign_cost_by_series(
+                date(2026, 9, 1),
+                date(2026, 9, 17),
+                ["美国", "德国"],
+                {AMAZON_SERIES[0]},
+                {},
+                [],
+                "USD",
+                False,
+            ))
+        self.assertAlmostEqual(totals[("美国", AMAZON_SERIES[0])], 100)
+        self.assertAlmostEqual(totals[("德国", AMAZON_SERIES[0])], 115)
+        self.assertTrue(quality["complete"])
+
+    def test_sales_actual_rows_replace_product_performance_money(self):
+        series = AMAZON_SERIES[0]
+        periodic = {
+            "rows": [{
+                "site": "美国", "series": series, "product": "TN10-主链接-黑色",
+                "units": 100, "net_sales": 20000, "clicks": 12000,
+                "ad_cost": 387034.42, "ad_units": 300, "ad_orders": 240,
+            }],
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+        }
+
+        async def strategy_payload(*args, **kwargs):
+            return {
+                "data_quality": {"complete": True, "errors": []},
+                "strategies": [{
+                    "site": "美国", "series": series, "currency": "USD",
+                    "metrics": {"ad_cost": 54982.14},
+                }],
+            }
+
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
+        }
+        with patch.dict(os.environ, env), \
+             patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), \
+             patch("app.amazon_dashboard_periodic", new=AsyncMock(return_value=periodic)), \
+             patch("app.amazon_strategy_board_payload", new=AsyncMock(side_effect=strategy_payload)):
+            rows, quality = asyncio.run(amazon_sales_actual_rows(
+                date(2026, 9, 1), date(2026, 9, 17), "月", ["美国"],
+                {series}, {"TN10-主链接-黑色"}, False,
+            ))
+        actuals = amazon_sales_actuals(rows)
+        self.assertAlmostEqual(actuals["ad_cost"], 54982.14)
+        self.assertAlmostEqual(actuals["cpc"], 54982.14 / 12000)
+        self.assertEqual(actuals["units"], 100)
+        self.assertEqual(actuals["clicks"], 12000)
+        self.assertEqual(quality["ad_money_source"], "campaign_report")
+
+    def test_sales_campaign_money_fails_closed_when_inventory_incomplete(self):
+        async def strategy_payload(*args, **kwargs):
+            return {"data_quality": {"complete": False, "errors": ["missing SB"]}, "strategies": []}
+
+        with patch("app.amazon_strategy_board_payload", new=AsyncMock(side_effect=strategy_payload)):
+            with self.assertRaisesRegex(RuntimeError, "广告活动金额来源不完整"):
+                asyncio.run(amazon_sales_campaign_cost_by_series(
+                    date(2026, 9, 1), date(2026, 9, 17), ["美国"],
+                    {AMAZON_SERIES[0]}, {}, [], "original", False,
+                ))
 
     def test_monthly_target_migration_adds_site_without_losing_legacy_rows(self):
         database = create_engine("sqlite:///:memory:")

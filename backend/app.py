@@ -665,6 +665,133 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     }
 
 
+async def amazon_usd_exchange_rates(
+    rate_date: date,
+    currencies: set[str],
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, float]:
+    """Fetch once-per-day USD rates for an all-site advertising rollup."""
+    currencies = {code for code in currencies if code and code != "USD"}
+    if not currencies:
+        return {"USD": 1.0}
+    cache_key = ("amazon-usd-fx", rate_date.isoformat(), tuple(sorted(currencies)))
+    cached = _amazon_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < 12 * 60 * 60:
+        return cached[1]
+    url = f"https://api.frankfurter.dev/v1/{rate_date.isoformat()}?base=USD"
+
+    async def fetch(client_value: httpx.AsyncClient) -> dict[str, float]:
+        response = await client_value.get(url, params={"symbols": ",".join(sorted(currencies))})
+        response.raise_for_status()
+        payload = response.json()
+        rates = payload.get("rates", {})
+        result = {"USD": 1.0}
+        for code in currencies:
+            value = rates.get(code)
+            if value is None or not float(value):
+                raise RuntimeError(f"汇率服务缺少 {rate_date} 的 {code} 汇率")
+            result[code] = 1.0 / float(value)
+        return result
+
+    if client is not None:
+        result = await fetch(client)
+    else:
+        async with httpx.AsyncClient(timeout=15) as owned_client:
+            result = await fetch(owned_client)
+    _amazon_cache[cache_key] = (time.monotonic(), result)
+    return result
+
+
+async def amazon_sales_campaign_cost_by_series(
+    start_date: date,
+    end_date: date,
+    selected_sites: list[str],
+    selected_series: set[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None,
+    display_currency: str,
+    refresh: bool,
+) -> tuple[dict[tuple[str, str], float], dict[str, Any]]:
+    """Read advertising money from the complete campaign inventory.
+
+    LingXing's product-performance endpoint currently returns its generic
+    advertising money in the marketplace settlement currency even when USD is
+    requested.  The campaign report is the authoritative money source; product
+    performance remains authoritative for non-money actuals.
+    """
+    payload = await amazon_strategy_board_payload(
+        start_date,
+        end_date,
+        selected_sites,
+        sid_map,
+        store_rows,
+        selected_series=selected_series,
+        refresh=refresh,
+    )
+    quality = dict(payload.get("data_quality") or {})
+    if not quality.get("complete"):
+        errors = "; ".join(quality.get("errors") or [])
+        raise RuntimeError(f"广告活动金额来源不完整：{errors or 'campaign inventory incomplete'}")
+
+    native_totals: dict[tuple[str, str, str], float] = {}
+    for group in payload.get("strategies", []):
+        site = str(group.get("site") or "")
+        series = str(group.get("series") or "")
+        currency = str(group.get("currency") or "USD")
+        value = group.get("metrics", {}).get("ad_cost")
+        if site and series and series in selected_series and value is not None:
+            native_totals[(site, series, currency)] = native_totals.get((site, series, currency), 0.0) + float(value)
+
+    requested_currency = str(display_currency or "original").upper()
+    if requested_currency == "ORIGINAL":
+        requested_currency = "USD" if len(selected_sites) > 1 else "original"
+    rates: dict[str, float] | None = None
+    if requested_currency != "original":
+        needed = {currency for _, _, currency in native_totals}
+        rates = await amazon_usd_exchange_rates(end_date, needed)
+
+    totals: dict[tuple[str, str], float] = {}
+    for (site, series, currency), value in native_totals.items():
+        converted = value if requested_currency == "original" or currency == requested_currency else value * rates[currency]
+        totals[(site, series)] = totals.get((site, series), 0.0) + converted
+    return totals, quality
+
+
+def amazon_sales_apply_campaign_ad_cost(
+    rows: list[dict[str, Any]],
+    campaign_costs: dict[tuple[str, str], float],
+) -> list[dict[str, Any]]:
+    """Replace product-performance spend with campaign-report spend.
+
+    Campaign assignments identify a series, not an individual ASIN.  Allocate
+    each series total across its product rows only so the model-level metrics
+    used by the target dashboard remain exact; the allocation weights do not
+    affect the final model total.
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault((str(row.get("site") or ""), str(row.get("series") or "")), []).append(index)
+
+    for key, indexes in groups.items():
+        authoritative_cost = float(campaign_costs.get(key, 0.0))
+        current_values = [float(rows[index].get("ad_cost") or 0.0) for index in indexes]
+        weight_sum = sum(current_values)
+        if weight_sum <= 0:
+            weights = [float(rows[index].get("clicks") or 0.0) for index in indexes]
+            weight_sum = sum(weights)
+            if weight_sum <= 0:
+                weights = [1.0] * len(indexes)
+                weight_sum = float(len(indexes))
+        else:
+            weights = current_values
+        for index, weight in zip(indexes, weights):
+            rows[index]["ad_cost"] = authoritative_cost * weight / weight_sum
+            rows[index]["ad_cost_source"] = "campaign_report"
+            clicks = rows[index].get("clicks")
+            rows[index]["cpc"] = rows[index]["ad_cost"] / clicks if clicks else None
+    return rows
+
+
 def amazon_sales_target_values(item: Any | None) -> dict[str, float | None]:
     """Read the five manually entered targets.
 
@@ -747,7 +874,21 @@ async def amazon_sales_actual_rows(
         store_rows,
         requested_currency,
     )
-    return periodic["rows"], periodic["data_quality"]
+    campaign_costs, campaign_quality = await amazon_sales_campaign_cost_by_series(
+        period_start,
+        actual_end,
+        selected_sites,
+        selected_series,
+        sid_map,
+        store_rows,
+        requested_currency,
+        refresh,
+    )
+    rows = amazon_sales_apply_campaign_ad_cost(periodic["rows"], campaign_costs)
+    data_quality = dict(periodic.get("data_quality") or {})
+    data_quality["ad_money_source"] = "campaign_report"
+    data_quality["campaign_money_quality"] = campaign_quality
+    return rows, data_quality
 
 
 def amazon_sales_currency(selected_sites: list[str]) -> str:
