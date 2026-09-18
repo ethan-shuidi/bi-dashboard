@@ -2587,10 +2587,10 @@ AMAZON_AD_BREAKDOWN_FIELDS = {
 
 # LingXing's typed product-performance money fields are returned in the store's
 # settlement currency even when the generic product-performance money fields are
-# requested in USD (or another site currency).  The campaign report confirms the
-# generic fields carry the requested-currency values.  Keep typed dimensions
-# only for additive non-money metrics; otherwise a US spend of about $76k is
-# displayed as roughly CNY 387k.
+# requested in USD (or another site currency).  Reconcile a complete typed money
+# matrix against the authoritative generic total instead of adding the raw typed
+# values.  This keeps the four ad-type details in the dashboard currency while
+# preventing a US spend of about $76k from being displayed as roughly CNY 387k.
 PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS = {"ad_cost", "ad_sales"}
 
 
@@ -2600,16 +2600,43 @@ def product_performance_ad_breakdown(raw: dict[str, Any]) -> dict[str, dict[str,
     for ad_type, fields in AMAZON_AD_BREAKDOWN_FIELDS.items():
         result[ad_type] = {}
         for metric, names in fields.items():
-            if metric in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS:
-                result[ad_type][metric] = None
-                continue
             # Keep an absent upstream field as null. Filling missing fields
             # with zero makes the frontend mistake an incomplete breakdown for
             # a complete zero-valued breakdown and overwrite the generic total.
             result[ad_type][metric] = optional_metric(raw, *names)
+
+    # Typed money values can use a different currency from the requested
+    # generic total.  Scale a complete four-type matrix so its sum exactly
+    # matches the authoritative total.  Incomplete, zero-but-positive, or
+    # unavailable totals stay null instead of presenting an invented split.
+    for metric in PRODUCT_PERFORMANCE_TYPED_MONEY_FIELDS:
+        typed_values = [
+            optional_metric(raw, *AMAZON_AD_BREAKDOWN_FIELDS[ad_type][metric])
+            for ad_type in AMAZON_AD_BREAKDOWN_FIELDS
+        ]
+        generic_total = optional_metric(
+            raw,
+            *AMAZON_SOURCE_FIELDS["performance"][metric],
+        )
+        typed_total = sum(typed_values) if all(value is not None for value in typed_values) else None
+        if (
+            typed_total is not None
+            and generic_total is not None
+            and typed_total > 0
+            and generic_total > 0
+        ):
+            scale = generic_total / typed_total
+            for ad_type, value in zip(AMAZON_AD_BREAKDOWN_FIELDS, typed_values):
+                result[ad_type][metric] = value * scale
+        elif typed_total == 0 and generic_total == 0:
+            for ad_type in AMAZON_AD_BREAKDOWN_FIELDS:
+                result[ad_type][metric] = 0
+        else:
+            for ad_type in AMAZON_AD_BREAKDOWN_FIELDS:
+                result[ad_type][metric] = None
+
     generic_fields = {
         "clicks": AMAZON_SOURCE_FIELDS["performance"]["clicks"],
-        "ad_cost": AMAZON_SOURCE_FIELDS["performance"]["ad_cost"],
         "ad_units": AMAZON_SOURCE_FIELDS["performance"]["ad_units"],
         "ad_orders": AMAZON_SOURCE_FIELDS["performance"]["ad_orders"],
     }

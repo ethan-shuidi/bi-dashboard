@@ -559,11 +559,12 @@ function aggregate(items) {
       if (value != null) out[key] = (out[key] || 0) + Number(value)
     }
     if (item.ad_breakdown) {
-      out.ad_breakdown ||= {}
-      for (const { key: typeKey } of adBreakdownTypes) {
-        out.ad_breakdown[typeKey] ||= {}
-        for (const metricKey of ["impressions", "clicks", "ad_units", "ad_orders"]) {
-          const value = item.ad_breakdown[typeKey]?.[metricKey]
+        out.ad_breakdown ||= {}
+        for (const { key: typeKey } of adBreakdownTypes) {
+          out.ad_breakdown[typeKey] ||= {}
+          for (const metricKey of ["impressions", "clicks", "ad_cost", "ad_units", "ad_orders"]) {
+            if (mixedCurrency && metricKey === "ad_cost") continue
+            const value = item.ad_breakdown[typeKey]?.[metricKey]
           if (value != null) out.ad_breakdown[typeKey][metricKey] = (out.ad_breakdown[typeKey][metricKey] || 0) + Number(value)
         }
       }

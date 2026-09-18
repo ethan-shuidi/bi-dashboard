@@ -408,6 +408,47 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         breakdown = product_performance_ad_breakdown(raw)
         self.assertTrue(all(breakdown[key]["clicks"] is None for key in ("sp", "sb", "sbv", "sd")))
 
+    def test_typed_money_breakdown_is_scaled_to_generic_total(self):
+        raw = {
+            "spend": 100,
+            "ad_sales_amount": 160,
+            "ads_sp_cost": 500,
+            "shared_ads_sb_cost": 250,
+            "shared_ads_sbv_cost": 150,
+            "ads_sd_cost": 100,
+            "ads_sp_sales": 800,
+            "shared_ads_sb_sales": 400,
+            "shared_ads_sbv_sales": 240,
+            "ads_sd_sales": 160,
+        }
+        breakdown = product_performance_ad_breakdown(raw)
+        self.assertEqual(breakdown["sp"]["ad_cost"], 50)
+        self.assertEqual(breakdown["sb"]["ad_cost"], 25)
+        self.assertEqual(breakdown["sbv"]["ad_cost"], 15)
+        self.assertEqual(breakdown["sd"]["ad_cost"], 10)
+        self.assertAlmostEqual(sum(item["ad_cost"] for item in breakdown.values()), 100)
+        self.assertAlmostEqual(sum(item["ad_sales"] for item in breakdown.values()), 160)
+
+    def test_partial_typed_money_breakdown_is_not_scaled(self):
+        raw = {
+            "spend": 100,
+            "ads_sp_cost": 50,
+            "shared_ads_sb_cost": 25,
+        }
+        breakdown = product_performance_ad_breakdown(raw)
+        self.assertTrue(all(breakdown[key]["ad_cost"] is None for key in ("sp", "sb", "sbv", "sd")))
+
+    def test_positive_generic_money_with_zero_typed_total_is_unavailable(self):
+        raw = {
+            "spend": 100,
+            "ads_sp_cost": 0,
+            "shared_ads_sb_cost": 0,
+            "shared_ads_sbv_cost": 0,
+            "ads_sd_cost": 0,
+        }
+        breakdown = product_performance_ad_breakdown(raw)
+        self.assertTrue(all(breakdown[key]["ad_cost"] is None for key in ("sp", "sb", "sbv", "sd")))
+
     def test_partial_typed_breakdown_keeps_generic_total(self):
         raw = {
             "clicks": 20,
@@ -1332,8 +1373,8 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(breakdown["sb"]["clicks"], 3)
         self.assertEqual(breakdown["sbv"]["ad_units"], 1)
         self.assertEqual(breakdown["sd"]["ad_orders"], 1)
-        self.assertIsNone(breakdown["sp"]["ad_cost"])
-        self.assertIsNone(breakdown["sb"]["ad_sales"])
+        self.assertAlmostEqual(breakdown["sp"]["ad_cost"], 6.25)
+        self.assertAlmostEqual(breakdown["sb"]["ad_sales"], 3.75)
 
     def test_dashboard_uses_generic_money_but_typed_ad_counts(self):
         site_name = next(iter(AMAZON_SITE_CODES))
@@ -1374,8 +1415,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["clicks"], 16)
         self.assertEqual(row["ad_cost"], 10)
         self.assertEqual(row["ad_sales"], 20)
-        self.assertIsNone(row["ad_breakdown"]["sp"]["ad_cost"])
-        self.assertIsNone(row["ad_breakdown"]["sb"]["ad_sales"])
+        self.assertAlmostEqual(row["ad_breakdown"]["sp"]["ad_cost"], 6.25)
+        self.assertAlmostEqual(row["ad_breakdown"]["sb"]["ad_sales"], 3.75)
+        self.assertAlmostEqual(
+            sum(item["ad_cost"] for item in row["ad_breakdown"].values()),
+            row["ad_cost"],
+        )
 
     def test_multi_site_original_currency_is_rejected(self):
         site_names = ["美国", "加拿大"]
