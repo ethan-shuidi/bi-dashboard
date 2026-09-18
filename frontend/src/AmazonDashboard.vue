@@ -29,6 +29,7 @@ const periods = ref([])
 const loading = ref(true)
 const error = ref("")
 const currency = ref("original")
+let currencyWasAutoSwitched = false
 const currencyOptions = [
   { value: "original", label: "原币种" },
   { value: "USD", label: "美元 USD" },
@@ -60,7 +61,7 @@ const quickDateOptions = [
   { key: "previous-year", label: "去年" },
 ]
 
-const seriesOptions = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
+const seriesOptions = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总", "TN20系列（小链接）汇总"]
 const productOptions = ["TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色", "TN10-小链接-黑色", "TN10-小链接-银色", "TN10-小链接-橙色", "TN20-主链接-黑色", "TN20-主链接-银色", "TN20-主链接-红", "TN20-小链接-黑色", "TN20-小链接-银色", "TN20-小链接-樱桃红"]
 const sites = ref(["美国"])
 const siteOrder = ["美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
@@ -137,6 +138,7 @@ const displaySeries = (value) => ({
   "TN10系列（主链接）汇总": "TN10（主）",
   "TN10系列（小链接）汇总": "TN10（小）",
   "TN20系列（主链接）汇总": "TN20（主）",
+  "TN20系列（小链接）汇总": "TN20（小）",
 }[value] || value)
 const displayProduct = (value) => String(value || "")
   .replace(/系列（主链接）汇总/g, "（主）")
@@ -525,10 +527,13 @@ function cycleSort(column) {
 
 function aggregate(items) {
   const currencies = [...new Set(items.map((item) => item.currency).filter((value) => value && value !== "original"))]
-  const aggregateCurrency = currencies.length === 1 ? currencies[0] : (currency.value !== "original" ? currency.value : "USD")
+  const mixedCurrency = currencies.length > 1
+  const aggregateCurrency = mixedCurrency ? "MIXED" : currencies.length === 1 ? currencies[0] : (currency.value !== "original" ? currency.value : "USD")
   const out = { currency: aggregateCurrency }
+  const moneyKeys = new Set(["net_sales", "ad_sales", "ad_cost"])
   for (const item of items) {
     for (const key of ["units", "net_sales", "orders", "b2b_units", "b2b_orders", "impressions", "clicks", "ad_sales", "ad_cost", "ad_units", "ad_orders", "sessions"]) {
+      if (mixedCurrency && moneyKeys.has(key)) continue
       const value = metricValue(item, key)
       if (value != null) out[key] = (out[key] || 0) + Number(value)
     }
@@ -559,10 +564,10 @@ function aggregate(items) {
     return denominator ? numerator / denominator : null
   }
   out.ctr = weighted("ctr", "impressions")
-  out.cpc = weighted("cpc", "clicks")
+  out.cpc = mixedCurrency ? null : weighted("cpc", "clicks")
   out.ad_cvr = weighted("ad_cvr", "clicks")
   out.cvr = weighted("cvr", "sessions")
-  out.acos = weighted("acos", "ad_sales")
+  out.acos = mixedCurrency ? null : weighted("acos", "ad_sales")
   return out
 }
 
@@ -728,6 +733,13 @@ async function load(forceRefresh = false) {
 
 async function handleSiteChange() {
   if (!site.value.length && sites.value.length) site.value = [sites.value[0]]
+  if (site.value.length > 1 && currency.value === "original") {
+    currency.value = "USD"
+    currencyWasAutoSwitched = true
+  } else if (site.value.length === 1 && currencyWasAutoSwitched && currency.value === "USD") {
+    currency.value = "original"
+    currencyWasAutoSwitched = false
+  }
   await loadDateContext()
   if (quickDatePreset.value) {
     const [start, end] = quickDateRange(quickDatePreset.value)

@@ -35,6 +35,7 @@ from app import (
     amazon_sales_apply_campaign_ad_cost,
     amazon_sales_campaign_cost_by_series,
     amazon_sales_completion,
+    amazon_convert_sales_money_rows,
     amazon_sales_currency,
     amazon_sales_derived_targets,
     amazon_sales_metric_rows,
@@ -44,6 +45,7 @@ from app import (
     amazon_sales_actual_rows,
     amazon_sales_target_values,
     amazon_sales_target_number,
+    amazon_sales_validate_money_reconciliation,
     amazon_week_label,
     amazon_ads_chart_rows,
     amazon_ads_charts,
@@ -463,6 +465,11 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIn("TN20系列（主链接）汇总", series)
         self.assertIn("TN20系列（小链接）汇总", series)
 
+    def test_tn20_small_series_is_part_of_campaign_series_catalog(self):
+        self.assertIn(AMAZON_SALES_TN20_SMALL_SERIES, AMAZON_SERIES)
+        self.assertEqual(amazon_series("TN20-小链接-樱桃红"), AMAZON_SALES_TN20_SMALL_SERIES)
+        validate_strategy_series("品类词", AMAZON_SALES_TN20_SMALL_SERIES)
+
     def test_sales_completion_uses_requested_business_rules(self):
         self.assertEqual(amazon_sales_completion("units", 100, 90)["status"], "green")
         self.assertEqual(amazon_sales_completion("units", 100, 110)["status"], "red")
@@ -559,13 +566,75 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertAlmostEqual(totals[("德国", AMAZON_SERIES[0])], 115)
         self.assertTrue(quality["complete"])
 
+    def test_sales_campaign_money_falls_back_per_site_when_campaign_spend_is_unclassified(self):
+        async def strategy_payload(*args, **kwargs):
+            return {
+                "data_quality": {
+                    "complete": True,
+                    "errors": [],
+                    "unassigned_campaign_spend": {"德国|EUR": 123.45},
+                },
+                "strategies": [
+                    {"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "metrics": {"ad_cost": 100}},
+                    {"site": "德国", "series": AMAZON_SERIES[0], "currency": "EUR", "metrics": {"ad_cost": 80}},
+                ],
+            }
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "EUR": 1.1}
+
+        with patch("app.amazon_strategy_board_payload", new=AsyncMock(side_effect=strategy_payload)):
+            with patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
+                totals, quality = asyncio.run(amazon_sales_campaign_cost_by_series(
+                    date(2026, 9, 1), date(2026, 9, 17), ["美国", "德国"],
+                    {AMAZON_SERIES[0]}, {}, [], "USD", False,
+                ))
+        self.assertEqual(totals, {("美国", AMAZON_SERIES[0]): 100.0})
+        self.assertEqual(quality["campaign_money_authoritative_sites"], ["美国"])
+        self.assertEqual(quality["campaign_money_fallback_sites"], ["德国"])
+        self.assertEqual(quality["campaign_money_mode"], "product_performance_where_campaign_series_is_incomplete")
+
+    def test_all_site_sales_money_uses_campaign_fx_source(self):
+        rows = [{
+            "site": "德国", "series": AMAZON_SERIES[0], "currency": "EUR",
+            "net_sales": 100, "ad_sales": 20, "ad_cost": 10, "clicks": 5,
+        }]
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "EUR": 1.15}
+
+        with patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
+            result = asyncio.run(amazon_convert_sales_money_rows(
+                rows, "USD", date(2026, 9, 17)
+            ))
+        self.assertEqual(result[0]["currency"], "USD")
+        self.assertAlmostEqual(result[0]["net_sales"], 115)
+        self.assertAlmostEqual(result[0]["ad_sales"], 23)
+        self.assertAlmostEqual(result[0]["ad_cost"], 11.5)
+        self.assertAlmostEqual(result[0]["cpc"], 2.3)
+
+    def test_sales_actuals_reject_mixed_currency_rows(self):
+        rows = [
+            {"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 10},
+            {"site": "德国", "series": AMAZON_SERIES[0], "currency": "EUR", "ad_cost": 10},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "多币种"):
+            amazon_sales_actuals(rows)
+
+    def test_sales_money_reconciliation_fails_on_material_source_gap(self):
+        rows = [{"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 387034.42}]
+        with self.assertRaisesRegex(RuntimeError, "交叉校验失败"):
+            amazon_sales_validate_money_reconciliation(
+                rows, {("美国", AMAZON_SERIES[0]): 54982.14}
+            )
+
     def test_sales_actual_rows_replace_product_performance_money(self):
         series = AMAZON_SERIES[0]
         periodic = {
             "rows": [{
                 "site": "美国", "series": series, "product": "TN10-主链接-黑色",
                 "units": 100, "net_sales": 20000, "clicks": 12000,
-                "ad_cost": 387034.42, "ad_units": 300, "ad_orders": 240,
+                "ad_cost": 54982.14, "ad_units": 300, "ad_orders": 240,
             }],
             "data_quality": {"source": "mcp", "complete": True, "errors": []},
         }
@@ -977,6 +1046,16 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["sessions"], 20)
         self.assertIsNone(row["page_views"])
 
+    def test_ads_chart_rows_reject_mixed_currency_money(self):
+        periodic = {
+            "rows": [
+                {"period_start": "2026-09-07", "period_end": "2026-09-13", "currency": "USD", "ad_cost": 10},
+                {"period_start": "2026-09-07", "period_end": "2026-09-13", "currency": "EUR", "ad_cost": 10},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "多币种"):
+            amazon_ads_chart_rows(periodic)
+
     def test_ads_charts_endpoint_reports_explicit_field_availability(self):
         periodic = {
             "data_quality": {"source": "mcp", "complete": True, "errors": []},
@@ -1101,7 +1180,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIsNone(row["ad_breakdown"]["sp"]["ad_cost"])
         self.assertIsNone(row["ad_breakdown"]["sb"]["ad_sales"])
 
-    def test_multi_site_original_currency_keeps_site_rows_separate(self):
+    def test_multi_site_original_currency_is_rejected(self):
         site_names = ["美国", "加拿大"]
         asin = next(iter(ASIN_MAPPING[AMAZON_SITE_CODES[site_names[0]]]))
         product = ASIN_MAPPING[AMAZON_SITE_CODES[site_names[0]]][asin]
@@ -1112,20 +1191,84 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             return performance
 
         with patch("app.fetch_product_performance", new=AsyncMock(side_effect=fake_performance)):
+            with self.assertRaisesRegex(ValueError, "统一货币"):
+                asyncio.run(amazon_dashboard_periodic(
+                    "日",
+                    date(2026, 9, 4),
+                    date(2026, 9, 4),
+                    site_names,
+                    {series},
+                    {product},
+                    {AMAZON_SITE_CODES[site_names[0]]: {"sid": 1}, AMAZON_SITE_CODES[site_names[1]]: {"sid": 2}},
+                    [],
+                    "original",
+                ))
+
+    def test_dashboard_normalizes_settlement_currency_to_requested_currency(self):
+        site_names = ["美国", "加拿大"]
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+        performance = [{
+            "asin": asin,
+            "currency_code": "CNY",
+            "net_amount": 100,
+            "spend": 20,
+            "ad_sales_amount": 40,
+            "clicks": 10,
+        }]
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "CNY": 0.1, "CAD": 1.2}
+
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)), \
+             patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
             result = asyncio.run(amazon_dashboard_periodic(
-                "日",
-                date(2026, 9, 4),
-                date(2026, 9, 4),
-                site_names,
-                {series},
-                {product},
+                "日", date(2026, 9, 4), date(2026, 9, 4), site_names,
+                {series}, {product},
                 {AMAZON_SITE_CODES[site_names[0]]: {"sid": 1}, AMAZON_SITE_CODES[site_names[1]]: {"sid": 2}},
-                [],
-                "original",
+                [], "USD",
             ))
-        self.assertEqual(result["currency"], "original")
-        self.assertEqual(result["selected_sites"], site_names)
-        self.assertEqual({row["site"] for row in result["rows"]}, set(site_names))
+        row = result["rows"][0]
+        self.assertEqual(result["currency"], "USD")
+        self.assertEqual(row["currency"], "USD")
+        self.assertAlmostEqual(row["net_sales"], 10)
+        self.assertAlmostEqual(row["ad_cost"], 2)
+        self.assertAlmostEqual(row["ad_sales"], 4)
+        self.assertAlmostEqual(row["cpc"], 0.2)
+
+    def test_dashboard_native_mode_keeps_each_site_currency(self):
+        site_names = ["美国", "加拿大"]
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+
+        async def fake_performance(sid, *args, **kwargs):
+            return [{
+                "asin": asin,
+                "currency_code": "CNY",
+                "net_amount": 100,
+                "spend": 20,
+                "ad_sales_amount": 40,
+                "clicks": 10,
+            }]
+
+        async def exchange_rates(*args, **kwargs):
+            return {"USD": 1.0, "CNY": 0.1, "CAD": 1.2}
+
+        with patch("app.fetch_product_performance", new=AsyncMock(side_effect=fake_performance)), \
+             patch("app.amazon_usd_exchange_rates", new=AsyncMock(side_effect=exchange_rates)):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日", date(2026, 9, 4), date(2026, 9, 4), site_names,
+                {series}, {product},
+                {AMAZON_SITE_CODES[site_names[0]]: {"sid": 1}, AMAZON_SITE_CODES[site_names[1]]: {"sid": 2}},
+                [], "native",
+            ))
+        self.assertEqual(result["currency"], "native")
+        self.assertEqual({row["currency"] for row in result["rows"]}, {"USD", "CAD"})
+        for row in result["rows"]:
+            self.assertAlmostEqual(row["net_sales"], 10)
+            self.assertAlmostEqual(row["ad_cost"], 2)
 
 
 if __name__ == "__main__":

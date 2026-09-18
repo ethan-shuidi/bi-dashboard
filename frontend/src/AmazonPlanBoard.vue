@@ -16,7 +16,7 @@ const props = defineProps({
 })
 
 const SITE_ORDER = ["美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
-const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
+const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总", "TN20系列（小链接）汇总"]
 const isOperationPlan = computed(() => props.planType === "operation")
 const planTitle = computed(() => isOperationPlan.value ? "运营计划" : "广告计划")
 const planDescription = computed(() => `${planTitle.value}内容按周、站点和系列保存，所有用户共享同一份云端内容。`)
@@ -73,6 +73,7 @@ function displaySeries(value) {
     "TN10系列（主链接）汇总": "TN10（主）",
     "TN10系列（小链接）汇总": "TN10（小）",
     "TN20系列（主链接）汇总": "TN20（主）",
+    "TN20系列（小链接）汇总": "TN20（小）",
   }[value] || value || "")
 }
 

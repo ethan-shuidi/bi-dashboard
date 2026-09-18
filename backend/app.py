@@ -148,6 +148,7 @@ AMAZON_SERIES = [
     "TN10系列（主链接）汇总",
     "TN10系列（小链接）汇总",
     "TN20系列（主链接）汇总",
+    "TN20系列（小链接）汇总",
 ]
 AMAZON_PRODUCTS = [
     "TN10-主链接-黑色", "TN10-主链接-银色", "TN10-主链接-橙色",
@@ -613,7 +614,7 @@ def amazon_series(product: str | None) -> str | None:
     if product.startswith("TN20-主链接"):
         return AMAZON_SERIES[2]
     if product.startswith("TN20-小链接"):
-        return AMAZON_SALES_TN20_SMALL_SERIES
+        return AMAZON_SERIES[3]
     return None
 
 
@@ -642,6 +643,9 @@ def amazon_sales_selected_sites(site: str) -> list[str]:
 
 def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     """Aggregate product rows from totals so derived ratios stay correct."""
+    currencies = {str(row.get("currency") or "") for row in rows if row.get("currency")}
+    if len(currencies) > 1:
+        raise RuntimeError(f"销售看板实际值存在多币种，拒绝相加：{', '.join(sorted(currencies))}")
     additive = ("units", "net_sales", "clicks", "ad_cost", "ad_units", "ad_orders")
     totals: dict[str, float] = {key: 0.0 for key in additive}
     present = {key: False for key in additive}
@@ -732,6 +736,21 @@ async def amazon_sales_campaign_cost_by_series(
     if not quality.get("complete"):
         errors = "; ".join(quality.get("errors") or [])
         raise RuntimeError(f"广告活动金额来源不完整：{errors or 'campaign inventory incomplete'}")
+    unassigned_spend = quality.get("unassigned_campaign_spend") or {}
+    unassigned_sites = {
+        str(key).split("|", 1)[0]
+        for key, value in unassigned_spend.items()
+        if float(value or 0) > 0.01
+    }
+    authoritative_sites = [site for site in selected_sites if site not in unassigned_sites]
+    fallback_sites = [site for site in selected_sites if site in unassigned_sites]
+    quality["campaign_money_authoritative_sites"] = authoritative_sites
+    quality["campaign_money_fallback_sites"] = fallback_sites
+    quality["campaign_money_mode"] = (
+        "campaign_report"
+        if not fallback_sites
+        else "product_performance_where_campaign_series_is_incomplete"
+    )
 
     native_totals: dict[tuple[str, str, str], float] = {}
     for group in payload.get("strategies", []):
@@ -739,8 +758,15 @@ async def amazon_sales_campaign_cost_by_series(
         series = str(group.get("series") or "")
         currency = str(group.get("currency") or "USD")
         value = group.get("metrics", {}).get("ad_cost")
-        if site and series and series in selected_series and value is not None:
+        if site in authoritative_sites and series and series in selected_series and value is not None:
             native_totals[(site, series, currency)] = native_totals.get((site, series, currency), 0.0) + float(value)
+    # Keep an explicit zero for every authoritative site/series pair. Without
+    # it, reconciliation could silently skip a series whose campaign inventory
+    # was empty while product performance reported spend.
+    for site in authoritative_sites:
+        for series in selected_series:
+            if not any(key[0] == site and key[1] == series for key in native_totals):
+                native_totals[(site, series, AMAZON_CURRENCY_CODES.get(site, "USD"))] = 0.0
 
     requested_currency = str(display_currency or "original").upper()
     if requested_currency == "ORIGINAL":
@@ -755,6 +781,100 @@ async def amazon_sales_campaign_cost_by_series(
         converted = value if requested_currency == "original" or currency == requested_currency else value * rates[currency]
         totals[(site, series)] = totals.get((site, series), 0.0) + converted
     return totals, quality
+
+
+async def amazon_convert_sales_money_rows(
+    rows: list[dict[str, Any]],
+    target_currency: str,
+    rate_date: date,
+    rates: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize product-performance settlement money to a display currency.
+
+    LingXing may return marketplace money in CNY even when another currency is
+    requested. Normalize at this boundary and recalculate money-derived fields
+    so no downstream dashboard accidentally adds mixed currencies.
+    """
+    currencies = {
+        str(row.get("currency") or "").strip().upper()
+        for row in rows
+        if str(row.get("currency") or "").strip()
+    }
+    needed_currencies = currencies | {target_currency}
+    if not currencies or needed_currencies == {target_currency}:
+        return rows
+    rates = rates or await amazon_usd_exchange_rates(rate_date, needed_currencies)
+    for row in rows:
+        currency = str(row.get("currency") or target_currency).strip().upper()
+        if currency == target_currency:
+            continue
+        rate = rates.get(currency)
+        if rate is None:
+            raise RuntimeError(f"销售看板金额缺少 {currency} 到 {target_currency} 的汇率")
+        for key in ("net_sales", "ad_sales", "ad_cost"):
+            value = row.get(key)
+            if value is not None:
+                row[key] = float(value) * rate
+        if row.get("source_cpc") is not None:
+            row["source_cpc"] = float(row["source_cpc"]) * rate
+        row["currency"] = target_currency
+        clicks = row.get("clicks")
+        net_sales = row.get("net_sales")
+        ad_sales = row.get("ad_sales")
+        ad_orders = row.get("ad_orders")
+        row["cpc"] = row["ad_cost"] / clicks if row.get("ad_cost") is not None and clicks else None
+        row["acoas"] = row["ad_cost"] / net_sales if row.get("ad_cost") is not None and net_sales else None
+        row["acos"] = row["ad_cost"] / ad_sales if row.get("ad_cost") is not None and ad_sales else None
+        row["cpo"] = row["ad_cost"] / ad_orders if row.get("ad_cost") is not None and ad_orders else None
+    return rows
+
+
+def amazon_sales_validate_money_reconciliation(
+    rows: list[dict[str, Any]],
+    campaign_costs: dict[tuple[str, str], float],
+) -> dict[str, Any]:
+    """Fail closed for authoritative campaign/site pairs when sources disagree."""
+    currencies = {str(row.get("currency") or "") for row in rows if row.get("currency")}
+    if len(currencies) > 1:
+        raise RuntimeError(f"销售看板实际值存在多币种，拒绝相加：{', '.join(sorted(currencies))}")
+
+    product_costs: dict[tuple[str, str], float] = {}
+    for row in rows:
+        key = (str(row.get("site") or ""), str(row.get("series") or ""))
+        value = row.get("ad_cost")
+        if value is not None:
+            product_costs[key] = product_costs.get(key, 0.0) + float(value)
+
+    checks: list[dict[str, Any]] = []
+    # Only campaign-authoritative site/series pairs are checked. Sites with
+    # unclassified campaign spend remain on product-performance money because
+    # forcing those campaigns into a series would create a worse attribution
+    # error; that fallback is exposed through data_quality instead.
+    for key in sorted(campaign_costs):
+        campaign_value = float(campaign_costs.get(key, 0.0))
+        product_value = float(product_costs.get(key, 0.0))
+        difference = abs(campaign_value - product_value)
+        tolerance = max(50.0, 0.1 * max(abs(campaign_value), abs(product_value)))
+        passed = difference <= tolerance
+        checks.append({
+            "site": key[0],
+            "series": key[1],
+            "campaign_report": campaign_value,
+            "product_performance": product_value,
+            "difference": difference,
+            "tolerance": tolerance,
+            "passed": passed,
+        })
+        if not passed:
+            raise RuntimeError(
+                f"广告金额交叉校验失败：{key[0]} {key[1]} "
+                f"广告活动 {campaign_value:.2f} / 产品表现 {product_value:.2f}"
+            )
+    return {
+        "source": "campaign_report_vs_product_performance",
+        "complete": True,
+        "checks": checks,
+    }
 
 
 def amazon_sales_apply_campaign_ad_cost(
@@ -773,6 +893,8 @@ def amazon_sales_apply_campaign_ad_cost(
         groups.setdefault((str(row.get("site") or ""), str(row.get("series") or "")), []).append(index)
 
     for key, indexes in groups.items():
+        if key not in campaign_costs:
+            continue
         authoritative_cost = float(campaign_costs.get(key, 0.0))
         current_values = [float(rows[index].get("ad_cost") or 0.0) for index in indexes]
         weight_sum = sum(current_values)
@@ -860,9 +982,14 @@ async def amazon_sales_actual_rows(
         store_rows = []
     if refresh:
         _amazon_cache.clear()
-    # A single site reports in that site's native marketplace currency.  The
-    # all-sites rollup needs one common currency, so it stays in USD.
+    # A single site reports in that site's native marketplace currency.  For
+    # all sites, fetch product performance in native currency and convert it
+    # with the same FX source/date used by the campaign report.
     requested_currency = amazon_sales_currency(selected_sites)
+    # "native" is an internal multi-site mode: keep each site in its own
+    # marketplace currency first, then convert all rows once below. The public
+    # original-currency mode intentionally rejects a multi-site rollup.
+    performance_currency = "native" if len(selected_sites) > 1 else requested_currency
     periodic = await amazon_dashboard_periodic(
         comparison,
         period_start,
@@ -872,7 +999,10 @@ async def amazon_sales_actual_rows(
         products,
         sid_map,
         store_rows,
-        requested_currency,
+        performance_currency,
+    )
+    periodic_rows = await amazon_convert_sales_money_rows(
+        periodic["rows"], requested_currency, actual_end,
     )
     campaign_costs, campaign_quality = await amazon_sales_campaign_cost_by_series(
         period_start,
@@ -884,10 +1014,12 @@ async def amazon_sales_actual_rows(
         requested_currency,
         refresh,
     )
-    rows = amazon_sales_apply_campaign_ad_cost(periodic["rows"], campaign_costs)
+    reconciliation = amazon_sales_validate_money_reconciliation(periodic_rows, campaign_costs)
+    rows = amazon_sales_apply_campaign_ad_cost(periodic_rows, campaign_costs)
     data_quality = dict(periodic.get("data_quality") or {})
-    data_quality["ad_money_source"] = "campaign_report"
+    data_quality["ad_money_source"] = str(campaign_quality.get("campaign_money_mode") or "campaign_report")
     data_quality["campaign_money_quality"] = campaign_quality
+    data_quality["money_reconciliation"] = reconciliation
     return rows, data_quality
 
 
@@ -2360,13 +2492,20 @@ async def amazon_dashboard_periodic(
     selected_sites = list(dict.fromkeys(item for item in selected_sites if item in AMAZON_SITE_CODES)) or list(AMAZON_SITE_CODES)
     is_multi_site = len(selected_sites) > 1
     requested_currency = str(display_currency or "original").upper()
+    currency_mode = requested_currency
+    if requested_currency == "NATIVE":
+        # Internal sales-dashboard mode. It keeps site rows separate while the
+        # caller performs one final conversion into its rollup currency.
+        requested_currency = "native"
     if requested_currency == "ORIGINAL":
         requested_currency = "original"
-    if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
+    if is_multi_site and requested_currency in ("original",):
+        raise ValueError("多站点汇总必须选择统一货币，不能直接相加原币种")
+    if requested_currency not in ("original", "native") and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v6-pv", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    cache_key = ("periodic-dashboard-v7-currency-normalized", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         return cached[1]
@@ -2378,7 +2517,7 @@ async def amazon_dashboard_periodic(
             if not accounts:
                 return site_name, site_code, AMAZON_CURRENCY_CODES.get(site_name, "USD"), []
             native_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
-            query_currency = native_currency if requested_currency == "original" else requested_currency
+            query_currency = native_currency if requested_currency in ("original", "native") else requested_currency
             # Translate the UI's product selection back to the site's mapped
             # ASINs so LingXing can filter at the source. Keep a full request
             # for "all products"; an empty mapped result intentionally yields
@@ -2417,7 +2556,7 @@ async def amazon_dashboard_periodic(
                 for row in performance_rows:
                     row["_source"] = "performance"
                 all_rows.extend(performance_rows)
-            return site_name, site_code, query_currency, all_rows
+            return site_name, site_code, native_currency, all_rows
 
         results = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
@@ -2526,11 +2665,47 @@ async def amazon_dashboard_periodic(
             "page_views": int(page_views) if page_views is not None else None,
             "ad_breakdown": item.get("ad_breakdown", {}),
         })
-    output_currency = requested_currency if requested_currency != "original" else (AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD") if len(selected_sites) == 1 else "original")
+    # Product performance can label all marketplace money as CNY regardless of
+    # the requested currency. Normalize from that settlement currency to the
+    # requested/native currency before any endpoint aggregates rows.
+    row_rates: dict[str, float] | None = None
+    if requested_currency == "native":
+        by_site: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_site.setdefault(str(row.get("site") or ""), []).append(row)
+        needed = {
+            str(row.get("currency") or "").strip().upper()
+            for row in rows
+            if str(row.get("currency") or "").strip()
+        } | {AMAZON_CURRENCY_CODES.get(site, "USD") for site in by_site}
+        row_rates = await amazon_usd_exchange_rates(end_date, needed) if needed else None
+        for site, site_rows in by_site.items():
+            rows_for_site = site_rows
+            await amazon_convert_sales_money_rows(
+                rows_for_site,
+                AMAZON_CURRENCY_CODES.get(site, "USD"),
+                end_date,
+                row_rates,
+            )
+    else:
+        target_currency = requested_currency if requested_currency != "original" else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD")
+        needed = {
+            str(row.get("currency") or "").strip().upper()
+            for row in rows
+            if str(row.get("currency") or "").strip()
+        } | ({target_currency} if rows else set())
+        row_rates = await amazon_usd_exchange_rates(end_date, needed) if needed else None
+        await amazon_convert_sales_money_rows(rows, target_currency, end_date, row_rates)
+
+    output_currency = (
+        "native"
+        if requested_currency == "native"
+        else requested_currency if requested_currency != "original" else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD")
+    )
     response = {
         "period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()},
         "currency": output_currency,
-        "currency_mode": requested_currency,
+        "currency_mode": currency_mode.lower(),
         "selected_sites": selected_sites,
         "filters": {"site": selected_sites, "series": list(selected_series), "products": list(selected_products)},
         "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods],
@@ -3246,6 +3421,21 @@ async def amazon_strategy_board_payload(
         for item in db.scalars(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
             notes[(item.week_start, item.site_code, item.series, normalize_strategy(item.strategy))] = item.note
 
+    # A store-specific assignment must override a legacy site-wide assignment,
+    # but an empty field on the specific row should not hide the useful legacy
+    # value. Merge non-empty fields so old classifications continue to cover
+    # new store accounts instead of creating false "unassigned" campaigns.
+    for exact_key in list(assignments):
+        _, store_sid, campaign_id = exact_key
+        if not store_sid:
+            continue
+        generic = assignments.get((exact_key[0], "", campaign_id))
+        if not generic:
+            continue
+        merged = dict(generic)
+        merged.update({key: value for key, value in assignments[exact_key].items() if value not in ("", None)})
+        assignments[exact_key] = merged
+
     aggregate: dict[tuple[str, str, str], dict[str, Any]] = {}
     for site_name, site_code, raw_rows, _ in fetched:
         for raw in raw_rows:
@@ -3271,8 +3461,22 @@ async def amazon_strategy_board_payload(
                 item["metrics"][name] += value
 
     week_scope = normalize_week_start(start_date)
+    unassigned_campaign_spend: dict[tuple[str, str], float] = {}
+    for (site_code, store_sid, campaign_id), item in aggregate.items():
+        assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
+        series = assignment.get("series", "") if assignment.get("series", "") in AMAZON_SERIES else ""
+        if not series:
+            key = (item["site"], str(item.get("currency") or "USD"))
+            value = float(item.get("metrics", {}).get("ad_cost") or 0)
+            if value:
+                unassigned_campaign_spend[key] = unassigned_campaign_spend.get(key, 0.0) + value
     output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
     data_quality = _strategy_campaign_data_quality(fetched)
+    data_quality["unassigned_campaign_spend"] = {
+        f"{site}|{currency}": value
+        for (site, currency), value in unassigned_campaign_spend.items()
+        if value > 0.01
+    }
     response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": data_quality}
     # A degraded OpenAPI response must not occupy the normal 10-minute slot.
     # Leaving it uncached makes the next request retry the authoritative MCP
@@ -3492,6 +3696,13 @@ def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
     """Collapse product/site rows into the three weekly ad-chart datasets."""
 
     additive = ("net_sales", "ad_sales", "ad_cost", "clicks", "ad_orders", "sessions", "page_views")
+    currencies = {
+        str(source.get("currency") or "").strip().upper()
+        for source in periodic.get("rows", [])
+        if str(source.get("currency") or "").strip()
+    }
+    if len(currencies) > 1:
+        raise ValueError(f"广告周度图表存在多币种，拒绝相加：{', '.join(sorted(currencies))}")
     grouped: dict[str, dict[str, Any]] = {}
     for source in periodic.get("rows", []):
         period_start = str(source.get("period_start") or "")
@@ -3758,6 +3969,8 @@ async def amazon_dashboard(
         requested_currency = "original"
     if requested_currency != "original" and requested_currency not in AMAZON_SUPPORTED_CURRENCIES:
         raise HTTPException(status_code=422, detail="不支持的货币")
+    if len(selected_sites) > 1 and requested_currency == "original":
+        raise HTTPException(status_code=422, detail="多站点汇总必须选择统一货币，不能直接相加原币种")
     if (start_date is None) != (end_date is None):
         raise HTTPException(status_code=422, detail="开始日期和结束日期需要同时提供")
     if start_date is None:

@@ -6,7 +6,7 @@ import WeekPicker from "./WeekPicker.vue"
 
 const props = defineProps({ apiBase: { type: String, default: "" } })
 const SITE_ORDER = ["美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
-const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总"]
+const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总", "TN20系列（小链接）汇总"]
 const STRATEGIES = ["品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/"]
 const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr", MXN: "MX$", PLN: "zł" }
 const rows = ref([]); const stores = ref([]); const seriesOptions = ref([...DEFAULT_SERIES])
@@ -34,6 +34,8 @@ const strategyWeekRangeLabel = computed(() => `${formatDotDate(strategyWeekStart
 const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })).sort((a, b) => compare(a.metrics?.[sort.value.key], b.metrics?.[sort.value.key], sort.value.direction)))
 const summaryMetrics = computed(() => {
   const total = { clicks: 0, ad_cost: 0, ad_sales: 0, ad_orders: 0, ad_units: 0 }
+  const currencies = [...new Set(rows.value.map((row) => row.currency).filter(Boolean))]
+  const mixedCurrency = currencies.length > 1
   rows.value.forEach((row) => {
     const metrics = row.metrics || {}
     const clicks = Number(metrics.clicks) || 0
@@ -45,22 +47,22 @@ const summaryMetrics = computed(() => {
   })
   return {
     clicks: Math.round(total.clicks),
-    cpc: total.clicks ? total.ad_cost / total.clicks : null,
-    ad_cost: total.ad_cost,
-    ad_sales: total.ad_sales,
+    cpc: mixedCurrency ? null : total.clicks ? total.ad_cost / total.clicks : null,
+    ad_cost: mixedCurrency ? null : total.ad_cost,
+    ad_sales: mixedCurrency ? null : total.ad_sales,
     ad_orders: total.ad_orders,
     ad_units: total.ad_units,
-    acos: total.ad_sales ? total.ad_cost / total.ad_sales : null,
-    roas: total.ad_cost ? total.ad_sales / total.ad_cost : null,
+    acos: mixedCurrency ? null : total.ad_sales ? total.ad_cost / total.ad_sales : null,
+    roas: mixedCurrency ? null : total.ad_cost ? total.ad_sales / total.ad_cost : null,
     ad_cvr: total.clicks ? total.ad_orders / total.clicks : null,
   }
 })
-const summaryCurrency = computed(() => rows.value[0]?.currency || "")
+const summaryCurrency = computed(() => new Set(rows.value.map((row) => row.currency).filter(Boolean)).size > 1 ? "MIXED" : rows.value[0]?.currency || "")
 function previousWeekStart() { const date = new Date(); date.setHours(0, 0, 0, 0); date.setDate(date.getDate() - ((date.getDay() + 6) % 7) - 7); return formatLocalDate(date) }
 function monday(value) { const date = new Date(`${value}T00:00:00`); if (Number.isNaN(date.getTime())) return previousWeekStart(); date.setDate(date.getDate() - ((date.getDay() + 6) % 7)); return formatLocalDate(date) }
 function compare(left, right, direction) { const a = Number(left); const b = Number(right); if (Number.isNaN(a) && Number.isNaN(b)) return 0; if (Number.isNaN(a)) return 1; if (Number.isNaN(b)) return -1; return direction === "asc" ? a - b : b - a }
 function display(value, column, currency) { if (value == null) return "—"; if (column.percent) return `${(Number(value) * 100).toFixed(2)}%`; if (column.money) return `${currencySymbols[currency] || currency || ""} ${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`; return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 }) }
-function displaySeries(value) { return ({ "TN10系列（主链接）汇总": "TN10（主）", "TN10系列（小链接）汇总": "TN10（小）", "TN20系列（主链接）汇总": "TN20（主）" }[value] || value || "") }
+function displaySeries(value) { return ({ "TN10系列（主链接）汇总": "TN10（主）", "TN10系列（小链接）汇总": "TN10（小）", "TN20系列（主链接）汇总": "TN20（主）", "TN20系列（小链接）汇总": "TN20（小）" }[value] || value || "") }
 function groupMeta(row) { return [row.series ? displaySeries(row.series) : "", row.site, `${row.campaigns.length} 个活动`].filter(Boolean).join(" · ") }
 function groupKey(row) { return `${row.site_code}:${row.strategy}:${row.series || ""}:${row.product || ""}` }; function noteKey(row) { return `${strategyWeekStart.value}:${groupKey(row)}` }
 function toggle(row) { const next = new Set(expanded.value); const key = groupKey(row); next.has(key) ? next.delete(key) : next.add(key); expanded.value = next }
