@@ -115,7 +115,7 @@ DEFAULT_SYNC_COOLDOWN_SECONDS = 600
 AMAZON_STRATEGY_OPTIONS = ("品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/")
 
 LINGXING_API_BASE = "https://openapi.lingxing.com"
-XIYOU_API_BASE = os.environ.get("XIYOU_API_BASE", "https://openapi.xydc.com").rstrip("/")
+XIYOU_API_BASE = os.environ.get("XIYOU_API_BASE", "https://api.sellersprite.com").rstrip("/")
 LINGXING_MCP_URL = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
 LINGXING_MCP_PRODUCT_TOOL = "query_product_performance_asin_lists"
 LINGXING_MCP_CAMPAIGN_TOOL = "ad_campaign_report"
@@ -3877,6 +3877,12 @@ def keyword_date_value(value: Any) -> date | None:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)):
+        try:
+            seconds = value / (1000 if value >= 100_000_000_000 else 1)
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).date()
+        except (OverflowError, OSError, ValueError):
+            return None
     text = str(value).strip()[:10].replace(".", "-").replace("/", "-")
     try:
         return date.fromisoformat(text)
@@ -3889,7 +3895,7 @@ def xiyou_business_payload(payload: dict[str, Any]) -> Any:
 
     code = payload.get("code")
     success = payload.get("success")
-    successful_code = code in (None, 0, 200, "0", "200", "success", "SUCCESS")
+    successful_code = code in (None, 0, 200, "0", "200", "OK", "success", "SUCCESS")
     if success is False or (code is not None and not successful_code):
         message = payload.get("msg") or payload.get("message") or f"错误码 {code}"
         raise RuntimeError(f"西柚接口返回错误：{message}")
@@ -3901,16 +3907,17 @@ def xiyou_business_payload(payload: dict[str, Any]) -> Any:
     return data
 
 
-def xiyou_weekly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Parse Xiyou's weekly ABA response without guessing a single schema.
+def xiyou_weekly_records(payload: dict[str, Any], term: str | None = None) -> list[dict[str, Any]]:
+    """Parse SellerSprite (Xiyou) weekly ABA trend records.
 
-    The endpoint documentation exposes ``searchFrequencyRank`` and
-    ``weeklySearchVolume``.  Its nesting, however, has changed between API
-    revisions, so walk the business payload and keep every dated record that
-    carries either field.
+    The open-platform contract returns a flat ``data`` list whose records use
+    ``date`` (a millisecond timestamp), ``rank``, and ``searches``.  Keep a
+    small compatibility layer for earlier mock responses so deployments can be
+    rolled back without losing parsing coverage.
     """
 
     records: list[dict[str, Any]] = []
+    normalized_term = normalize_keyword(term) if term else None
 
     def first_value(source: dict[str, Any], keys: tuple[str, ...]) -> Any:
         for key in keys:
@@ -3925,7 +3932,7 @@ def xiyou_weekly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
             return
         if not isinstance(value, dict):
             return
-        term = first_value(value, ("searchTerm", "searchTerms", "keyword", "keywordName")) or term_hint
+        term = first_value(value, ("searchTerm", "searchTerms", "keyword", "keywordName")) or normalized_term or term_hint
         term = normalize_keyword(term) if term else term_hint
         nested = False
         for key in ("weeklyData", "weekly_data", "trends", "list", "records", "rows", "items", "data"):
@@ -3934,8 +3941,8 @@ def xiyou_weekly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 nested = True
                 walk(child, term)
         rank = first_value(value, ("searchFrequencyRank", "searchFrequencyRankWeekly", "rank"))
-        volume = first_value(value, ("weeklySearchVolume", "searchVolumeWeekly", "searchVolume"))
-        report_date = keyword_date_value(first_value(value, ("reportFromDate", "startDate", "reportStart", "weekStart")))
+        volume = first_value(value, ("searches", "weeklySearchVolume", "searchVolumeWeekly", "searchVolume"))
+        report_date = keyword_date_value(first_value(value, ("date", "reportFromDate", "startDate", "reportStart", "weekStart")))
         if report_date and (rank is not None or volume is not None):
             try:
                 rank_number = int(rank) if rank is not None else None
@@ -4021,15 +4028,14 @@ async def fetch_xiyou_weekly_records(
     if not api_key:
         raise RuntimeError("西柚 API Key 尚未配置")
 
-    async def request(client_value: httpx.AsyncClient) -> list[dict[str, Any]]:
+    async def request(client_value: httpx.AsyncClient, keyword: str) -> list[dict[str, Any]]:
         response = await client_value.post(
-            f"{XIYOU_API_BASE}/v1/searchTerms/abaReport/trends/weekly",
-            headers={"X-Auth-Version": "2.0", "X-Api-Key": api_key},
+            f"{XIYOU_API_BASE}/v1/aba/research/trends",
+            headers={"secret-key": api_key},
             json={
-                "country": country,
-                "searchTerms": terms,
-                "startWeek": {"startDate": start.isoformat(), "endDate": (start + timedelta(days=6)).isoformat()},
-                "endWeek": {"startDate": end.isoformat(), "endDate": (end + timedelta(days=6)).isoformat()},
+                "marketplace": country,
+                "keyword": keyword,
+                "timeGranularity": "W",
             },
         )
         if response.status_code == 401:
@@ -4046,12 +4052,38 @@ async def fetch_xiyou_weekly_records(
         if response.status_code >= 400:
             message = payload.get("msg") or payload.get("message") or response.text[:200]
             raise RuntimeError(f"西柚接口请求失败：HTTP {response.status_code} {message}")
-        return xiyou_weekly_records(payload)
+        return xiyou_weekly_records(payload, keyword)
 
     if client is not None:
-        return await request(client)
-    async with httpx.AsyncClient(timeout=45) as created:
-        return await request(created)
+        client_value = client
+    else:
+        client_value = httpx.AsyncClient(timeout=45)
+
+    async def request_all() -> list[dict[str, Any]]:
+        # This endpoint accepts one keyword per request.  Keep concurrency small
+        # to avoid tripping SellerSprite rate limits while remaining responsive
+        # for the maximum configured keyword list.
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_one(keyword: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                records = await request(client_value, keyword)
+                return [
+                    record for record in records
+                    if start <= record["week_start"] <= end
+                ]
+
+        return [
+            record
+            for term_records in await asyncio.gather(*(fetch_one(term) for term in terms))
+            for record in term_records
+        ]
+
+    try:
+        return await request_all()
+    finally:
+        if client is None:
+            await client_value.aclose()
 
 
 def keyword_terms_payload(rows: list[KeywordDashboardTerm]) -> list[dict[str, Any]]:

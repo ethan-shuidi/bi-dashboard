@@ -20,27 +20,15 @@ from app import (
 class KeywordDashboardTests(unittest.TestCase):
     def test_xiyou_nested_response_is_parsed_with_null_gaps(self):
         records = xiyou_weekly_records({
-            "code": 200,
-            "data": {
-                "list": [{
-                    "searchTerm": "  power   bank  ",
-                    "weeklyData": [
-                        {
-                            "reportFromDate": "2026-09-07",
-                            "searchFrequencyRank": "12",
-                            "weeklySearchVolume": "34500",
-                        },
-                        {
-                            "reportFromDate": "2026-09-21",
-                            "searchFrequencyRank": "9",
-                            "weeklySearchVolume": "41200",
-                        },
-                    ],
-                }],
-            },
-        })
+            "code": "OK",
+            "message": "成功",
+            "data": [
+                {"date": 1793577600000, "rank": 12, "searches": 34500, "label": 202645},
+                {"date": 1790294400000, "rank": 9, "searches": 41200, "label": 202639},
+            ],
+        }, "  power   bank  ")
         self.assertEqual(records, [
-            {"keyword": "power bank", "week_start": date(2026, 9, 7), "rank": 12, "volume": 34500},
+            {"keyword": "power bank", "week_start": date(2026, 11, 2), "rank": 12, "volume": 34500},
             {"keyword": "power bank", "week_start": date(2026, 9, 21), "rank": 9, "volume": 41200},
         ])
 
@@ -53,12 +41,12 @@ class KeywordDashboardTests(unittest.TestCase):
         )
         rows = keyword_dashboard_rows(
             [term],
-            keyword_week_columns(date(2026, 9, 7), date(2026, 9, 21)),
+            keyword_week_columns(date(2026, 9, 21), date(2026, 11, 2)),
             records,
         )
         self.assertEqual(rows[0]["weekly"][1]["search_rank"], None)
         self.assertEqual(rows[0]["weekly"][1]["search_volume"], None)
-        self.assertEqual(rows[0]["rank_change"], -3)
+        self.assertEqual(rows[0]["rank_change"], 3)
 
     def test_fetch_xiyou_uses_server_key_and_turns_401_into_business_error(self):
         client = AsyncMock()
@@ -67,12 +55,17 @@ class KeywordDashboardTests(unittest.TestCase):
             request=httpx.Request("POST", "https://example.test/weekly"),
             json={"code": "APICredentialNotFound", "msg": "invalid key"},
         )
-        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key", "XIYOU_API_BASE": "https://example.test"}):
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"):
             with self.assertRaisesRegex(RuntimeError, "无效或未授权"):
                 asyncio.run(fetch_xiyou_weekly_records("US", ["power bank"], date(2026, 9, 7), date(2026, 9, 14), client))
-        headers = client.post.call_args.kwargs["headers"]
-        self.assertEqual(headers["X-Auth-Version"], "2.0")
-        self.assertEqual(headers["X-Api-Key"], "server-only-test-key")
+        request = client.post.call_args
+        self.assertEqual(request.args[0], "https://example.test/v1/aba/research/trends")
+        self.assertEqual(request.kwargs["headers"], {"secret-key": "server-only-test-key"})
+        self.assertEqual(request.kwargs["json"], {
+            "marketplace": "US",
+            "keyword": "power bank",
+            "timeGranularity": "W",
+        })
 
     def test_rejects_all_site_and_ranges_over_52_weeks(self):
         client = TestClient(app)
