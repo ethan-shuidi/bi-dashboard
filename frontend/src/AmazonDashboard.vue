@@ -437,6 +437,15 @@ function selectOnlySite(value) {
 
 const showPeriodTotals = computed(() => summaryOnly.value || (selectedSeries.value.length !== 1 && (site.value.length <= 1 || currency.value !== "original")))
 
+function rowHasMetricData(metrics) {
+  return dataColumns.value.some((column) => {
+    const value = metricValue(metrics, column.key)
+    if (value == null || value === "") return false
+    const numericValue = Number(value)
+    return Number.isFinite(numericValue) ? numericValue !== 0 : true
+  })
+}
+
 const displayRows = computed(() => {
   const grouped = new Map()
   for (const row of rows.value) {
@@ -494,11 +503,9 @@ const displayRows = computed(() => {
     if (showPeriodTotals.value) {
       periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
     }
-    if (periodRows.length) periodRows[0].periodFirst = true
-    result.push(...periodRows)
+    result.push(...periodRows.filter((row) => rowHasMetricData(row.metrics)))
   }
-  if (!summaryOnly.value) return result
-  const summaryRows = result.filter((row) => row.type === "period-total")
+  const summaryRows = summaryOnly.value ? result.filter((row) => row.type === "period-total") : result
   const displayedPeriods = new Set()
   for (const row of summaryRows) {
     row.periodFirst = !displayedPeriods.has(row.period)
