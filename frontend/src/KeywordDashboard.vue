@@ -32,10 +32,10 @@ function isoDate(value) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`
 }
 
-function monday(value) {
+function keywordWeekStart(value) {
   const date = parseDate(value)
   date.setHours(0, 0, 0, 0)
-  date.setDate(date.getDate() - ((date.getDay() + 6) % 7))
+  date.setDate(date.getDate() - date.getDay())
   return date
 }
 
@@ -46,21 +46,21 @@ function addDays(value, amount) {
 }
 
 function isoWeek(value) {
-  const start = monday(value)
-  const thursday = addDays(start, 3)
-  const firstThursday = new Date(thursday.getFullYear(), 0, 4)
-  const firstMonday = monday(firstThursday)
-  return Math.floor((start - firstMonday) / 604800000) + 1
+  const anchor = addDays(keywordWeekStart(value), 4)
+  const firstThursday = new Date(anchor.getFullYear(), 0, 4)
+  const firstMonday = new Date(firstThursday)
+  firstMonday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7))
+  return Math.floor((anchor - firstMonday) / 604800000) + 1
 }
 
 function applyQuickRange(weekCount) {
-  const end = monday(new Date())
+  const end = keywordWeekStart(new Date())
   endWeek.value = isoDate(end)
   startWeek.value = isoDate(addDays(end, -(Number(weekCount) - 1) * 7))
 }
 
 function syncQuickRange() {
-  const currentWeek = monday(new Date())
+  const currentWeek = keywordWeekStart(new Date())
   const matched = quickRangeOptions.find(({ value }) => (
     startWeek.value === isoDate(addDays(currentWeek, -(value - 1) * 7)) &&
     endWeek.value === isoDate(currentWeek)
@@ -285,8 +285,8 @@ onMounted(loadAll)
           <option v-for="item in quickRangeOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
         </select>
       </label>
-      <label><span>开始周</span><WeekPicker v-model="startWeek" /></label>
-      <label><span>结束周</span><WeekPicker v-model="endWeek" /></label>
+      <label><span>开始周</span><WeekPicker v-model="startWeek" :week-starts-on="0" /></label>
+      <label><span>结束周</span><WeekPicker v-model="endWeek" :week-starts-on="0" /></label>
       <label>
         <span>站点</span>
         <select :value="site" @change="changeSite($event.target.value)">

@@ -1,31 +1,52 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 
-const props = defineProps({ modelValue: { type: String, default: "" } })
+const props = defineProps({
+  modelValue: { type: String, default: "" },
+  weekStartsOn: { type: Number, default: 1, validator: (value) => [0, 1].includes(value) },
+})
 const emit = defineEmits(["update:modelValue", "change"])
 const open = ref(false)
 const viewDate = ref(parseDate(props.modelValue) || new Date())
 const hoverDate = ref(null)
 const root = ref(null)
-const weekdays = ["一", "二", "三", "四", "五", "六", "日"]
+const weekdayNames = ["日", "一", "二", "三", "四", "五", "六"]
+const weekdays = computed(() => [...weekdayNames.slice(props.weekStartsOn), ...weekdayNames.slice(0, props.weekStartsOn)])
 
 function parseDate(value) { if (!value) return null; const date = new Date(`${value}T00:00:00`); return Number.isNaN(date.getTime()) ? null : date }
 function pad(value) { return String(value).padStart(2, "0") }
 function formatDate(date) { return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` }
-function monday(date) { const result = new Date(date); result.setHours(0, 0, 0, 0); result.setDate(result.getDate() - ((result.getDay() + 6) % 7)); return result }
+function weekStart(date) {
+  const result = new Date(date)
+  result.setHours(0, 0, 0, 0)
+  result.setDate(result.getDate() - ((result.getDay() - props.weekStartsOn + 7) % 7))
+  return result
+}
 function addDays(date, amount) { const result = new Date(date); result.setDate(result.getDate() + amount); return result }
 function sameDay(left, right) { return left && right && formatDate(left) === formatDate(right) }
-function weekStartFor(date) { return monday(date) }
+function weekStartFor(date) { return weekStart(date) }
 function inWeek(date, start) { return date >= start && date <= addDays(start, 6) }
-function isoWeek(date) { const start = monday(date); const thursday = addDays(start, 3); const firstThursday = new Date(thursday.getFullYear(), 0, 4); const firstMonday = monday(firstThursday); return Math.floor((start - firstMonday) / 604800000) + 1 }
+function isoWeek(date) {
+  const start = weekStart(date)
+  const anchor = addDays(start, (4 - props.weekStartsOn + 7) % 7)
+  const firstThursday = new Date(anchor.getFullYear(), 0, 4)
+  const firstMonday = new Date(firstThursday)
+  firstMonday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7))
+  return Math.floor((anchor - firstMonday) / 604800000) + 1
+}
+
+function isoWeekYear(date) {
+  const start = weekStart(date)
+  return addDays(start, (4 - props.weekStartsOn + 7) % 7).getFullYear()
+}
 
 const selectedDate = computed(() => parseDate(props.modelValue) || new Date())
 const selectedWeekStart = computed(() => weekStartFor(selectedDate.value))
 const hoverWeekStart = computed(() => hoverDate.value ? weekStartFor(hoverDate.value) : null)
-const displayValue = computed(() => `${selectedWeekStart.value.getFullYear()}年第${pad(isoWeek(selectedWeekStart.value))}周`)
+const displayValue = computed(() => `${isoWeekYear(selectedWeekStart.value)}年第${pad(isoWeek(selectedWeekStart.value))}周`)
 const cells = computed(() => {
   const firstOfMonth = new Date(viewDate.value.getFullYear(), viewDate.value.getMonth(), 1)
-  const start = monday(firstOfMonth)
+  const start = weekStart(firstOfMonth)
   return Array.from({ length: 42 }, (_, index) => {
     const date = addDays(start, index)
     return { date, key: formatDate(date), day: date.getDate(), outside: date.getMonth() !== viewDate.value.getMonth() }
