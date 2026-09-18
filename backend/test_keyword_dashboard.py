@@ -101,6 +101,16 @@ class KeywordDashboardTests(unittest.TestCase):
         self.assertEqual([row["keyword"] for row in rows], ["comu", "ai", "pocket"])
         self.assertEqual(KEYWORD_CATEGORIES[0], "comu品牌词")
 
+    def test_keyword_rows_use_latest_present_rank_when_tail_week_is_empty(self):
+        term = KeywordDashboardTerm(id=1, site_code="US", category="AI核心词", keyword="power bank", sort_order=0)
+        rows = keyword_dashboard_rows(
+            [term],
+            keyword_week_columns(date(2026, 9, 13), date(2026, 9, 27)),
+            [{"keyword": "power bank", "week_start": date(2026, 9, 20), "rank": 7, "volume": 100}],
+        )
+        self.assertEqual(rows[0]["latest_search_rank"], 7)
+        self.assertEqual(rows[0]["rank_change"], None)
+
     def test_fetch_xiyou_uses_official_batched_contract_and_server_key(self):
         client = AsyncMock()
         client.post.return_value = httpx.Response(

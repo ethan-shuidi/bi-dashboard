@@ -1503,6 +1503,7 @@ async def fetch_ad_reports_range(
     show_detail: int = 1,
 ) -> list[dict[str, Any]]:
     """Read dated advertising reports, serializing requests for LingXing's rate limit."""
+    periodic: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
     cursor = start_date
     while cursor <= end_date:
@@ -4084,7 +4085,7 @@ def keyword_dashboard_rows(
         rank_change = None
         if len(present_ranks) >= 2:
             rank_change = present_ranks[-1] - present_ranks[-2]
-        latest_rank = weekly[-1]["search_rank"] if weekly else None
+        latest_rank = present_ranks[-1] if present_ranks else None
         output.append({
             "id": term.id,
             "site_code": term.site_code,
@@ -4402,6 +4403,12 @@ async def keyword_dashboard(
     week_count = (end - start).days // 7 + 1
     if week_count > 52:
         raise HTTPException(status_code=422, detail="关键词看板最多支持 52 周")
+    latest_completed_start = latest_completed_keyword_week_start()
+    # Xiyou rejects ranges containing an in-progress week. Clamping keeps API
+    # callers and a page left open across a week boundary from repeatedly
+    # spending credits on a range that can never return data.
+    start = min(start, latest_completed_start)
+    end = min(end, latest_completed_start)
 
     weeks = keyword_week_columns(start, end)
     with session_factory()() as db:
@@ -4511,7 +4518,11 @@ async def keyword_dashboard(
     }
 
 
-def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
+def amazon_ads_chart_rows(
+    periodic: dict[str, Any],
+    range_start: date | None = None,
+    range_end: date | None = None,
+) -> list[dict[str, Any]]:
     """Collapse product/site rows into the three weekly ad-chart datasets."""
 
     additive = ("net_sales", "ad_sales", "ad_cost", "clicks", "ad_orders", "sessions", "page_views")
@@ -4541,8 +4552,45 @@ def amazon_ads_chart_rows(periodic: dict[str, Any]) -> list[dict[str, Any]]:
                 item[key] += float(value)
                 item[f"{key}_present"] = True
 
+    requested_weeks: list[date] | None = None
+    if range_start is not None and range_end is not None:
+        normalized_start = normalize_week_start(range_start)
+        normalized_end = normalize_week_start(range_end)
+        if normalized_start > normalized_end:
+            raise ValueError("广告周度图表周范围无效")
+        requested_weeks = [
+            normalized_start + timedelta(days=offset * 7)
+            for offset in range((normalized_end - normalized_start).days // 7 + 1)
+        ]
+
     output: list[dict[str, Any]] = []
-    for item in sorted(grouped.values(), key=lambda row: row["period_start"]):
+    grouped_items = (
+        [grouped.get(week.isoformat()) for week in requested_weeks]
+        if requested_weeks is not None
+        else sorted(grouped.values(), key=lambda row: row["period_start"])
+    )
+    for index, item in enumerate(grouped_items):
+        if item is None:
+            week_start_value = requested_weeks[index] if requested_weeks is not None else None
+            if week_start_value is None:
+                continue
+            week_end_value = week_start_value + timedelta(days=6)
+            output.append({
+                "period": f"{week_start_value.isoformat()}~{week_end_value.isoformat()}",
+                "period_start": week_start_value.isoformat(),
+                "period_end": week_end_value.isoformat(),
+                "week_label": amazon_week_label(week_start_value.isoformat()),
+                "net_sales": None,
+                "ad_sales": None,
+                "ad_cost": None,
+                "fee_ratio": None,
+                "clicks": None,
+                "ad_orders": None,
+                "ad_cvr": None,
+                "sessions": None,
+                "page_views": None,
+            })
+            continue
         net_sales = item["net_sales"] if item["net_sales_present"] else None
         ad_sales = item["ad_sales"] if item["ad_sales_present"] else None
         ad_cost = item["ad_cost"] if item["ad_cost_present"] else None
@@ -4638,13 +4686,13 @@ async def amazon_ads_charts(
                 store_rows,
                 "USD" if len(selected_sites) > 1 else "original",
             )
-            rows = amazon_ads_chart_rows(periodic)
             data_quality = dict(periodic.get("data_quality") or {})
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+                raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
 
+    rows = amazon_ads_chart_rows(periodic, start, end)
     sessions_present = any(row.get("sessions") is not None for row in rows)
     page_views_present = any(row.get("page_views") is not None for row in rows)
     return {

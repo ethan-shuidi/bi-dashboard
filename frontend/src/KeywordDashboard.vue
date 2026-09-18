@@ -52,6 +52,7 @@ const columnWidthBounds = {
   weeklyMetric: [70, 190],
 }
 let resizeCleanup = null
+let dashboardRequestSeq = 0
 
 function parseDate(value) {
   const parsed = new Date(`${value}T00:00:00`)
@@ -243,6 +244,7 @@ async function loadTerms(nextSite = site.value) {
 
 async function loadDashboard() {
   if (!props.apiBase || !startWeek.value || !endWeek.value) return
+  const requestSeq = ++dashboardRequestSeq
   loading.value = true
   error.value = ""
   try {
@@ -252,6 +254,7 @@ async function loadDashboard() {
       end_week: endWeek.value,
     })
     data.value = await api(`/api/keyword-dashboard?${query}`)
+    if (requestSeq !== dashboardRequestSeq) return
     if (data.value?.terms?.length && !terms.value.length) {
       terms.value = normalizeTerms(data.value)
       savedTerms.value = termPayload()
@@ -260,22 +263,26 @@ async function loadDashboard() {
     const warnings = data.value?.warnings || []
     if (warnings.length) error.value = warnings.join("；")
   } catch (exception) {
+    if (requestSeq !== dashboardRequestSeq) return
     error.value = exception.message || "关键词数据加载失败"
   } finally {
-    loading.value = false
+    if (requestSeq === dashboardRequestSeq) loading.value = false
   }
 }
 
 async function loadAll() {
+  const requestSeq = ++dashboardRequestSeq
   loading.value = true
   error.value = ""
   try {
     await loadTerms()
+    if (requestSeq !== dashboardRequestSeq) return
     await loadDashboard()
   } catch (exception) {
+    if (requestSeq !== dashboardRequestSeq) return
     error.value = exception.message || "关键词配置加载失败"
   } finally {
-    loading.value = false
+    if (requestSeq === dashboardRequestSeq) loading.value = false
   }
 }
 
@@ -433,7 +440,7 @@ const tableRows = computed(() => {
       category: item.category,
       keyword: item.keyword,
       weekly,
-      latest_search_rank: weekly.length ? weekly[weekly.length - 1].search_rank : null,
+      latest_search_rank: weekly.reduce((result, item) => item.search_rank ?? result, null),
     }
   })
 })
@@ -459,6 +466,9 @@ function metricClass(row, index, field) {
 
 function sparkline(row, field) {
   const values = row.weekly.map((item) => item[field])
+  const visibleIndexes = [...visibleWeekIndices.value].sort((left, right) => left - right)
+  const firstVisibleIndex = visibleIndexes[0] ?? 0
+  const lastVisibleIndex = visibleIndexes[visibleIndexes.length - 1] ?? Math.max(values.length - 1, 0)
   const points = values
     .map((value, index) => ({ value, index }))
     .filter((item) => visibleWeekIndices.value.includes(item.index))
@@ -470,7 +480,7 @@ function sparkline(row, field) {
   const span = max - min || 1
   const coordinates = points.map((item) => ({
     ...item,
-    x: item.index / Math.max(values.length - 1, 1) * 100,
+    x: (item.index - firstVisibleIndex) / Math.max(lastVisibleIndex - firstVisibleIndex, 1) * 100,
     y: 5 + (item.value - min) / span * 26,
     is_min: hasExtreme && item.value === min,
     is_max: hasExtreme && item.value === max,

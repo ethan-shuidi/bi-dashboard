@@ -1210,6 +1210,27 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual([row["week_label"] for row in rows], ["W01", "W37"])
         self.assertEqual(amazon_week_label("2026-09-14"), "W38")
 
+    def test_ads_chart_rows_keep_requested_weeks_with_missing_data_explicit(self):
+        rows = amazon_ads_chart_rows(
+            {
+                "rows": [{
+                    "period": "2026-09-07~2026-09-13",
+                    "period_start": "2026-09-07",
+                    "period_end": "2026-09-13",
+                    "net_sales": 100,
+                    "clicks": 20,
+                }],
+            },
+            date(2026, 9, 7),
+            date(2026, 9, 20),
+        )
+        self.assertEqual([row["period_start"] for row in rows], ["2026-09-07", "2026-09-14"])
+        self.assertEqual(rows[0]["net_sales"], 100)
+        self.assertIsNone(rows[1]["net_sales"])
+        self.assertIsNone(rows[1]["clicks"])
+        self.assertIsNone(rows[1]["fee_ratio"])
+        self.assertIsNone(rows[1]["net_sales"])
+
     def test_ads_chart_keeps_missing_pv_explicitly_unavailable(self):
         row = amazon_ads_chart_rows({
             "rows": [{

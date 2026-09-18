@@ -30,6 +30,8 @@ const loading = ref(true)
 const error = ref("")
 const currency = ref("original")
 let currencyWasAutoSwitched = false
+let dashboardRequestSeq = 0
+let dateContextRequestSeq = 0
 const currencyOptions = [
   { value: "original", label: "原币种" },
   { value: "USD", label: "美元 USD" },
@@ -281,7 +283,16 @@ async function copyProductLink(row) {
 }
 
 const number = (v) => v == null ? "—" : new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Number(v || 0))
-const money = (v, c = currency.value) => v == null ? "—" : new Intl.NumberFormat("zh-CN", { style: "currency", currency: c || "USD", maximumFractionDigits: 2 }).format(Number(v || 0))
+const money = (v, c = currency.value) => {
+  if (v == null) return "—"
+  const currencyCode = String(c || "USD").toUpperCase()
+  if (currencyCode === "MIXED") return "币种混合"
+  try {
+    return new Intl.NumberFormat("zh-CN", { style: "currency", currency: currencyCode, maximumFractionDigits: 2 }).format(Number(v || 0))
+  } catch {
+    return "—"
+  }
+}
 const percent = (v) => v == null ? "—" : `${(Number(v) * 100).toFixed(2)}%`
 const normalize = (v) => v
   .replace(/-黑$/, "-黑色")
@@ -714,17 +725,20 @@ async function loadRuntime() {
 }
 
 async function loadDateContext() {
+  const requestSeq = ++dateContextRequestSeq
   try {
     const query = new URLSearchParams()
     site.value.forEach((siteName) => query.append("site", siteName))
     const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/date-context?${query}`)
     const data = await response.json()
+    if (requestSeq !== dateContextRequestSeq) return
     if (response.ok && data.today) siteToday.value = data.today
   } catch {}
 }
 
 async function load(forceRefresh = false) {
   if (!startDate.value || !endDate.value || startDate.value > endDate.value) { error.value = "请选择有效日期范围"; return }
+  const requestSeq = ++dashboardRequestSeq
   loading.value = true; error.value = ""
   try {
     const query = new URLSearchParams({ comparison: comparison.value, start_date: startDate.value, end_date: endDate.value, currency: currency.value })
@@ -737,8 +751,14 @@ async function load(forceRefresh = false) {
     let data = {}
     try { data = raw ? JSON.parse(raw) : {} } catch { throw new Error(raw || `HTTP ${response.status}`) }
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    if (requestSeq !== dashboardRequestSeq) return
     rows.value = data.rows || []; periods.value = data.periods || []; expanded.value = new Set()
-  } catch (e) { error.value = e.message || "数据加载失败" } finally { loading.value = false }
+  } catch (e) {
+    if (requestSeq !== dashboardRequestSeq) return
+    error.value = e.message || "数据加载失败"
+  } finally {
+    if (requestSeq === dashboardRequestSeq) loading.value = false
+  }
 }
 
 async function handleSiteChange() {
@@ -756,6 +776,7 @@ async function handleSiteChange() {
     startDate.value = formatDate(start)
     endDate.value = formatDate(end)
   }
+  normalizeDateRange()
   load()
 }
 async function handleCurrencyChange() {

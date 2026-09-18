@@ -30,6 +30,7 @@ let salesChart
 let conversionChart
 let trafficChart
 let resizeObserver
+let chartRequestSeq = 0
 
 function parseDate(value) {
   if (!value) return new Date()
@@ -114,6 +115,7 @@ function syncQuickRange() {
 
 async function load({ refresh = false } = {}) {
   if (!props.apiBase) return
+  const requestSeq = ++chartRequestSeq
   loading.value = true
   error.value = ""
   try {
@@ -122,6 +124,7 @@ async function load({ refresh = false } = {}) {
     const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/ads-charts?${query}`)
     const body = await response.json()
     if (!response.ok) throw new Error(requestErrorMessage(body, response.status))
+    if (requestSeq !== chartRequestSeq) return
     data.value = body
     rows.value = body.rows || []
     currency.value = body.currency || "USD"
@@ -129,13 +132,14 @@ async function load({ refresh = false } = {}) {
     await nextTick()
     renderCharts()
   } catch (e) {
+    if (requestSeq !== chartRequestSeq) return
     error.value = e.message || "广告图表加载失败"
     rows.value = []
     fieldAvailability.value = null
     await nextTick()
     renderCharts()
   } finally {
-    loading.value = false
+    if (requestSeq === chartRequestSeq) loading.value = false
   }
 }
 
