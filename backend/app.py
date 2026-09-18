@@ -717,10 +717,15 @@ async def amazon_usd_exchange_rates(
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < 12 * 60 * 60:
         return cached[1]
-    url = f"https://api.frankfurter.dev/v1/{rate_date.isoformat()}?base=USD"
+    url = f"https://api.frankfurter.dev/v1/{rate_date.isoformat()}"
 
     async def fetch(client_value: httpx.AsyncClient) -> dict[str, float]:
-        response = await client_value.get(url, params={"symbols": ",".join(sorted(currencies))})
+        # httpx replaces an existing query string when ``params`` is supplied.
+        # Keep ``base`` in the same params mapping so USD cannot be dropped.
+        response = await client_value.get(
+            url,
+            params={"base": "USD", "symbols": ",".join(sorted(currencies))},
+        )
         response.raise_for_status()
         payload = response.json()
         rates = payload.get("rates", {})

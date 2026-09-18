@@ -48,6 +48,7 @@ from app import (
     amazon_sales_target_values,
     amazon_sales_target_number,
     amazon_sales_validate_money_reconciliation,
+    amazon_usd_exchange_rates,
     amazon_week_label,
     amazon_ads_chart_rows,
     amazon_ads_charts,
@@ -623,6 +624,41 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertAlmostEqual(result[0]["ad_sales"], 23)
         self.assertAlmostEqual(result[0]["ad_cost"], 11.5)
         self.assertAlmostEqual(result[0]["cpc"], 2.3)
+
+    def test_all_site_fx_request_keeps_usd_base(self):
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"rates": {"EUR": 0.8}}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, params=None):
+                captured["url"] = url
+                captured["params"] = params
+                return FakeResponse()
+
+        _amazon_cache.pop(
+            ("amazon-usd-fx", "2026-09-17", ("EUR",)), None
+        )
+        with patch("app.httpx.AsyncClient", return_value=FakeClient()):
+            rates = asyncio.run(amazon_usd_exchange_rates(
+                date(2026, 9, 17), {"USD", "EUR"}
+            ))
+        self.assertEqual(rates, {"USD": 1.0, "EUR": 1.25})
+        self.assertNotIn("?", captured["url"])
+        self.assertEqual(
+            captured["params"], {"base": "USD", "symbols": "EUR"}
+        )
 
     def test_sales_actuals_reject_mixed_currency_rows(self):
         rows = [
