@@ -310,9 +310,21 @@ AMAZON_MAX_DATE_RANGE_DAYS = 400
 ASIN_MAPPING = {
     "US": {"B0G1XQ3H4H":"TN10-主链接-黑色","B0G1YMLFSZ":"TN10-小链接-银色","B0GMGP9B1D":"TN10-小链接-橙色","B0GSJMTSMQ":"TN10-小链接-黑色","B0GZNNL72W":"TN10-主链接-橙色","B0GR9CDQYG":"TN10-主链接-银色","B0H8SF6N61":"TN20-主链接-黑色","B0H8S9M43Y":"TN20-主链接-银色","B0H8SZZN8X":"TN20-主链接-红","B0H8MRQW7Q":"TN20-小链接-黑色","B0H8CKG9P5":"TN20-小链接-银色","B0H8NP9TVK":"TN20-小链接-樱桃红"},
     "JP": {"B0G4M5QMNG":"TN10-主链接-黑色","B0G4M4YMHZ":"TN10-主链接-银色","B0G4M4KZ5S":"TN10-主链接-橙色","B0HC6V88K5":"TN20-主链接-黑色","B0HC75XJ3D":"TN20-主链接-银色","B0HC78T99S":"TN20-主链接-红","B0HD7GRRL5":"TN20-小链接-黑色","B0HD77JKX5":"TN20-小链接-银色","B0HD7QJ1XJ":"TN20-小链接-樱桃红"},
+    # Canada has a site-specific TN20 layout. Keep it explicit so positional
+    # synchronization can never silently reassign these ASINs to TN10 variants.
+    "CA": {
+        "B0G1XQ3H4H": "TN10-主链接-黑色",
+        "B0G1YMLFSZ": "TN10-主链接-银色",
+        "B0G1YCTVJG": "TN10-主链接-橙色",
+        "B0H8NCJLMD": "TN20-主链接-黑色",
+        "B0H8RSZHB3": "TN20-主链接-银色",
+        "B0H8S2TK5K": "TN20-主链接-红",
+        "B0H94CHVCN": "TN20-小链接-黑色",
+        "B0H94MYQP3": "TN20-小链接-银色",
+        "B0H94QM3TZ": "TN20-小链接-樱桃红",
+    },
 }
 for _site, _asins, _series in [
-    ("CA", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8NCJLMD","B0H8RSZHB3","B0H8S2TK5K","B0H94CHVCN","B0H94MYQP3","B0H94QM3TZ"], None),
     ("AU", ["B0G1XQ3H4H","B0G1YMLFSZ","B0G1YCTVJG","B0H8N38BB4","B0H8N3KCBK","B0H8NGTX8G","B0H8PFZ3WW","B0H8PCPN8Z","B0H8PDYNH9"], None),
     ("DE", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),
     ("FR", ["B0G4WGC459","B0G4WJMFB3","B0G55V8N7H","B0H7S1BDZ1","B0H8N8DLYX","B0H8N55JPT","B0H8CKG9P5","B0H8D4YZTS","B0H8D96XRQ"], None),

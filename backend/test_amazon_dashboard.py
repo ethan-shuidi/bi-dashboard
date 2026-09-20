@@ -558,6 +558,23 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(amazon_product("US", "B0H8SZZN8X"), "TN20-主链接-红")
         self.assertEqual(amazon_series("TN20-主链接-红"), "TN20系列（主链接）汇总")
 
+    def test_canada_tn20_main_and_small_asins_use_explicit_mapping(self):
+        expected = {
+            "B0G1XQ3H4H": ("TN10-主链接-黑色", "TN10系列（主链接）汇总"),
+            "B0G1YMLFSZ": ("TN10-主链接-银色", "TN10系列（主链接）汇总"),
+            "B0G1YCTVJG": ("TN10-主链接-橙色", "TN10系列（主链接）汇总"),
+            "B0H8NCJLMD": ("TN20-主链接-黑色", "TN20系列（主链接）汇总"),
+            "B0H8RSZHB3": ("TN20-主链接-银色", "TN20系列（主链接）汇总"),
+            "B0H8S2TK5K": ("TN20-主链接-红", "TN20系列（主链接）汇总"),
+            "B0H94CHVCN": ("TN20-小链接-黑色", "TN20系列（小链接）汇总"),
+            "B0H94MYQP3": ("TN20-小链接-银色", "TN20系列（小链接）汇总"),
+            "B0H94QM3TZ": ("TN20-小链接-樱桃红", "TN20系列（小链接）汇总"),
+        }
+        self.assertEqual(set(ASIN_MAPPING["CA"]), set(expected))
+        for asin, (product, series) in expected.items():
+            self.assertEqual(amazon_product("CA", asin), product)
+            self.assertEqual(amazon_series(product), series)
+
     def test_sales_scope_merges_current_and_future_tn20_variants(self):
         products, series = amazon_sales_scope("TN20")
         self.assertIn("TN20-主链接-黑色", products)
