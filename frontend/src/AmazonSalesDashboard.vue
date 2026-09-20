@@ -20,8 +20,10 @@ defineProps({
       </div>
     </section>
 
-    <SalesTargetModule :api-base="apiBase" variant="month" />
-    <SalesTargetModule :api-base="apiBase" variant="week" />
+    <section class="sales-target-grid" aria-label="周度与月度销售目标看板">
+      <SalesTargetModule :api-base="apiBase" variant="month" />
+      <SalesTargetModule :api-base="apiBase" variant="week" />
+    </section>
     <AmazonPlanBoard :api-base="apiBase" plan-type="operation" />
   </section>
 </template>

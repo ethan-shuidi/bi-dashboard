@@ -41,6 +41,29 @@ const notice = ref("")
 const targetDraft = ref({})
 const savedTargets = ref({})
 let dashboardRequestSeq = 0
+let columnResizeCleanup = null
+
+const salesColumnDefaults = {
+  metric: 128,
+  target: 214,
+  actual: 148,
+  completion: 152,
+}
+const salesColumnBounds = {
+  metric: [96, 280],
+  target: [160, 340],
+  actual: [112, 280],
+  completion: [112, 280],
+}
+const salesColumns = [
+  { key: "metric", label: "指标" },
+  { key: "target", label: "目标" },
+  { key: "actual", label: "实际完成" },
+  { key: "completion", label: "完成率" },
+]
+const columnWidthStorageKey = computed(() => `sales-target-column-widths:${props.variant}`)
+const columnWidths = ref(loadColumnWidths())
+const tableWidth = computed(() => salesColumns.reduce((total, column) => total + columnWidths.value[column.key], 0))
 
 const metricRows = computed(() => data.value?.metrics || [])
 const editableRows = computed(() => metricRows.value.filter(({ target_input }) => target_input))
@@ -280,6 +303,51 @@ function displayPercent(value) {
   return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(Number(value))}%`
 }
 
+function loadColumnWidths() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(columnWidthStorageKey.value) || "{}")
+    const widths = { ...salesColumnDefaults }
+    for (const column of salesColumns) {
+      const value = Number(stored[column.key])
+      const [minWidth, maxWidth] = salesColumnBounds[column.key]
+      if (Number.isFinite(value)) widths[column.key] = Math.round(Math.min(maxWidth, Math.max(minWidth, value)))
+    }
+    return widths
+  } catch {
+    return { ...salesColumnDefaults }
+  }
+}
+
+function saveColumnWidths() {
+  try {
+    window.localStorage.setItem(columnWidthStorageKey.value, JSON.stringify(columnWidths.value))
+  } catch {
+    // Local storage can be unavailable in private browsing; resizing still works for this session.
+  }
+}
+
+function startColumnResize(event, columnKey) {
+  event.preventDefault()
+  event.stopPropagation()
+  columnResizeCleanup?.()
+  const startX = event.clientX
+  const startWidth = columnWidths.value[columnKey]
+  const [minWidth, maxWidth] = salesColumnBounds[columnKey]
+  const move = (moveEvent) => {
+    const nextWidth = Math.round(startWidth + moveEvent.clientX - startX)
+    columnWidths.value = { ...columnWidths.value, [columnKey]: Math.min(maxWidth, Math.max(minWidth, nextWidth)) }
+  }
+  const stop = () => {
+    window.removeEventListener("pointermove", move)
+    window.removeEventListener("pointerup", stop)
+    columnResizeCleanup = null
+    saveColumnWidths()
+  }
+  columnResizeCleanup = stop
+  window.addEventListener("pointermove", move)
+  window.addEventListener("pointerup", stop, { once: true })
+}
+
 function closeDatePicker(event) {
   if (!event.target.closest?.(".sales-date-field, .sales-date-panel")) datePanelOpen.value = false
 }
@@ -291,6 +359,7 @@ onMounted(() => {
   loadDashboard()
 })
 onBeforeUnmount(() => {
+  columnResizeCleanup?.()
   document.removeEventListener("click", closeDatePicker)
   window.removeEventListener("resize", updateDatePanelPosition)
   window.removeEventListener("scroll", updateDatePanelPosition, true)
@@ -378,9 +447,23 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
         <small>手填销量、客单、CPC、广告销量占比、广告CVR；其他目标自动计算。</small>
       </header>
       <div class="sales-table-wrap">
-        <table class="sales-target-table">
+        <table class="sales-target-table" :style="{ width: `${tableWidth}px`, minWidth: `${tableWidth}px` }">
+          <colgroup>
+            <col v-for="column in salesColumns" :key="column.key" :style="{ width: `${columnWidths[column.key]}px` }">
+          </colgroup>
           <thead>
-            <tr><th>指标</th><th>{{ targetColumnTitle }}</th><th>实际完成</th><th>完成率</th></tr>
+            <tr>
+              <th v-for="column in salesColumns" :key="column.key" scope="col">
+                <span>{{ column.key === "target" ? targetColumnTitle : column.label }}</span>
+                <i
+                  class="sales-column-resize-handle"
+                  role="separator"
+                  aria-orientation="vertical"
+                  :title="`拖动调整${column.key === 'target' ? targetColumnTitle : column.label}列宽`"
+                  @pointerdown="startColumnResize($event, column.key)"
+                ></i>
+              </th>
+            </tr>
           </thead>
           <tbody>
             <tr v-for="row in metricRows" :key="row.key">
