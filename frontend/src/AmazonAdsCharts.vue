@@ -13,9 +13,9 @@ const modelOptions = [
   { label: "TN20", value: "TN20" },
 ]
 const quickRangeOptions = [
-  { label: "近5周", value: 5 },
-  { label: "近10周", value: 10 },
-  { label: "近15周", value: 15 },
+  { label: "前5周", value: 5 },
+  { label: "前10周", value: 10 },
+  { label: "前15周", value: 15 },
 ]
 const site = ref("全部站点")
 const model = ref("TN10")
@@ -60,8 +60,8 @@ function isoWeek(value) {
   const firstMonday = monday(firstThursday)
   return Math.floor((start - firstMonday) / 604800000) + 1
 }
-const endWeek = ref(isoDate(monday()))
-const startWeek = ref(isoDate(addDays(monday(), -28)))
+const endWeek = ref(isoDate(addDays(monday(), -7)))
+const startWeek = ref(isoDate(addDays(monday(), -35)))
 
 const rows = ref([])
 const currency = ref("USD")
@@ -102,14 +102,15 @@ function requestErrorMessage(body, status) {
 }
 
 function applyQuickRange(weekCount) {
-  const end = monday()
+  const end = addDays(monday(), -7)
   endWeek.value = isoDate(end)
   startWeek.value = isoDate(addDays(end, -(weekCount - 1) * 7))
 }
 
 function syncQuickRange() {
   const currentWeek = monday()
-  const matched = quickRangeOptions.find(({ value }) => startWeek.value === isoDate(addDays(currentWeek, -(value - 1) * 7)) && endWeek.value === isoDate(currentWeek))
+  const completedWeek = addDays(currentWeek, -7)
+  const matched = quickRangeOptions.find(({ value }) => startWeek.value === isoDate(addDays(completedWeek, -(value - 1) * 7)) && endWeek.value === isoDate(completedWeek))
   quickRange.value = matched?.value ?? null
 }
 
