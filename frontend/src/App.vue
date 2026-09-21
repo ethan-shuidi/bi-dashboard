@@ -335,7 +335,19 @@ onBeforeUnmount(() => {
           @drop.prevent="onDashboardDrop"
           @dragend="onDashboardDrop"
         >
-          <span class="dashboard-nav-icon" aria-hidden="true">{{ item.icon }}</span><span>{{ item.label }}</span>
+          <span class="dashboard-nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" role="presentation">
+              <path v-if="item.key === 'amazon'" d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" fill="currentColor" />
+              <g v-else-if="item.key === 'amazon-sales'" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="8" />
+                <path d="M8.3 14.2l2.8-3.1 2 2.1 3-4" />
+              </g>
+              <g v-else fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <circle cx="10.5" cy="10.5" r="6.5" />
+                <path d="M15.4 15.4L20 20" />
+              </g>
+            </svg>
+          </span><span>{{ item.label }}</span>
         </button>
       </aside>
 
