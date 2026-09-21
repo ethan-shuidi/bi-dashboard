@@ -6,6 +6,7 @@ import json
 import os
 import re
 import base64
+import copy
 import hashlib
 import hmac
 import math
@@ -798,14 +799,17 @@ def amazon_sales_actuals(rows: list[dict[str, Any]]) -> dict[str, float | None]:
                 totals[key] += float(value)
                 present[key] = True
     return {
+        # Zero is a measured value, while None means the upstream field was
+        # unavailable. Keeping the two states separate prevents valid zero
+        # spend, sales, and orders from being displayed or compared as missing.
         "units": totals["units"] if present["units"] else None,
-        "aov": totals["net_sales"] / totals["units"] if present["net_sales"] and totals["units"] else None,
+        "aov": totals["net_sales"] / totals["units"] if present["net_sales"] and present["units"] and totals["units"] != 0 else None,
         "net_sales": totals["net_sales"] if present["net_sales"] else None,
-        "cpc": totals["ad_cost"] / totals["clicks"] if present["ad_cost"] and totals["clicks"] else None,
-        "ad_sales_share": totals["ad_units"] / totals["units"] if present["ad_units"] and totals["units"] else None,
-        "acoas": totals["ad_cost"] / totals["net_sales"] if present["ad_cost"] and totals["net_sales"] else None,
+        "cpc": totals["ad_cost"] / totals["clicks"] if present["ad_cost"] and present["clicks"] and totals["clicks"] != 0 else None,
+        "ad_sales_share": totals["ad_units"] / totals["units"] if present["ad_units"] and present["units"] and totals["units"] != 0 else None,
+        "acoas": totals["ad_cost"] / totals["net_sales"] if present["ad_cost"] and present["net_sales"] and totals["net_sales"] != 0 else None,
         "ad_units": totals["ad_units"] if present["ad_units"] else None,
-        "ad_cvr": totals["ad_orders"] / totals["clicks"] if present["ad_orders"] and totals["clicks"] else None,
+        "ad_cvr": totals["ad_orders"] / totals["clicks"] if present["ad_orders"] and present["clicks"] and totals["clicks"] != 0 else None,
         "ad_cost": totals["ad_cost"] if present["ad_cost"] else None,
         "clicks": totals["clicks"] if present["clicks"] else None,
     }
@@ -969,10 +973,10 @@ async def amazon_convert_sales_money_rows(
         net_sales = row.get("net_sales")
         ad_sales = row.get("ad_sales")
         ad_orders = row.get("ad_orders")
-        row["cpc"] = row["ad_cost"] / clicks if row.get("ad_cost") is not None and clicks else None
-        row["acoas"] = row["ad_cost"] / net_sales if row.get("ad_cost") is not None and net_sales else None
-        row["acos"] = row["ad_cost"] / ad_sales if row.get("ad_cost") is not None and ad_sales else None
-        row["cpo"] = row["ad_cost"] / ad_orders if row.get("ad_cost") is not None and ad_orders else None
+        row["cpc"] = row["ad_cost"] / clicks if row.get("ad_cost") is not None and clicks is not None and clicks != 0 else None
+        row["acoas"] = row["ad_cost"] / net_sales if row.get("ad_cost") is not None and net_sales is not None and net_sales != 0 else None
+        row["acos"] = row["ad_cost"] / ad_sales if row.get("ad_cost") is not None and ad_sales is not None and ad_sales != 0 else None
+        row["cpo"] = row["ad_cost"] / ad_orders if row.get("ad_cost") is not None and ad_orders is not None and ad_orders != 0 else None
     return rows
 
 
@@ -1090,7 +1094,7 @@ def amazon_sales_apply_campaign_ad_cost(
             rows[index]["ad_cost"] = authoritative_cost * weight / weight_sum
             rows[index]["ad_cost_source"] = "campaign_report"
             clicks = rows[index].get("clicks")
-            rows[index]["cpc"] = rows[index]["ad_cost"] / clicks if clicks else None
+            rows[index]["cpc"] = rows[index]["ad_cost"] / clicks if clicks is not None and clicks != 0 else None
     return rows
 
 
@@ -1282,7 +1286,7 @@ def amazon_sales_derived_targets(targets: dict[str, float | None]) -> dict[str, 
     )
     ad_units = clicks * ad_cvr if clicks is not None and ad_cvr is not None else None
     ad_cost = cpc * clicks if cpc is not None and clicks is not None else None
-    acoas = ad_cost / net_sales if ad_cost is not None and net_sales else None
+    acoas = ad_cost / net_sales if ad_cost is not None and net_sales is not None and net_sales != 0 else None
     return {
         "net_sales": net_sales,
         "clicks": clicks,
@@ -1602,7 +1606,10 @@ async def fetch_ad_report(
     cache_key = ("ads-v3", sid, report_date.isoformat(), offset, show_detail)
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
-        return cached[1]
+        # Sales-dashboard enrichment reallocates rows in-place after this call.
+        # Return a private object so those edits cannot pollute the cached raw
+        # periodic response for another viewer or filter invocation.
+        return copy.deepcopy(cached[1])
     global _lingxing_ad_report_last_call
     async with semaphore:
         # LingXing advertising endpoints use a one-token bucket. Keep a
@@ -1831,14 +1838,14 @@ def finalize_strategy_metrics(total: dict[str, float]) -> dict[str, float | None
     ad_orders = total.get("ad_orders", 0)
     return {
         "clicks": int(clicks),
-        "cpc": ad_cost / clicks if clicks else None,
+        "cpc": ad_cost / clicks if clicks is not None and clicks != 0 else None,
         "ad_cost": ad_cost,
         "ad_sales": ad_sales,
         "ad_orders": int(ad_orders),
         "ad_units": int(total.get("ad_units", 0)),
-        "acos": ad_cost / ad_sales if ad_sales else None,
-        "roas": ad_sales / ad_cost if ad_cost else None,
-        "ad_cvr": ad_orders / clicks if clicks else None,
+        "acos": ad_cost / ad_sales if ad_sales is not None and ad_sales != 0 else None,
+        "roas": ad_sales / ad_cost if ad_cost is not None and ad_cost != 0 else None,
+        "ad_cvr": ad_orders / clicks if clicks is not None and clicks != 0 else None,
     }
 
 
@@ -2503,7 +2510,9 @@ async def fetch_product_performance(
         rate_limited = False
         cached = _amazon_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
-            chunk_rows = cached[1]
+            # Currency normalization below mutates each returned row. Keep the
+            # cached upstream payload immutable across viewers and currencies.
+            chunk_rows = copy.deepcopy(cached[1])
         else:
             payload = {
                 "offset": 0,
@@ -2586,7 +2595,7 @@ async def fetch_product_performance(
             else:
                 chunk_rows = []
             chunk_rows = chunk_rows if isinstance(chunk_rows, list) else []
-            _amazon_cache[cache_key] = (time.monotonic(), chunk_rows)
+            _amazon_cache[cache_key] = (time.monotonic(), copy.deepcopy(chunk_rows))
         if quality is not None:
             _record_performance_quality(
                 quality,
@@ -2860,7 +2869,10 @@ async def amazon_dashboard_periodic(
     cache_key = ("periodic-dashboard-v10-explicit-mcp-currency", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
-        return cached[1]
+        # Sales-dashboard enrichment reallocates rows in-place after this call.
+        # Return a private object so those edits cannot pollute the cached raw
+        # periodic response for another viewer or filter invocation.
+        return copy.deepcopy(cached[1])
 
     async with httpx.AsyncClient(timeout=45) as client:
         async def fetch_site(site_name: str):
@@ -3000,23 +3012,23 @@ async def amazon_dashboard_periodic(
         sessions = item.get("sessions")
         page_views = item.get("page_views")
         ad_units = item.get("ad_units")
-        ad_sales_share = (ad_units / units) if ad_units is not None and units else None
-        ad_order_share = (ad_orders / orders) if ad_orders is not None and orders else None
+        ad_sales_share = (ad_units / units) if ad_units is not None and units is not None and units != 0 else None
+        ad_order_share = (ad_orders / orders) if ad_orders is not None and orders is not None and orders != 0 else None
         # ACoAS is defined by the dashboard requirement as ad spend divided
         # by net sales. Recalculate it from the period totals instead of
         # trusting a range-level/source value that may use another denominator.
-        calculated_acoas = (ad_cost / net_sales) if ad_cost is not None and net_sales else None
+        calculated_acoas = (ad_cost / net_sales) if ad_cost is not None and net_sales is not None and net_sales != 0 else None
         rows.append({
             "period": item["period"], "period_start": item["period_start"], "period_end": item["period_end"],
             "site": site_name, "site_code": item.get("site_code"), "series": group, "product": product, "asin": ", ".join(sorted(item.get("asins") or [])) or None, "currency": item.get("currency", "USD"),
             "units": int(units) if units is not None else None, "net_sales": net_sales, "orders": int(orders) if orders is not None else None,
             "b2b_units": int(item["b2b_units"]) if item.get("b2b_units") is not None else None, "b2b_orders": int(item["b2b_orders"]) if item.get("b2b_orders") is not None else None,
-            "ctr": clicks / impressions if clicks is not None and impressions else item.get("source_ctr"), "clicks": int(clicks) if clicks is not None else None,
-            "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks else item.get("source_cpc"),
-            "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else item.get("source_ad_cvr"),
-            "cpo": ad_cost / ad_orders if ad_cost is not None and ad_orders else None,
+            "ctr": clicks / impressions if clicks is not None and impressions is not None and impressions != 0 else (None if impressions is not None else item.get("source_ctr")), "clicks": int(clicks) if clicks is not None else None,
+            "impressions": int(impressions) if impressions is not None else None, "cpc": ad_cost / clicks if ad_cost is not None and clicks is not None and clicks != 0 else (None if clicks is not None else item.get("source_cpc")),
+            "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks is not None and clicks != 0 else (None if clicks is not None else item.get("source_ad_cvr")),
+            "cpo": ad_cost / ad_orders if ad_cost is not None and ad_orders is not None and ad_orders != 0 else None,
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
-            "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales else item.get("source_acos"),
+            "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales is not None and ad_sales != 0 else (None if ad_sales is not None else item.get("source_acos")),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
             "sessions": int(sessions) if sessions is not None else None,
             "page_views": int(page_views) if page_views is not None else None,
@@ -3077,7 +3089,7 @@ async def amazon_dashboard_periodic(
             "net_sales_field": "net_amount",
         },
     }
-    _amazon_cache[cache_key] = (time.monotonic(), response)
+    _amazon_cache[cache_key] = (time.monotonic(), copy.deepcopy(response))
     return response
 
 
@@ -3679,7 +3691,10 @@ async def amazon_strategy_board_payload(
         _amazon_cache.pop(cache_key, None)
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
-        return cached[1]
+        # Sales endpoints enrich and reallocate rows after this function. A
+        # cache hit must therefore return a private object; otherwise those
+        # endpoint-level edits pollute the next viewer's raw periodic cache.
+        return copy.deepcopy(cached[1])
 
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     async with httpx.AsyncClient(timeout=45) as client:
@@ -4808,10 +4823,10 @@ def amazon_ads_chart_rows(
             "net_sales": net_sales,
             "ad_sales": ad_sales,
             "ad_cost": ad_cost,
-            "fee_ratio": ad_cost / net_sales if ad_cost is not None and net_sales else None,
+            "fee_ratio": ad_cost / net_sales if ad_cost is not None and net_sales is not None and net_sales != 0 else None,
             "clicks": int(clicks) if clicks is not None else None,
             "ad_orders": int(ad_orders) if ad_orders is not None else None,
-            "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks else None,
+            "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks is not None and clicks != 0 else None,
             "sessions": int(sessions) if sessions is not None else None,
             "page_views": int(page_views) if page_views is not None else None,
         })
@@ -4873,6 +4888,9 @@ async def amazon_ads_charts(
         for site_name in selected_sites
     )
     fetch_end = min(end + timedelta(days=6), site_today)
+    # Future-only ranges should render empty weeks instead of raising because
+    # the upstream periodic payload was never requested.
+    periodic: dict[str, Any] = {"rows": []}
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     if start <= fetch_end:

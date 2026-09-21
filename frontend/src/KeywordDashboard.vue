@@ -56,6 +56,8 @@ const columnWidthBounds = {
 }
 let resizeCleanup = null
 let dashboardRequestSeq = 0
+let termsRequestSeq = 0
+let loadAllRequestSeq = 0
 
 function parseDate(value) {
   const parsed = new Date(`${value}T00:00:00`)
@@ -255,12 +257,14 @@ function termPayload() {
 }
 
 async function loadTerms(nextSite = site.value) {
+  const requestSeq = ++termsRequestSeq
   const payload = await api(`/api/keyword-dashboard/terms?site=${encodeURIComponent(nextSite)}`)
+  if (requestSeq !== termsRequestSeq) return
   terms.value = normalizeTerms(payload)
   savedTerms.value = termPayload()
 }
 
-async function loadDashboard() {
+async function loadDashboard({ refresh = false } = {}) {
   if (!props.apiBase || !startWeek.value || !endWeek.value) return
   const requestSeq = ++dashboardRequestSeq
   loading.value = true
@@ -271,8 +275,10 @@ async function loadDashboard() {
       start_week: startWeek.value,
       end_week: endWeek.value,
     })
-    data.value = await api(`/api/keyword-dashboard?${query}`)
+    if (refresh) query.set("refresh", "true")
+    const body = await api(`/api/keyword-dashboard?${query}`)
     if (requestSeq !== dashboardRequestSeq) return
+    data.value = body
     if (data.value?.terms?.length && !terms.value.length) {
       terms.value = normalizeTerms(data.value)
       savedTerms.value = termPayload()
@@ -289,18 +295,17 @@ async function loadDashboard() {
 }
 
 async function loadAll() {
-  const requestSeq = ++dashboardRequestSeq
+  const requestSeq = ++loadAllRequestSeq
   loading.value = true
   error.value = ""
   try {
     await loadTerms()
-    if (requestSeq !== dashboardRequestSeq) return
+    if (requestSeq !== loadAllRequestSeq) return
     await loadDashboard()
   } catch (exception) {
-    if (requestSeq !== dashboardRequestSeq) return
-    error.value = exception.message || "关键词配置加载失败"
+    if (requestSeq === loadAllRequestSeq) error.value = exception.message || "关键词配置加载失败"
   } finally {
-    if (requestSeq === dashboardRequestSeq) loading.value = false
+    if (requestSeq === loadAllRequestSeq) loading.value = false
   }
 }
 
@@ -421,26 +426,10 @@ async function refreshDashboard() {
   } catch {
     return
   }
-  loading.value = true
   error.value = ""
   notice.value = ""
-  try {
-    const query = new URLSearchParams({
-      site: site.value,
-      start_week: startWeek.value,
-      end_week: endWeek.value,
-      refresh: "true",
-    })
-    data.value = await api(`/api/keyword-dashboard?${query}`)
-    if (!dirty.value) applySavedDashboardOrder()
-    const warnings = data.value?.warnings || []
-    if (warnings.length) error.value = warnings.join("；")
-    else notice.value = "ABA 数据已重新抓取并写入历史库"
-  } catch (exception) {
-    error.value = exception.message || "ABA 数据刷新失败"
-  } finally {
-    loading.value = false
-  }
+  await loadDashboard({ refresh: true })
+  if (!error.value) notice.value = "ABA 数据已重新抓取并写入历史库"
 }
 
 const tableRows = computed(() => {
@@ -559,10 +548,8 @@ watch(endWeek, (value) => {
   if (value && startWeek.value && value < startWeek.value) startWeek.value = value
   syncQuickRange()
 })
-watch(() => [props.apiBase, site.value], async ([nextApiBase], oldValues) => {
-  if (!nextApiBase) return
-  if (oldValues && oldValues[1] === site.value) return
-  await loadAll()
+watch(() => [props.apiBase, site.value], ([nextApiBase]) => {
+  if (nextApiBase) loadAll()
 })
 watch(() => [props.apiBase, startWeek.value, endWeek.value], ([nextApiBase], oldValues) => {
   if (!nextApiBase) return

@@ -129,8 +129,9 @@ async function loadDashboard({ refresh = false } = {}) {
     if (isWeek.value) query.set("week_start", weekStart.value)
     else query.set("year", String(year.value)), query.set("month", String(month.value))
     if (refresh) query.set("refresh", "true")
-    data.value = await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}?${query}`)
+    const body = await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}?${query}`)
     if (requestSeq !== dashboardRequestSeq) return
+    data.value = body
     syncDraft(data.value.targets)
   } catch (exception) {
     if (requestSeq !== dashboardRequestSeq) return

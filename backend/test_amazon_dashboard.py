@@ -919,6 +919,144 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "多币种"):
             amazon_sales_actuals(rows)
 
+    def test_sales_actuals_keep_measured_zero_distinct_from_missing(self):
+        actuals = amazon_sales_actuals([{
+            "currency": "USD",
+            "units": 0,
+            "net_sales": 0,
+            "clicks": 10,
+            "ad_cost": 0,
+            "ad_units": 0,
+            "ad_orders": 0,
+        }])
+        self.assertEqual(actuals["units"], 0)
+        self.assertEqual(actuals["net_sales"], 0)
+        self.assertEqual(actuals["ad_cost"], 0)
+        self.assertEqual(actuals["ad_units"], 0)
+        self.assertEqual(actuals["cpc"], 0)
+        self.assertEqual(actuals["ad_cvr"], 0)
+        self.assertIsNone(actuals["ad_sales_share"])
+
+    def test_campaign_cost_zero_and_zero_click_keep_invalid_cpc_missing(self):
+        rows = [{
+            "site": "美国",
+            "series": AMAZON_SERIES[0],
+            "clicks": 0,
+            "ad_cost": 5,
+        }]
+        result = amazon_sales_apply_campaign_ad_cost(rows, {
+            ("美国", AMAZON_SERIES[0]): 0,
+        })
+        self.assertEqual(result[0]["ad_cost"], 0)
+        self.assertEqual(result[0]["ad_cost_source"], "campaign_report")
+        self.assertIsNone(result[0]["cpc"])
+
+    def test_ads_chart_zero_numerator_and_zero_denominator_are_distinct(self):
+        rows = amazon_ads_chart_rows({
+            "rows": [{
+                "period": "2026-09-07~2026-09-13",
+                "period_start": "2026-09-07",
+                "period_end": "2026-09-13",
+                "currency": "USD",
+                "net_sales": 0,
+                "ad_sales": 0,
+                "ad_cost": 0,
+                "clicks": 10,
+                "ad_orders": 0,
+                "sessions": 0,
+                "page_views": 0,
+            }],
+        }, date(2026, 9, 7), date(2026, 9, 7))
+        self.assertEqual(rows[0]["ad_cost"], 0)
+        self.assertEqual(rows[0]["clicks"], 10)
+        self.assertEqual(rows[0]["ad_cvr"], 0)
+        self.assertEqual(rows[0]["sessions"], 0)
+        self.assertIsNone(rows[0]["fee_ratio"])
+
+    def test_product_performance_cache_is_not_polluted_by_currency_normalization(self):
+        cache_key = ("product-performance-v3", 101, "2026-09-01", "2026-09-07", (), "USD")
+        original_cache = dict(_amazon_cache)
+        _amazon_cache.clear()
+        try:
+            body = {"data": [{"currencyCode": "CNY", "net_amount": 10}]}
+
+            async def fetch():
+                with patch("app.lingxing_post", new=AsyncMock(return_value=body)):
+                    return await fetch_product_performance(
+                        101, date(2026, 9, 1), date(2026, 9, 7), "日", object(),
+                        asyncio.Semaphore(1), currency_code="USD",
+                    )
+
+            first = asyncio.run(fetch())
+            first[0]["currency_code"] = "POLLUTED"
+            first[0]["net_amount"] = 999999
+            cached_rows = _amazon_cache[cache_key][1]
+            self.assertEqual(cached_rows[0]["currencyCode"], "CNY")
+            self.assertEqual(cached_rows[0]["net_amount"], 10)
+        finally:
+            _amazon_cache.clear()
+            _amazon_cache.update(original_cache)
+
+    def test_dashboard_periodic_cache_is_not_polluted_by_endpoint_enrichment(self):
+        asin = next(iter(ASIN_MAPPING["US"]))
+        product = ASIN_MAPPING["US"][asin]
+        series = amazon_series(product)
+        performance = [{
+            "asin": asin,
+            "volume": 1,
+            "net_amount": 10,
+            "spend": 2,
+            "ad_sales_amount": 4,
+            "clicks": 10,
+        }]
+        original_cache = dict(_amazon_cache)
+        _amazon_cache.clear()
+        try:
+            async def fetch():
+                with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)):
+                    return await amazon_dashboard_periodic(
+                        "日", date(2026, 9, 4), date(2026, 9, 4), "美国",
+                        {series}, {product}, {"US": {"sid": 1}},
+                    )
+
+            first = asyncio.run(fetch())
+            first["rows"][0]["ad_cost"] = 999999
+            first["rows"][0]["currency"] = "POLLUTED"
+            second = asyncio.run(fetch())
+            self.assertEqual(second["rows"][0]["ad_cost"], 2)
+            self.assertEqual(second["rows"][0]["currency"], "USD")
+            # The cache hit itself must also return a private object. A viewer
+            # mutating the second response must not poison the third request.
+            second["rows"][0]["ad_cost"] = 888888
+            second["rows"][0]["currency"] = "POLLUTED_AGAIN"
+            third = asyncio.run(fetch())
+            self.assertEqual(third["rows"][0]["ad_cost"], 2)
+            self.assertEqual(third["rows"][0]["currency"], "USD")
+        finally:
+            _amazon_cache.clear()
+            _amazon_cache.update(original_cache)
+
+    def test_ads_charts_future_weeks_return_empty_without_upstream_request(self):
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
+        }
+        periodic_mock = AsyncMock()
+        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=periodic_mock):
+            result = asyncio.run(amazon_ads_charts(
+                date(2099, 1, 4),
+                date(2099, 1, 4),
+                "美国",
+                "TN10",
+                False,
+            ))
+        periodic_mock.assert_not_called()
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertTrue(result["data_quality"]["complete"])
+        for key in ("net_sales", "ad_sales", "ad_cost", "clicks", "sessions", "page_views"):
+            self.assertIsNone(result["rows"][0][key])
+
     def test_sales_money_reconciliation_fails_on_material_source_gap(self):
         rows = [{"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 387034.42}]
         with self.assertRaisesRegex(RuntimeError, "交叉校验失败"):

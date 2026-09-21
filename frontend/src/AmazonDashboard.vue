@@ -806,6 +806,28 @@ function shiftDate(value, days) {
   return formatDate(result)
 }
 
+function shiftCalendarMonth(value, amount) {
+  const source = toDate(value) || todayDate()
+  const monthIndex = source.getFullYear() * 12 + source.getMonth() + amount
+  const year = Math.floor(monthIndex / 12)
+  const month = ((monthIndex % 12) + 12) % 12
+  const lastDay = new Date(year, month + 1, 0).getDate()
+  return new Date(year, month, Math.min(source.getDate(), lastDay))
+}
+
+function previousComparisonRange() {
+  const start = toDate(startDate.value) || todayDate()
+  const end = toDate(endDate.value) || todayDate()
+  if (comparison.value === "月") {
+    // Monthly rows are paired by their period index in the table. Shift the
+    // whole selected range one calendar month so each month compares with its
+    // immediately preceding month, even when several months are selected.
+    return [formatDate(shiftCalendarMonth(start, -1)), formatDate(shiftCalendarMonth(end, -1))]
+  }
+  const rangeDays = (end - start) / 86400000
+  return [shiftDate(startDate.value, -(rangeDays + 1)), shiftDate(endDate.value, -(rangeDays + 1))]
+}
+
 async function fetchDashboardData(rangeStart, rangeEnd, forceRefresh = false) {
   const query = new URLSearchParams({ comparison: comparison.value, start_date: rangeStart, end_date: rangeEnd, currency: currency.value })
   site.value.forEach((siteName) => query.append("site", siteName))
@@ -825,24 +847,22 @@ async function load(forceRefresh = false) {
   const requestSeq = ++dashboardRequestSeq
   loading.value = true; error.value = ""
   try {
-    const rangeDays = ((toDate(endDate.value) || todayDate()) - (toDate(startDate.value) || todayDate())) / 86400000
-    const previousStart = shiftDate(startDate.value, -(rangeDays + 1))
-    const previousEnd = shiftDate(endDate.value, -(rangeDays + 1))
-    if (forceRefresh && showComparison.value) {
-      const refreshedPrevious = await fetchDashboardData(previousStart, previousEnd, true)
-      if (requestSeq !== dashboardRequestSeq) return
-      previousRows.value = refreshedPrevious.rows || []
-      previousPeriods.value = refreshedPrevious.periods || []
-    }
-    const data = await fetchDashboardData(startDate.value, endDate.value, forceRefresh)
+    const [previousStart, previousEnd] = previousComparisonRange()
+    // Fetch both scopes before updating visible state. Assigning the current
+    // rows first and the comparison rows later used to briefly pair new rows
+    // with stale previous-period rows when filters changed quickly.
+    const [data, previousData] = await Promise.all([
+      fetchDashboardData(startDate.value, endDate.value, forceRefresh),
+      showComparison.value
+        ? fetchDashboardData(previousStart, previousEnd, forceRefresh)
+        : Promise.resolve(null),
+    ])
     if (requestSeq !== dashboardRequestSeq) return
-    rows.value = data.rows || []; periods.value = data.periods || []; expanded.value = new Set()
-    if (showComparison.value && !forceRefresh) {
-      const previousData = await fetchDashboardData(previousStart, previousEnd)
-      if (requestSeq !== dashboardRequestSeq) return
-      previousRows.value = previousData.rows || []
-      previousPeriods.value = previousData.periods || []
-    }
+    rows.value = data.rows || []
+    periods.value = data.periods || []
+    previousRows.value = showComparison.value ? (previousData?.rows || []) : []
+    previousPeriods.value = showComparison.value ? (previousData?.periods || []) : []
+    expanded.value = new Set()
   } catch (e) {
     if (requestSeq !== dashboardRequestSeq) return
     error.value = e.message || "数据加载失败"

@@ -37,6 +37,7 @@ const planEditor = ref(null)
 const editorHeight = ref(172)
 let toastTimer = null
 let resizeObserver = null
+let planRequestSeq = 0
 
 const orderedSites = computed(() => [...new Set([...SITE_ORDER, ...stores.value.map((item) => item.country).filter(Boolean)])].sort((a, b) => (SITE_ORDER.indexOf(a) < 0 ? 999 : SITE_ORDER.indexOf(a)) - (SITE_ORDER.indexOf(b) < 0 ? 999 : SITE_ORDER.indexOf(b)) || a.localeCompare(b, "zh-CN")))
 const weekEnd = computed(() => {
@@ -96,17 +97,20 @@ async function loadStores() {
 
 async function load() {
   if (!props.apiBase || !weekStart.value || !site.value || !series.value) return
+  const requestSeq = ++planRequestSeq
   loading.value = true
+  error.value = ""
   try {
     const query = new URLSearchParams({ week_start: weekStart.value, site: site.value, series: series.value })
     const response = await fetchWithDashboardAuth(`${props.apiBase}${planEndpoint.value}?${query}`)
     const data = await response.json()
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    if (requestSeq !== planRequestSeq) return
     draft.value = { review: data.review || "", plan: data.plan || "" }
   } catch (exception) {
-    error.value = exception.message || `${planTitle.value}加载失败`
+    if (requestSeq === planRequestSeq) error.value = exception.message || `${planTitle.value}加载失败`
   } finally {
-    loading.value = false
+    if (requestSeq === planRequestSeq) loading.value = false
   }
 }
 
@@ -131,15 +135,13 @@ async function save() {
 
 function onWeekChange() {
   weekStart.value = monday(weekStart.value)
-  load()
 }
 
 watch(() => props.apiBase, () => {
   if (!props.apiBase) return
   loadStores()
-  load()
 })
-watch(() => [weekStart.value, site.value, series.value], load)
+watch(() => [props.apiBase, weekStart.value, site.value, series.value], load)
 
 onMounted(async () => {
   weekStart.value = previousWeekStart()
@@ -152,7 +154,6 @@ onMounted(async () => {
     ;[reviewEditor.value, planEditor.value].filter(Boolean).forEach((editor) => resizeObserver.observe(editor, { box: "border-box" }))
   }
   await loadStores()
-  await load()
 })
 
 onBeforeUnmount(() => {

@@ -178,9 +178,17 @@ function yAxis(label, options = {}) {
   }
 }
 
+function ensureChart(chart, element) {
+  if (!chart || chart.getDom() !== element) {
+    chart?.dispose()
+    return init(element)
+  }
+  return chart
+}
+
 function renderSalesChart() {
   if (!salesChartElement.value) return
-  salesChart ||= init(salesChartElement.value)
+  salesChart = ensureChart(salesChart, salesChartElement.value)
   salesChart.setOption({
     ...baseOption("按周展示销售额、广告销售额和费比。"),
     color: ["#3b82f6", "#22c55e", "#f97316"],
@@ -198,7 +206,7 @@ function renderSalesChart() {
 
 function renderConversionChart() {
   if (!conversionChartElement.value) return
-  conversionChart ||= init(conversionChartElement.value)
+  conversionChart = ensureChart(conversionChart, conversionChartElement.value)
   conversionChart.setOption({
     ...baseOption("按周展示点击数和广告转化率。"),
     color: ["#6366f1", "#f59e0b"],
@@ -215,7 +223,7 @@ function renderConversionChart() {
 
 function renderTrafficChart() {
   if (!trafficChartElement.value) return
-  trafficChart ||= init(trafficChartElement.value)
+  trafficChart = ensureChart(trafficChart, trafficChartElement.value)
   trafficChart.setOption({
     ...baseOption("按周展示领星 Sessions-Total 和 PV-Total。"),
     color: ["#0ea5e9", "#a855f7"],

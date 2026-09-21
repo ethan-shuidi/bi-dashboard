@@ -19,7 +19,7 @@ const nameColumnWidth = ref(430)
 const noteColumnWidth = ref(290)
 const widths = ref(Object.fromEntries(columns.map((column) => [column.key, column.width]))); const visible = ref(Object.fromEntries(columns.map((column) => [column.key, true]))); const columnOrder = ref(columns.map((column) => column.key)); const sort = ref({ key: "clicks", direction: "desc" }); const draggingColumn = ref(""); const tableHeight = ref(null)
 const columnStorageKey = "ideadock.amazon-strategy-board.columns.v1"
-let resizeCleanup = null; let toastTimer = null
+let resizeCleanup = null; let toastTimer = null; let strategyRequestSeq = 0
 const orderedSites = computed(() => [...new Set([...SITE_ORDER, ...stores.value.map((item) => item.country).filter(Boolean)])].sort((a, b) => (SITE_ORDER.indexOf(a) < 0 ? 999 : SITE_ORDER.indexOf(a)) - (SITE_ORDER.indexOf(b) < 0 ? 999 : SITE_ORDER.indexOf(b)) || a.localeCompare(b, "zh-CN")))
 const visibleColumns = computed(() => columnOrder.value.map((key) => columns.find((column) => column.key === key)).filter((column) => column && visible.value[column.key]))
 const strategyTableWidth = computed(() => visibleColumns.value.reduce((sum, column) => sum + widths.value[column.key], 0) + nameColumnWidth.value + noteColumnWidth.value)
@@ -250,6 +250,7 @@ async function fetchStrategyBoard(weekStart) {
 }
 async function load() {
   if (!props.apiBase || !strategyWeekStart.value) return
+  const requestSeq = ++strategyRequestSeq
   loading.value = true; error.value = ""; saveError.value = ""
   try {
     const previousWeek = formatLocalDate(new Date(new Date(`${strategyWeekStart.value}T00:00:00`).getTime() - 7 * 86400000))
@@ -257,6 +258,7 @@ async function load() {
       fetchStrategyBoard(strategyWeekStart.value),
       showComparison.value ? fetchStrategyBoard(previousWeek) : Promise.resolve(null),
     ])
+    if (requestSeq !== strategyRequestSeq) return
     rows.value = data.strategies || []; previousRows.value = previousData?.strategies || []
     seriesOptions.value = data.series_options || DEFAULT_SERIES
     const nextDrafts = {}; const nextCampaignDrafts = {}
@@ -265,10 +267,18 @@ async function load() {
       ;(row.campaigns || []).forEach((campaign) => { nextCampaignDrafts[campaignKey(campaign)] = { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } })
     })
     noteDrafts.value = nextDrafts; campaignDrafts.value = nextCampaignDrafts
-  } catch (e) { error.value = e.message || "广告策略看板加载失败" } finally { loading.value = false; await nextTick(); resizeAllNotes() }
+  } catch (e) {
+    if (requestSeq === strategyRequestSeq) error.value = e.message || "广告策略看板加载失败"
+  } finally {
+    if (requestSeq === strategyRequestSeq) {
+      loading.value = false
+      await nextTick()
+      resizeAllNotes()
+    }
+  }
 }
-function onStrategySiteChange() { if (!availableStores.value.some((item) => String(item.sid) === strategyStore.value)) strategyStore.value = ""; load() }
-function onWeekChange() { strategyWeekStart.value = monday(strategyWeekStart.value); load() }
+function onStrategySiteChange() { if (!availableStores.value.some((item) => String(item.sid) === strategyStore.value)) strategyStore.value = "" }
+function onWeekChange() { strategyWeekStart.value = monday(strategyWeekStart.value) }
 watch(() => [props.apiBase, strategyWeekStart.value, strategySite.value, strategyStore.value, strategySeries.value, showComparison.value], load)
 onMounted(async () => {
   loadColumnPreferences()
@@ -277,7 +287,6 @@ onMounted(async () => {
   window.addEventListener("resize", updateConfigPosition)
   await nextTick()
   await loadStores()
-  await load()
 })
 onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", updateConfigPosition, true); window.removeEventListener("resize", updateConfigPosition); if (toastTimer) window.clearTimeout(toastTimer) })
 </script>
