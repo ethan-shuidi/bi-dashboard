@@ -1486,7 +1486,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "b2b_order_items": 1,
             "sessions_total": 50,
             "pageViewsTotal": 120,
-            "cvr": 0.1,
+            "cvr": 0.2,
             "impressions": 100,
             "clicks": 5,
             "ad_sales_amount": 20,
@@ -1512,6 +1512,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(row["cpo"], 1)
         self.assertEqual(row["ad_order_share"], 0.4)
         self.assertEqual(row["sessions"], 50)
+        self.assertAlmostEqual(row["cvr"], 0.1)
         self.assertEqual(row["page_views"], 120)
         self.assertEqual(row["asin"], asin)
         self.assertEqual(result["mapping"]["sources"], AMAZON_METRIC_SOURCES)

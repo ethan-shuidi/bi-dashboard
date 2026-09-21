@@ -479,7 +479,10 @@ function rowHasMetricData(metrics) {
 }
 
 const displayRows = computed(() => {
-  const previousIndexByLabel = new Map(previousPeriods.value.map((period, index) => [period.label, index]))
+  const chronologicalPeriods = [...periods.value].sort((left, right) => String(left.start).localeCompare(String(right.start)))
+  const chronologicalPreviousPeriods = [...previousPeriods.value].sort((left, right) => String(left.start).localeCompare(String(right.start)))
+  const previousIndexByLabel = new Map(chronologicalPreviousPeriods.map((period, index) => [period.label, index]))
+  const periodIndexByLabel = new Map(chronologicalPeriods.map((period, index) => [period.label, index]))
   const previousDetailsByIndex = new Map()
   for (const row of previousRows.value) {
     const periodIndex = previousIndexByLabel.get(row.period)
@@ -514,7 +517,7 @@ const displayRows = computed(() => {
     seriesMap.get(row.series).push(row)
   }
   const result = []
-  const orderedPeriods = [...periods.value].sort((a, b) => String(b.label).localeCompare(String(a.label)))
+  const orderedPeriods = [...chronologicalPeriods].reverse()
   const visibleSites = site.value.length ? site.value : sites.value
   const visibleSeries = selectedSeries.value.length ? selectedSeries.value : seriesOptions
   for (const periodInfo of orderedPeriods) {
@@ -550,7 +553,7 @@ const displayRows = computed(() => {
           ))
         periodDetails.push(...orderedDetails)
         const key = `${period}|${siteName}|${series}`
-        const periodIndex = orderedPeriods.indexOf(periodInfo)
+        const periodIndex = periodIndexByLabel.get(period)
         const previousSeriesRows = previousSeriesByKey.get(`${periodIndex}|${siteName}|${series}`) || []
         periodRows.push({ type: "group", key, period, site: siteName, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails), previousMetrics: showComparison.value ? aggregate(previousSeriesRows) : null })
         if (expanded.value.has(key)) orderedDetails.forEach((item) => {
@@ -560,7 +563,7 @@ const displayRows = computed(() => {
       }
     }
     if (showPeriodTotals.value) {
-      const periodIndex = orderedPeriods.indexOf(periodInfo)
+      const periodIndex = periodIndexByLabel.get(period)
       const previousPeriodRows = previousDetailsByIndex.get(periodIndex) || []
       periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails), previousMetrics: showComparison.value ? aggregate(previousPeriodRows) : null })
     }
@@ -638,7 +641,9 @@ function aggregate(items) {
   out.ctr = weighted("ctr", "impressions")
   out.cpc = mixedCurrency ? null : weighted("cpc", "clicks")
   out.ad_cvr = weighted("ad_cvr", "clicks")
-  out.cvr = weighted("cvr", "sessions")
+  out.cvr = out.orders != null && out.sessions != null && out.sessions !== 0
+    ? out.orders / out.sessions
+    : null
   out.acos = mixedCurrency ? null : weighted("acos", "ad_sales")
   return out
 }

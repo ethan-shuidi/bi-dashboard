@@ -3182,6 +3182,11 @@ async def amazon_dashboard_periodic(
         sessions = item.get("sessions")
         page_views = item.get("page_views")
         ad_units = item.get("ad_units")
+        calculated_cvr = (
+            orders / sessions
+            if orders is not None and sessions is not None and sessions != 0
+            else None
+        )
         ad_sales_share = (ad_units / units) if ad_units is not None and units is not None and units != 0 else None
         ad_order_share = (ad_orders / orders) if ad_orders is not None and orders is not None and orders != 0 else None
         # ACoAS is defined by the dashboard requirement as ad spend divided
@@ -3198,7 +3203,7 @@ async def amazon_dashboard_periodic(
             "ad_cost": ad_cost, "ad_cvr": ad_orders / clicks if ad_orders is not None and clicks is not None and clicks != 0 else (None if clicks is not None else item.get("source_ad_cvr")),
             "cpo": ad_cost / ad_orders if ad_cost is not None and ad_orders is not None and ad_orders != 0 else None,
             "ad_units": int(ad_units) if ad_units is not None else None, "ad_orders": int(ad_orders) if ad_orders is not None else None,
-            "cvr": item.get("source_cvr"), "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales is not None and ad_sales != 0 else (None if ad_sales is not None else item.get("source_acos")),
+            "cvr": calculated_cvr, "acos": ad_cost / ad_sales if ad_cost is not None and ad_sales is not None and ad_sales != 0 else (None if ad_sales is not None else item.get("source_acos")),
             "acoas": calculated_acoas, "ad_sales_share": ad_sales_share, "ad_order_share": ad_order_share, "ad_sales": ad_sales,
             "sessions": int(sessions) if sessions is not None else None,
             "page_views": int(page_views) if page_views is not None else None,
