@@ -41,6 +41,7 @@ Shopify 看板已经拆分为独立项目，由单独的仓库和 IdeaDock 项�
 其他可选变量：
 
 - `SYNC_API_KEY`：保护主动同步接口的内部调用密钥；看板只读查询在公司内网免密。
+- 看板浏览器保存动作通过 `GET /api/dashboard/write-token` 获取 30 分钟短期写权限；该权限绑定编辑者、允许来源和过期时间，不能替代或暴露 `SYNC_API_KEY`。
 - `DASHBOARD_API_KEY`：当前不用于只读看板查询，保留为未来重新启用鉴权时的兼容配置。
 - `SHOPIFY_STORES_JSON`：仅 Shopify 独立后端使用，不能配置到 Amazon 前端。
 - `SYNC_COOLDOWN_SECONDS`：同步冷却时间，默认 600 秒。

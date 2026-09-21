@@ -65,6 +65,8 @@ from app import (
     amazon_ads_chart_rows,
     amazon_ads_charts,
     dashboard_editor,
+    dashboard_write_token_valid,
+    issue_dashboard_write_token,
     normalize_week_start,
     migrate_amazon_monthly_targets,
     amazon_sid_accounts,
@@ -496,6 +498,44 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_business_access_does_not_require_key_for_internal_app(self):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))
+
+    def test_dashboard_write_token_is_short_lived_and_editor_bound(self):
+        origin = "https://ideadock.shuidihuzhu.com"
+        with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
+            issued = issue_dashboard_write_token("%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=1_000)
+            self.assertEqual(issued["editor"], "编辑者-abc")
+            self.assertTrue(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=1_001))
+            self.assertFalse(dashboard_write_token_valid(issued["token"], "another-editor", origin, now=1_001))
+            self.assertFalse(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=2_901))
+
+            with TestClient(app_module.app) as client:
+                denied = client.get("/api/dashboard/write-token", headers={
+                    "Origin": "https://example.test",
+                    "X-Dashboard-Editor": "pytest",
+                })
+                self.assertEqual(denied.status_code, 403)
+
+                response = client.get("/api/dashboard/write-token", headers={
+                    "Origin": origin,
+                    "X-Dashboard-Editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc",
+                })
+                self.assertEqual(response.status_code, 200)
+                token = response.json()["token"]
+
+                accepted = client.post("/api/keyword-dashboard/terms", json={}, headers={
+                    "Origin": origin,
+                    "X-Dashboard-Editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc",
+                    "X-Dashboard-Write-Token": token,
+                })
+                self.assertEqual(accepted.status_code, 422)
+
+                rejected = client.post("/api/keyword-dashboard/terms", json={}, headers={
+                    "Origin": origin,
+                    "X-Dashboard-Editor": "someone-else",
+                    "X-Dashboard-Write-Token": token,
+                })
+                self.assertEqual(rejected.status_code, 401)
+                self.assertIn("X-Sync-Key", rejected.json()["detail"])
 
     def test_strategy_and_series_must_be_set_together(self):
         self.assertIn("bundle", AMAZON_STRATEGY_OPTIONS)

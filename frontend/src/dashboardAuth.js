@@ -35,10 +35,68 @@ function safeHeaders(headers) {
   )
 }
 
-export function dashboardHeaders() {
+function staticDashboardKey() {
   const key = String(import.meta.env?.VITE_DASHBOARD_API_KEY || "").trim()
+  return key || null
+}
+
+const writeTokenState = {
+  editor: null,
+  token: null,
+  expiresAt: 0,
+  promise: null,
+}
+
+function dashboardWriteTokenUrl(url) {
+  const value = String(url)
+  const apiIndex = value.indexOf("/api/")
+  const base = apiIndex >= 0 ? value.slice(0, apiIndex) : new URL("/", value).toString().replace(/\/$/, "")
+  return `${base}/api/dashboard/write-token`
+}
+
+async function requestDashboardWriteToken(editor, targetUrl) {
+  const response = await fetch(dashboardWriteTokenUrl(targetUrl), {
+    cache: "no-store",
+    headers: safeHeaders({ "X-Dashboard-Editor": editor }),
+  })
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new DashboardApiError(dashboardApiErrorMessage(body, response.status), response.status, body)
+  }
+  return body
+}
+
+async function ensureDashboardWriteToken(targetUrl) {
+  const editor = dashboardEditorId()
+  const now = Date.now()
+  if (writeTokenState.editor === editor && writeTokenState.token && writeTokenState.expiresAt > now + 60_000) {
+    return writeTokenState.token
+  }
+  if (!writeTokenState.promise) {
+    writeTokenState.promise = requestDashboardWriteToken(editor, targetUrl)
+      .then((body) => {
+        const token = String(body?.token || "")
+        const expiresAtMilliseconds = Number(body?.expires_at)
+        if (!token || !Number.isFinite(expiresAtMilliseconds)) {
+          throw new DashboardApiError("看板写权限获取失败", 502, body)
+        }
+        writeTokenState.editor = editor
+        writeTokenState.token = token
+        writeTokenState.expiresAt = expiresAtMilliseconds * 1000
+        return token
+      })
+      .finally(() => {
+        writeTokenState.promise = null
+      })
+  }
+  return writeTokenState.promise
+}
+
+function dashboardHeaders(writeToken = null) {
+  const key = staticDashboardKey()
   return safeHeaders({
     ...(key ? { "X-Sync-Key": key } : {}),
+    ...(writeToken ? { "X-Dashboard-Write-Token": writeToken } : {}),
     "X-Dashboard-Editor": dashboardEditorId(),
   })
 }
@@ -48,11 +106,29 @@ export function clearDashboardKey() {
 }
 
 export async function fetchWithDashboardAuth(url, options = {}) {
-  const response = await fetch(url, {
+  const method = String(options.method || "GET").toUpperCase()
+  const isWriteMethod = method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
+  let writeToken = null
+  let headers = dashboardHeaders()
+  if (isWriteMethod && !staticDashboardKey()) {
+    writeToken = await ensureDashboardWriteToken(url)
+    headers = dashboardHeaders(writeToken)
+  }
+  let response = await fetch(url, {
     cache: "no-store",
     ...options,
-    headers: safeHeaders({ ...(options.headers || {}), ...dashboardHeaders() }),
+    headers: safeHeaders({ ...(options.headers || {}), ...headers }),
   })
+  if (response.status === 401 && isWriteMethod && writeToken) {
+    writeTokenState.token = null
+    writeTokenState.expiresAt = 0
+    writeToken = await ensureDashboardWriteToken(url)
+    response = await fetch(url, {
+      cache: "no-store",
+      ...options,
+      headers: safeHeaders({ ...(options.headers || {}), ...dashboardHeaders(writeToken) }),
+    })
+  }
   return response
 }
 

@@ -69,7 +69,7 @@ app.add_middleware(
     allow_origins=_DASHBOARD_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Sync-Key", "X-Dashboard-Editor"],
+    allow_headers=["Content-Type", "X-Sync-Key", "X-Dashboard-Editor", "X-Dashboard-Write-Token"],
 )
 
 
@@ -81,9 +81,63 @@ def require_business_access(
     """Allow public read-only access while protecting state-changing APIs."""
     if allow_public:
         return None
+    if _dashboard_write_authorized.get():
+        return None
     expected = os.environ.get("SYNC_API_KEY")
     if not expected or not x_sync_key or not hmac.compare_digest(x_sync_key, expected):
         raise HTTPException(status_code=401, detail="看板接口需要有效的 X-Sync-Key")
+
+
+def dashboard_write_token_signature(editor: str, origin: str, expires_at: int) -> str:
+    expected = os.environ.get("SYNC_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=503, detail="看板写接口未配置访问密钥")
+    message = f"dashboard-write-v1\n{editor}\n{origin}\n{expires_at}".encode()
+    digest = hmac.new(expected.encode(), message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def issue_dashboard_write_token(
+    editor: str | None,
+    origin: str | None,
+    *,
+    now: int | None = None,
+) -> dict[str, Any]:
+    normalized_origin = (origin or "").rstrip("/")
+    if not normalized_origin or normalized_origin not in _DASHBOARD_ORIGINS:
+        raise HTTPException(status_code=403, detail="看板写权限来源不允许")
+    editor_value = str(editor or "").strip() or "Editor-anonymous"
+    issued_at = int(now if now is not None else time.time())
+    expires_at = issued_at + 30 * 60
+    signature = dashboard_write_token_signature(editor_value, normalized_origin, expires_at)
+    return {
+        "token": f"{expires_at}.{signature}",
+        "expires_at": expires_at,
+        "editor": dashboard_editor(editor_value),
+        "expires_in": expires_at - issued_at,
+    }
+
+
+def dashboard_write_token_valid(
+    token: str | None,
+    editor: str | None,
+    origin: str | None,
+    *,
+    now: int | None = None,
+) -> bool:
+    if not token or "." not in token:
+        return False
+    raw_expires, signature = token.rsplit(".", 1)
+    if not raw_expires.isdigit():
+        return False
+    expires_at = int(raw_expires)
+    if expires_at <= int(now if now is not None else time.time()):
+        return False
+    normalized_origin = (origin or "").rstrip("/")
+    if not normalized_origin or normalized_origin not in _DASHBOARD_ORIGINS:
+        return False
+    expected_signature = dashboard_write_token_signature(str(editor or "").strip(), normalized_origin, expires_at)
+    return hmac.compare_digest(signature, expected_signature)
 
 Base = declarative_base()
 _engine = None
@@ -101,6 +155,10 @@ _keyword_unavailable_weeks_lock = threading.RLock()
 _keyword_unavailable_weeks: dict[tuple[str, date], datetime] = {}
 _xiyou_keyword_dashboard_scope: ContextVar[bool] = ContextVar(
     "xiyou_keyword_dashboard_scope",
+    default=False,
+)
+_dashboard_write_authorized: ContextVar[bool] = ContextVar(
+    "dashboard_write_authorized",
     default=False,
 )
 _amazon_cache_scope: ContextVar[str] = ContextVar(
@@ -185,13 +243,21 @@ async def scope_dashboard_request(request: Request, call_next):
     }
     namespace = next((value for prefix, value in cache_namespaces.items() if path.startswith(prefix)), "shared")
     cache_token = _amazon_cache_scope.set(namespace)
+    authorization_token = None
     try:
         if method not in {"GET", "HEAD", "OPTIONS"}:
             expected_key = os.environ.get("SYNC_API_KEY")
             supplied_key = request.headers.get("X-Sync-Key")
+            supplied_write_token = request.headers.get("X-Dashboard-Write-Token")
             if not expected_key:
                 return JSONResponse(status_code=503, content={"detail": "看板写接口未配置访问密钥"})
-            if not supplied_key or not hmac.compare_digest(supplied_key, expected_key):
+            if supplied_write_token and dashboard_write_token_valid(
+                supplied_write_token,
+                request.headers.get("X-Dashboard-Editor"),
+                request.headers.get("Origin"),
+            ):
+                authorization_token = _dashboard_write_authorized.set(True)
+            elif not supplied_key or not hmac.compare_digest(supplied_key, expected_key):
                 return JSONResponse(status_code=401, content={"detail": "看板接口需要有效的 X-Sync-Key"})
             origin = request.headers.get("Origin")
             if origin and origin.rstrip("/") not in _DASHBOARD_ORIGINS:
@@ -201,6 +267,8 @@ async def scope_dashboard_request(request: Request, call_next):
                 return await call_next(request)
         return await call_next(request)
     finally:
+        if authorization_token is not None:
+            _dashboard_write_authorized.reset(authorization_token)
         _amazon_cache_scope.reset(cache_token)
 KEYWORD_CATEGORIES = (
     "comu品牌词",
@@ -2574,6 +2642,16 @@ def dashboard_payload(db: Session, start: date, end: date, store: str | None) ->
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/dashboard/write-token")
+def dashboard_write_token(request: Request):
+    """Issue a short-lived browser write credential without exposing SYNC_API_KEY."""
+
+    return issue_dashboard_write_token(
+        request.headers.get("X-Dashboard-Editor"),
+        request.headers.get("Origin"),
+    )
 
 
 @app.get("/__ideadock/verify/mysql")

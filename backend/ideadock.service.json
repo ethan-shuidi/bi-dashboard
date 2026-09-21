@@ -19,6 +19,12 @@
       ]
     },
     {
+      "path": "/api/dashboard/write-token",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
       "path": "/api/sync",
       "methods": [
         "POST"
