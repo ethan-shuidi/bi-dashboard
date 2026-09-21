@@ -24,7 +24,6 @@ const store = ref("")
 const activeDashboard = ref("amazon")
 const sidebarCollapsed = ref(true)
 const dashboardNavDefaults = [
-  { key: "commerce", label: "Shopify数据看板", icon: "⌁" },
   { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
   { key: "amazon-sales", label: "Amazon-销售看板", icon: "◎" },
   { key: "keyword", label: "Amazon-ABA排名", icon: "⌕" },
