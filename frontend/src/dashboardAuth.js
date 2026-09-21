@@ -1,7 +1,7 @@
 import { ElMessageBox } from "element-plus"
 
 const editorStorageKey = "ideadock.dashboard.editor-id.v1"
-const anonymousEditorPrefix = "编辑者"
+const anonymousEditorPrefix = "Editor"
 
 function randomEditorToken() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID().slice(0, 8)
@@ -16,16 +16,31 @@ export function dashboardEditorId() {
     window.localStorage.setItem(editorStorageKey, created)
     return created
   } catch {
-    return `${anonymousEditorPrefix}-临时`
+    return `${anonymousEditorPrefix}-local`
   }
 }
 
+function safeHttpHeaderValue(value) {
+  const normalized = String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+  return Array.from(normalized).map((char) => (
+    char.charCodeAt(0) <= 0xff ? char : encodeURIComponent(char)
+  )).join("")
+}
+
+function safeHeaders(headers) {
+  return Object.fromEntries(
+    Object.entries(headers || {}).map(([name, value]) => [name, safeHttpHeaderValue(value)])
+  )
+}
+
 export function dashboardHeaders() {
-  const key = String(import.meta.env.VITE_DASHBOARD_API_KEY || "").trim()
-  return {
+  const key = String(import.meta.env?.VITE_DASHBOARD_API_KEY || "").trim()
+  return safeHeaders({
     ...(key ? { "X-Sync-Key": key } : {}),
     "X-Dashboard-Editor": dashboardEditorId(),
-  }
+  })
 }
 
 export function clearDashboardKey() {
@@ -36,7 +51,7 @@ export async function fetchWithDashboardAuth(url, options = {}) {
   const response = await fetch(url, {
     cache: "no-store",
     ...options,
-    headers: { ...(options.headers || {}), ...dashboardHeaders() },
+    headers: safeHeaders({ ...(options.headers || {}), ...dashboardHeaders() }),
   })
   return response
 }

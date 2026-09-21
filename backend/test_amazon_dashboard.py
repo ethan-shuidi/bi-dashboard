@@ -64,6 +64,7 @@ from app import (
     amazon_week_label,
     amazon_ads_chart_rows,
     amazon_ads_charts,
+    dashboard_editor,
     normalize_week_start,
     migrate_amazon_monthly_targets,
     amazon_sid_accounts,
@@ -144,6 +145,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
 
     def tearDown(self):
         reset_mcp_test_state()
+
+    def test_dashboard_editor_header_is_decoded_after_safe_transport(self):
+        encoded = "%E7%BC%96%E8%BE%91%E8%80%85-abc"
+        self.assertEqual(dashboard_editor(encoded), "编辑者-abc")
+        self.assertEqual(dashboard_editor("pytest"), "pytest")
+        self.assertEqual(dashboard_editor("100%"), "100%")
 
     def test_lingxing_mcp_result_decodes_text_business_payload(self):
         payload = {

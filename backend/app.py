@@ -15,7 +15,7 @@ import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -724,6 +724,13 @@ def parse_datetime(value: str | None) -> datetime | None:
 
 def dashboard_editor(value: str | None) -> str:
     editor = str(value or "").strip()
+    # Browser fetch headers only accept ISO-8859-1 values. The frontend sends
+    # percent-encoded text for non-ASCII editor IDs; restore it before storing.
+    try:
+        editor = unquote(editor, errors="strict")
+    except UnicodeDecodeError:
+        pass
+    editor = editor.replace("\x00", " ").strip()
     return editor[:80] if editor else "未知编辑者"
 
 
