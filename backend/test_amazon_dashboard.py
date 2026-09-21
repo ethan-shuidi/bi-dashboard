@@ -1017,12 +1017,18 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_sales_period_change_uses_absolute_difference_and_metric_direction(self):
         ad_cvr = amazon_sales_period_change("ad_cvr", 0.10, 0.09)
         cpc = amazon_sales_period_change("cpc", 0.90, 1.00)
+        aov = amazon_sales_period_change("aov", 110.00, 100.00)
+        ad_cost = amazon_sales_period_change("ad_cost", 110.00, 100.00)
         unchanged = amazon_sales_period_change("units", 100, 100)
         missing = amazon_sales_period_change("units", None, 100)
         self.assertAlmostEqual(ad_cvr["value"], 0.01)
         self.assertEqual(ad_cvr["status"], "red")
         self.assertAlmostEqual(cpc["value"], -0.10)
         self.assertEqual(cpc["status"], "red")
+        self.assertAlmostEqual(aov["value"], 10.00)
+        self.assertEqual(aov["status"], "red")
+        self.assertAlmostEqual(ad_cost["value"], 10.00)
+        self.assertEqual(ad_cost["status"], "green")
         self.assertEqual(unchanged["status"], "gray")
         self.assertEqual((missing["value"], missing["status"]), (None, ""))
 

@@ -282,6 +282,9 @@ AMAZON_SALES_METRICS = (
         "target_formula": "CPC × 广告点击",
     },
 )
+AMAZON_SALES_COMPARISON_LOWER_IS_BETTER = frozenset(
+    {"cpc", "ad_sales_share", "acoas", "ad_cost"}
+)
 AMAZON_SALES_TARGET_FIELDS = tuple(metric["key"] for metric in AMAZON_SALES_METRICS if metric.get("target_input"))
 AMAZON_SITE_ORDER = ("美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典")
 AMAZON_SITE_CODES = {"美国": "US", "日本": "JP", "德国": "DE", "英国": "UK", "法国": "FR", "加拿大": "CA", "澳洲": "AU", "西班牙": "ES", "意大利": "IT", "荷兰": "NL", "比利时": "BE", "墨西哥": "MX", "爱尔兰": "IE", "波兰": "PL", "瑞典": "SE"}
@@ -1266,7 +1269,8 @@ def amazon_sales_period_change(
 
     Ratio metrics keep their native unit and are formatted as percentage
     points in the frontend. Red/green follows each metric's business direction:
-    for example, CPC falling is red, while ad CVR rising is red.
+    for example, CPC falling is red, AOV and ad CVR rising are red, while ad
+    spend rising is green.
     """
     definition = next(item for item in AMAZON_SALES_METRICS if item["key"] == metric_key)
     if current is None or previous is None:
@@ -1275,7 +1279,7 @@ def amazon_sales_period_change(
     epsilon = 1e-9
     if abs(value) <= epsilon:
         status = "gray"
-    elif definition.get("difference_rule", "higher_is_red") == "lower_is_red":
+    elif metric_key in AMAZON_SALES_COMPARISON_LOWER_IS_BETTER:
         status = "red" if value < 0 else "green"
     else:
         status = "red" if value > 0 else "green"
