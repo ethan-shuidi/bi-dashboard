@@ -1,15 +1,32 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
-import { init, use } from "echarts/core"
-import { BarChart, LineChart } from "echarts/charts"
-import { AriaComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components"
-import { CanvasRenderer } from "echarts/renderers"
-import AmazonDashboard from "./AmazonDashboard.vue"
-import AmazonSalesDashboard from "./AmazonSalesDashboard.vue"
-import KeywordDashboard from "./KeywordDashboard.vue"
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
 
-use([LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, AriaComponent, CanvasRenderer])
+const AmazonDashboard = defineAsyncComponent(() => import("./AmazonDashboard.vue"))
+const AmazonSalesDashboard = defineAsyncComponent(() => import("./AmazonSalesDashboard.vue"))
+const KeywordDashboard = defineAsyncComponent(() => import("./KeywordDashboard.vue"))
+
+let legacyEChartsLoader
+function ensureLegacyECharts() {
+  legacyEChartsLoader ??= Promise.all([
+    import("echarts/core"),
+    import("echarts/charts"),
+    import("echarts/components"),
+    import("echarts/renderers"),
+  ]).then(([{ init, use }, charts, components, renderers]) => {
+    use([
+      charts.LineChart,
+      charts.BarChart,
+      components.GridComponent,
+      components.TooltipComponent,
+      components.LegendComponent,
+      components.AriaComponent,
+      renderers.CanvasRenderer,
+    ])
+    return init
+  })
+  return legacyEChartsLoader
+}
 
 const apiBase = ref("")
 const loading = ref(true)
@@ -140,7 +157,7 @@ function onDashboardDrop() {
   localStorage.setItem(dashboardNavStorageKey, JSON.stringify(next))
 }
 
-function renderSalesChart() {
+function renderSalesChart(init) {
   if (!salesChartElement.value || !dashboard.value?.daily?.length) return
   if (!salesChart || salesChart.getDom() !== salesChartElement.value) {
     salesChart?.dispose()
@@ -172,7 +189,7 @@ function renderSalesChart() {
   }, true)
 }
 
-function renderProductChart() {
+function renderProductChart(init) {
   if (!productChartElement.value || !dashboard.value?.sku_breakdown?.length) return
   if (!productChart || productChart.getDom() !== productChartElement.value) {
     productChart?.dispose()
@@ -194,8 +211,10 @@ async function renderCharts() {
   await nextTick()
   if (salesChartElement.value) resizeObserver?.observe(salesChartElement.value)
   if (productChartElement.value) resizeObserver?.observe(productChartElement.value)
-  renderSalesChart()
-  renderProductChart()
+  if (!dashboard.value?.daily?.length && !dashboard.value?.sku_breakdown?.length) return
+  const init = await ensureLegacyECharts()
+  renderSalesChart(init)
+  renderProductChart(init)
 }
 
 async function loadRuntime() {

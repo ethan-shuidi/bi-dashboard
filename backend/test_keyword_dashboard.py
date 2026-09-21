@@ -271,24 +271,33 @@ class KeywordDashboardTests(unittest.TestCase):
 
     def test_rejects_duplicate_keywords_before_database_write(self):
         client = TestClient(app)
-        response = client.post("/api/keyword-dashboard/terms", json={
-            "site": "美国",
-            "terms": [
-                {"category": "AI核心词", "keyword": "Power Bank"},
-                {"category": "AI核心词", "keyword": "power   bank"},
-            ],
-        })
+        with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
+            response = client.post("/api/keyword-dashboard/terms", json={
+                "site": "美国",
+                "terms": [
+                    {"category": "AI核心词", "keyword": "Power Bank"},
+                    {"category": "AI核心词", "keyword": "power   bank"},
+                ],
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
         self.assertEqual(response.status_code, 422)
         self.assertIn("关键词重复", response.json()["detail"])
 
     def test_rejects_keyword_category_outside_fixed_options(self):
         client = TestClient(app)
-        response = client.post("/api/keyword-dashboard/terms", json={
-            "site": "美国",
-            "terms": [{"category": "核心词", "keyword": "Power Bank"}],
-        })
+        with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
+            response = client.post("/api/keyword-dashboard/terms", json={
+                "site": "美国",
+                "terms": [{"category": "核心词", "keyword": "Power Bank"}],
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
         self.assertEqual(response.status_code, 422)
         self.assertIn("关键词分类无效", response.json()["detail"])
+
+    def test_write_without_dashboard_key_is_rejected(self):
+        client = TestClient(app)
+        with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
+            response = client.post("/api/keyword-dashboard/terms", json={})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("X-Sync-Key", response.json()["detail"])
 
 
 if __name__ == "__main__":

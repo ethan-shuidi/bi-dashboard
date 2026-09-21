@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessageBox } from "element-plus"
-import { fetchWithDashboardAuth } from "./dashboardAuth"
+import { apiWithDashboardAuth, chooseEditConflictAction, formatDashboardEditMetadata } from "./dashboardAuth"
+import DashboardState from "./DashboardState.vue"
 import WeekPicker from "./WeekPicker.vue"
 
 const props = defineProps({ apiBase: { type: String, required: true } })
@@ -28,9 +29,12 @@ const loading = ref(false)
 const saving = ref(false)
 const error = ref("")
 const notice = ref("")
+const rangeWarning = ref("")
 const data = ref(null)
 const terms = ref([])
 const savedTerms = ref([])
+const termsEdit = ref({ updated_at: null, updated_by: null })
+const baseUpdatedAt = ref(null)
 const endWeek = ref("")
 const startWeek = ref("")
 const addRowCount = ref(10)
@@ -109,18 +113,10 @@ function syncQuickRange() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetchWithDashboardAuth(`${props.apiBase}${path}`, {
+  return apiWithDashboardAuth(`${props.apiBase}${path}`, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    const detail = body?.detail
-    if (typeof detail === "string" && detail) throw new Error(detail)
-    if (Array.isArray(detail) && detail.length) throw new Error(detail[0]?.msg || `请求失败：HTTP ${response.status}`)
-    throw new Error(`请求失败：HTTP ${response.status}`)
-  }
-  return body
 }
 
 const weeks = computed(() => data.value?.weeks || [])
@@ -262,6 +258,8 @@ async function loadTerms(nextSite = site.value) {
   if (requestSeq !== termsRequestSeq) return
   terms.value = normalizeTerms(payload)
   savedTerms.value = termPayload()
+  termsEdit.value = { updated_at: payload.updated_at || null, updated_by: payload.updated_by || null }
+  baseUpdatedAt.value = payload.updated_at || null
 }
 
 async function loadDashboard({ refresh = false } = {}) {
@@ -269,6 +267,7 @@ async function loadDashboard({ refresh = false } = {}) {
   const requestSeq = ++dashboardRequestSeq
   loading.value = true
   error.value = ""
+  rangeWarning.value = ""
   try {
     const query = new URLSearchParams({
       site: site.value,
@@ -285,7 +284,7 @@ async function loadDashboard({ refresh = false } = {}) {
     }
     if (!dirty.value) applySavedDashboardOrder()
     const warnings = data.value?.warnings || []
-    if (warnings.length) error.value = warnings.join("；")
+    if (warnings.length) rangeWarning.value = warnings.join("；")
   } catch (exception) {
     if (requestSeq !== dashboardRequestSeq) return
     error.value = exception.message || "关键词数据加载失败"
@@ -379,7 +378,7 @@ function applySavedDashboardOrder() {
   savedTerms.value = termPayload()
 }
 
-async function saveTerms() {
+async function saveTerms({ force = false } = {}) {
   const payload = termPayload()
   if (payload.some((item) => !item.keyword)) {
     error.value = "关键词不能为空"
@@ -395,13 +394,27 @@ async function saveTerms() {
   try {
     const saved = await api("/api/keyword-dashboard/terms", {
       method: "POST",
-      body: JSON.stringify({ site: site.value, terms: payload }),
+      body: JSON.stringify({ site: site.value, terms: payload, base_updated_at: baseUpdatedAt.value, force }),
     })
     terms.value = normalizeTerms(saved)
     savedTerms.value = termPayload()
+    termsEdit.value = { updated_at: saved.updated_at || null, updated_by: saved.updated_by || null }
+    baseUpdatedAt.value = saved.updated_at || null
     await loadDashboard()
     notice.value = error.value ? "关键词配置已保存，部分 ABA 数据未拉取" : "关键词配置已保存，排序与历史数据已更新"
   } catch (exception) {
+    const action = await chooseEditConflictAction(exception)
+    if (action === "overwrite") {
+      try {
+        await saveTerms({ force: true })
+      } catch {}
+      return
+    }
+    if (action === "reload") {
+      await loadTerms()
+      notice.value = "已加载云端关键词配置"
+      return
+    }
     error.value = exception.message || "关键词配置保存失败"
   } finally {
     saving.value = false
@@ -542,7 +555,7 @@ watch(endWeek, (value) => {
   const latest = isoDate(latestCompletedWeek())
   if (value && value > latest) {
     endWeek.value = latest
-    notice.value = "西柚 ABA 仅支持已完成周，已自动切换到上一个已完成周"
+    rangeWarning.value = "西柚 ABA 仅支持已完成周，已自动切换到上一个已完成周"
     return
   }
   if (value && startWeek.value && value < startWeek.value) startWeek.value = value
@@ -592,6 +605,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="keyword-head-actions">
         <span v-if="data" :class="['keyword-cache', { cached: data.cached }]">{{ data.cached ? "历史数据" : "新抓取" }}</span>
+        <span class="keyword-edit-meta">{{ formatDashboardEditMetadata(termsEdit) }}</span>
         <button type="button" :disabled="loading" @click="refreshDashboard">{{ loading ? "同步中…" : "刷新" }}</button>
         <button class="primary" type="button" :disabled="saving || loading" @click="saveTerms">{{ saving ? "保存中…" : dirty ? "保存*" : "保存" }}</button>
       </div>
@@ -647,9 +661,10 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section v-if="error" class="keyword-message error" role="alert">{{ error }}</section>
+    <DashboardState v-if="error" state="error" title="ABA 数据加载或保存失败" :message="error" />
+    <DashboardState v-else-if="rangeWarning" state="warning" title="周范围已自动调整" :message="rangeWarning" />
     <section v-if="notice" class="keyword-message success" role="status">{{ notice }}</section>
-    <section v-if="loading && !tableRows.length" class="keyword-message muted">正在获取西柚 ABA 数据…</section>
+    <DashboardState v-if="loading && !tableRows.length" state="loading" title="西柚 ABA" message="正在获取西柚 ABA 数据…" />
 
     <section class="keyword-table-panel" aria-label="搜索词周度数据">
       <div class="keyword-table-wrap">
@@ -850,7 +865,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .keyword-dashboard{min-width:0;padding:22px;color:#17324d}
-.keyword-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.keyword-head span{color:#6d7f95;font-size:12px;font-weight:750}.keyword-head h1{margin:3px 0 0;color:#12315d;font-size:24px}.keyword-head p{margin:6px 0 0;color:#6d7f95;font-size:13px}.keyword-head-actions{display:flex;align-items:center;gap:8px}.keyword-head-actions button{height:36px;padding:0 14px;border:1px solid #c9dbf0;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.keyword-head-actions .primary{border-color:#1e57c8;background:#1e57c8;color:#fff}.keyword-head-actions button:disabled{opacity:.6;cursor:not-allowed}.keyword-cache{height:28px;display:inline-flex;align-items:center;padding:0 10px;border-radius:999px;background:#eef3f9;color:#65778c;font-size:12px;font-weight:750}.keyword-cache.cached{background:#e8f7ef;color:#19704b}
+.keyword-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.keyword-head span{color:#6d7f95;font-size:12px;font-weight:750}.keyword-head h1{margin:3px 0 0;color:#12315d;font-size:24px}.keyword-head p{margin:6px 0 0;color:#6d7f95;font-size:13px}.keyword-head-actions{display:flex;align-items:center;gap:8px}.keyword-head-actions button{height:36px;padding:0 14px;border:1px solid #c9dbf0;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.keyword-head-actions .primary{border-color:#1e57c8;background:#1e57c8;color:#fff}.keyword-head-actions button:disabled{opacity:.6;cursor:not-allowed}.keyword-cache,.keyword-edit-meta{height:28px;display:inline-flex;align-items:center;padding:0 10px;border-radius:999px;background:#eef3f9;color:#65778c;font-size:12px;font-weight:750}.keyword-cache.cached{background:#e8f7ef;color:#19704b}
 .keyword-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label,.column-width-control{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}.row-gap-control{align-content:center}.row-gap-control input{width:100%;height:24px;margin:5px 0;accent-color:#1e57c8}.row-gap-control small{color:#526b88;font-size:12px;font-weight:750;text-align:right}.column-width-control{align-content:end}.column-width-control button{height:42px;padding:0 12px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:750;cursor:pointer}.column-width-control button:hover{background:#f2f8ff}
 .keyword-message{margin-top:16px;padding:12px 14px;border-radius:10px;font-size:13px}.keyword-message.error{background:#fff2f4;color:#ad2745}.keyword-message.success{background:#edfaf3;color:#17724c}.keyword-message.muted{background:#f7fafd;color:#6d7f95}
 .keyword-filters :deep(.el-select){width:100%}.keyword-filters :deep(.el-select__wrapper){min-height:42px;border-radius:9px;background:#fff;box-shadow:0 0 0 1px #d5e2f1 inset}.keyword-filters :deep(.el-select__wrapper:hover){box-shadow:0 0 0 1px #adc8e8 inset}

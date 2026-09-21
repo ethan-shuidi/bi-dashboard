@@ -730,10 +730,12 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         ]
         with patch.object(app_module, "_engine", database), \
              patch.object(app_module, "_session_factory", factory), \
+             patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}), \
              TestClient(app_module.app) as client:
             response = client.post("/api/amazon/sales-dashboard/targets/bulk", json={
                 "year": 2026, "month": 9, "model": "TN10", "items": items,
-            })
+                "base_updated_at": "2026-09-17T00:00:00+00:00",
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -770,10 +772,11 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         ]
         with patch.object(app_module, "_engine", database), \
              patch.object(app_module, "_session_factory", factory), \
+             patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}), \
              TestClient(app_module.app) as client:
             response = client.post("/api/amazon/sales-dashboard/weekly/targets/bulk", json={
                 "week_start": "2026-09-14", "model": "TN20", "items": items,
-            })
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])

@@ -1,6 +1,8 @@
 <script setup>
-import SalesTargetModule from "./SalesTargetModule.vue"
-import AmazonPlanBoard from "./AmazonPlanBoard.vue"
+import { defineAsyncComponent } from "vue"
+
+const SalesTargetModule = defineAsyncComponent(() => import("./SalesTargetModule.vue"))
+const AmazonPlanBoard = defineAsyncComponent(() => import("./AmazonPlanBoard.vue"))
 
 defineProps({
   apiBase: { type: String, required: true },

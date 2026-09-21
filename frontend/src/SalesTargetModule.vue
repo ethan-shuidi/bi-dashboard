@@ -1,7 +1,8 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessageBox } from "element-plus"
-import { fetchWithDashboardAuth } from "./dashboardAuth"
+import { apiWithDashboardAuth, chooseEditConflictAction, formatDashboardEditMetadata } from "./dashboardAuth"
+import DashboardState from "./DashboardState.vue"
 import WeekPicker from "./WeekPicker.vue"
 
 const props = defineProps({
@@ -40,6 +41,8 @@ const error = ref("")
 const notice = ref("")
 const targetDraft = ref({})
 const savedTargets = ref({})
+const targetEdit = ref({ updated_at: null, updated_by: null })
+const baseUpdatedAt = ref(null)
 const quickTargetOpen = ref(false)
 const quickTargetDraft = ref({})
 const quickTargetSaving = ref(false)
@@ -98,13 +101,10 @@ const weekEnd = computed(() => {
 const weekRangeLabel = computed(() => `${formatDotDate(weekStart.value)}~${formatDotDate(weekEnd.value)}`)
 
 async function api(path, options = {}) {
-  const response = await fetchWithDashboardAuth(`${props.apiBase}${path}`, {
+  return apiWithDashboardAuth(`${props.apiBase}${path}`, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(body.detail || `请求失败：HTTP ${response.status}`)
-  return body
 }
 
 function syncDraft(targets = {}) {
@@ -132,6 +132,8 @@ async function loadDashboard({ refresh = false } = {}) {
     const body = await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}?${query}`)
     if (requestSeq !== dashboardRequestSeq) return
     data.value = body
+    targetEdit.value = body.target_edit || { updated_at: null, updated_by: null }
+    baseUpdatedAt.value = targetEdit.value.updated_at || null
     syncDraft(data.value.targets)
   } catch (exception) {
     if (requestSeq !== dashboardRequestSeq) return
@@ -201,7 +203,7 @@ function changeSite(nextSite) {
   site.value = nextSite
 }
 
-async function saveTargets() {
+async function saveTargets({ force = false } = {}) {
   if (isEuropeSite.value) {
     error.value = "欧洲销量目标由各国目标汇总，请使用快速写入目标"
     return
@@ -226,11 +228,23 @@ async function saveTargets() {
       : { year: year.value, month: month.value, model: model.value, site: site.value, targets }
     await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}/targets`, {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, base_updated_at: baseUpdatedAt.value, force }),
     })
     await loadDashboard()
     notice.value = `${dimensionName.value}目标已保存`
   } catch (exception) {
+    const action = await chooseEditConflictAction(exception)
+    if (action === "overwrite") {
+      try {
+        await saveTargets({ force: true })
+      } catch {}
+      return
+    }
+    if (action === "reload") {
+      await loadDashboard()
+      notice.value = `已加载云端${dimensionName.value}目标`
+      return
+    }
     error.value = exception.message
   } finally {
     saving.value = false
@@ -254,7 +268,7 @@ function closeQuickTargets() {
   quickTargetError.value = ""
 }
 
-async function saveQuickTargets() {
+async function saveQuickTargets({ force = false } = {}) {
   if (quickTargetSaving.value) return
   quickTargetSaving.value = true
   quickTargetError.value = ""
@@ -270,12 +284,25 @@ async function saveQuickTargets() {
       : { year: year.value, month: month.value, model: model.value, items }
     await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}/targets/bulk`, {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, base_updated_at: baseUpdatedAt.value, force }),
     })
     quickTargetOpen.value = false
     await loadDashboard()
     notice.value = `${dimensionName.value}各国销量目标已保存`
   } catch (exception) {
+    const action = await chooseEditConflictAction(exception)
+    if (action === "overwrite") {
+      try {
+        await saveQuickTargets({ force: true })
+      } catch {}
+      return
+    }
+    if (action === "reload") {
+      await loadDashboard()
+      quickTargetOpen.value = false
+      notice.value = `已加载云端${dimensionName.value}销量目标`
+      return
+    }
     quickTargetError.value = exception.message
   } finally {
     quickTargetSaving.value = false
@@ -464,9 +491,10 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
           <option v-for="item in siteOptions" :key="item" :value="item">{{ item }}</option>
         </select>
       </label>
-      <div class="sales-filter-scope">
-        <span>筛选范围</span>
-        <small>仅作用于销量进度和{{ dimensionName }}目标完成度</small>
+        <div class="sales-filter-scope">
+          <span>筛选范围</span>
+          <small>仅作用于销量进度和{{ dimensionName }}目标完成度</small>
+          <small>{{ formatDashboardEditMetadata(targetEdit) }}</small>
       </div>
       <div class="sales-filter-actions">
         <button class="sales-save-button" type="button" :disabled="saving || loading || isEuropeSite" :title="isEuropeSite ? '欧洲目标由各国销量目标汇总，请使用快速写入目标' : undefined" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
@@ -492,9 +520,9 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
       </div>
     </section>
 
-    <section v-if="error" class="message error-message" role="alert"><strong>数据加载失败</strong><span>{{ error }}</span></section>
+    <DashboardState v-if="error" state="error" title="数据加载或保存失败" :message="error" />
     <section v-if="notice" class="message success-message" role="status"><span>{{ notice }}</span></section>
-    <section v-if="loading" class="sales-loading">正在获取领星产品表现和云端目标…</section>
+    <DashboardState v-else-if="loading" state="loading" title="领星产品表现" message="正在获取领星产品表现和云端目标…" />
 
     <section v-else class="sales-table-panel">
       <header>

@@ -33,10 +33,13 @@ class DataSourceIsolationTests(unittest.TestCase):
         self.assertIn("西柚接口仅允许搜索词看板调用", source)
 
     def test_http_middleware_enables_xiyou_only_for_keyword_dashboard(self):
-        node = functions()["restrict_xiyou_to_keyword_dashboard"]
+        node = functions()["scope_dashboard_request"]
         source = ast.unparse(node)
         self.assertIn("/api/keyword-dashboard", source)
         self.assertIn("xiyou_keyword_dashboard_scope()", source)
+        self.assertIn("clear_current_namespace", APP_SOURCE)
+        self.assertIn("X-Sync-Key", source)
+        self.assertIn("X-Dashboard-Editor", APP_SOURCE)
 
     def test_amazon_and_lingxing_code_do_not_reference_xiyou(self):
         for name, node in functions().items():
@@ -55,6 +58,27 @@ class DataSourceIsolationTests(unittest.TestCase):
             any("lingxing" in identifier.lower() for identifier in values),
             "搜索词看板不允许引用领星数据链路",
         )
+
+    def test_cache_isolates_module_namespaces(self):
+        from app import ModuleScopedCache, _amazon_cache_scope
+
+        cache = ModuleScopedCache()
+        shared_token = _amazon_cache_scope.set("shared")
+        cache[("amazon-usd-fx", "US")] = ("meta", 1)
+        _amazon_cache_scope.reset(shared_token)
+
+        first_token = _amazon_cache_scope.set("first")
+        cache[("dashboard", "a")] = ("meta", "first")
+        cache.clear_current_namespace()
+        self.assertIsNone(cache.get(("dashboard", "a")))
+        self.assertEqual(cache[("amazon-usd-fx", "US")], ("meta", 1))
+        _amazon_cache_scope.reset(first_token)
+
+        second_token = _amazon_cache_scope.set("second")
+        cache[("dashboard", "a")] = ("meta", "second")
+        cache.clear_namespaces("first")
+        self.assertEqual(cache.get(("dashboard", "a")), ("meta", "second"))
+        _amazon_cache_scope.reset(second_token)
 
 
 if __name__ == "__main__":

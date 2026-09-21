@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
-import { fetchWithDashboardAuth } from "./dashboardAuth"
+import { apiWithDashboardAuth, chooseEditConflictAction, fetchWithDashboardAuth, formatDashboardEditMetadata } from "./dashboardAuth"
+import DashboardState from "./DashboardState.vue"
 import zhCn from "element-plus/es/locale/lang/zh-cn"
 import WeekPicker from "./WeekPicker.vue"
 
@@ -28,6 +29,8 @@ const weekStart = ref("")
 const site = ref("美国")
 const series = ref(DEFAULT_SERIES[0])
 const draft = ref({ review: "", plan: "" })
+const editMetadata = ref({ updated_at: null, updated_by: null })
+const baseUpdatedAt = ref(null)
 const loading = ref(false)
 const saving = ref(false)
 const error = ref("")
@@ -107,6 +110,8 @@ async function load() {
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
     if (requestSeq !== planRequestSeq) return
     draft.value = { review: data.review || "", plan: data.plan || "" }
+    editMetadata.value = { updated_at: data.updated_at || null, updated_by: data.updated_by || null }
+    baseUpdatedAt.value = data.updated_at || null
   } catch (exception) {
     if (requestSeq === planRequestSeq) error.value = exception.message || `${planTitle.value}加载失败`
   } finally {
@@ -114,19 +119,31 @@ async function load() {
   }
 }
 
-async function save() {
+async function save({ force = false } = {}) {
   saving.value = true
   error.value = ""
   try {
-    const response = await fetchWithDashboardAuth(`${props.apiBase}${planEndpoint.value}`, {
+    const data = await apiWithDashboardAuth(`${props.apiBase}${planEndpoint.value}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ week_start: weekStart.value, site: site.value, series: series.value, ...draft.value }),
+      body: JSON.stringify({ week_start: weekStart.value, site: site.value, series: series.value, base_updated_at: baseUpdatedAt.value, force, ...draft.value }),
     })
-    const data = await response.json()
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    editMetadata.value = { updated_at: data.updated_at || null, updated_by: data.updated_by || null }
+    baseUpdatedAt.value = data.updated_at || null
     showToast(`${planTitle.value}已保存到云端`)
   } catch (exception) {
+    const action = await chooseEditConflictAction(exception)
+    if (action === "overwrite") {
+      try {
+        await save({ force: true })
+      } catch {}
+      return
+    }
+    if (action === "reload") {
+      await load()
+      showToast(`已加载云端${planTitle.value}`)
+      return
+    }
     error.value = exception.message || `${planTitle.value}保存失败`
   } finally {
     saving.value = false
@@ -170,6 +187,7 @@ onBeforeUnmount(() => {
           <span class="section-label">共享编辑</span>
           <h2>{{ planTitle }}</h2>
           <p>{{ planDescription }}</p>
+          <small class="ad-plan-edit-meta">{{ formatDashboardEditMetadata(editMetadata) }}</small>
         </div>
         <button class="strategy-note-save" type="button" :disabled="saving || loading" @click="save">{{ saving ? "保存中" : "保存到云端" }}</button>
       </div>
@@ -193,7 +211,8 @@ onBeforeUnmount(() => {
           <small class="filter-meta-spacer" aria-hidden="true"></small>
         </label>
       </div>
-      <div v-if="error" class="strategy-board-error">{{ error }}</div>
+      <DashboardState v-if="error" state="error" title="数据加载或保存失败" :message="error" />
+      <DashboardState v-else-if="loading" state="loading" title="云端内容" message="正在获取共享编辑内容…" />
       <div class="ad-plan-grid">
         <label>
           <span>上周复盘</span>

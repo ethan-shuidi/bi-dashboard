@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import (
     Boolean,
     Column,
@@ -67,7 +68,7 @@ app.add_middleware(
     allow_origins=_DASHBOARD_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Sync-Key"],
+    allow_headers=["Content-Type", "X-Sync-Key", "X-Dashboard-Editor"],
 )
 
 
@@ -99,9 +100,61 @@ _xiyou_keyword_dashboard_scope: ContextVar[bool] = ContextVar(
     "xiyou_keyword_dashboard_scope",
     default=False,
 )
+_amazon_cache_scope: ContextVar[str] = ContextVar(
+    "amazon_cache_scope",
+    default="shared",
+)
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
-_amazon_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+
+
+class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
+    """Keep dashboard-level cache entries isolated by requesting module.
+
+    Immutable reference data (exchange rates and the store catalogue) stays in
+    a shared namespace. Raw upstream and derived dashboard entries follow the
+    current request namespace, so refreshing one dashboard cannot evict another
+    dashboard's completed response.
+    """
+
+    shared_prefixes = {
+        "amazon-usd-fx",
+        "lingxing-stores",
+        "lingxing-mcp-ad-shops",
+    }
+
+    @staticmethod
+    def storage_key(key: tuple[Any, ...]) -> tuple[str, tuple[Any, ...]]:
+        prefix = str(key[0]) if key else ""
+        namespace = "shared" if prefix in ModuleScopedCache.shared_prefixes else _amazon_cache_scope.get()
+        return (namespace, tuple(key))
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return super().get(self.storage_key(tuple(key)), default)
+
+    def __getitem__(self, key: Any) -> Any:
+        return super().__getitem__(self.storage_key(tuple(key)))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(self.storage_key(tuple(key)), value)
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        return super().pop(self.storage_key(tuple(key)), *default)
+
+    def clear_current_namespace(self) -> None:
+        namespace = _amazon_cache_scope.get()
+        for stored_key in list(self.keys()):
+            if stored_key[0] == namespace:
+                super().__delitem__(stored_key)
+
+    def clear_namespaces(self, *namespaces: str) -> None:
+        selected = set(namespaces)
+        for stored_key in list(self.keys()):
+            if stored_key[0] in selected:
+                super().__delitem__(stored_key)
+
+
+_amazon_cache = ModuleScopedCache()
 
 
 @contextmanager
@@ -116,13 +169,36 @@ def xiyou_keyword_dashboard_scope():
 
 
 @app.middleware("http")
-async def restrict_xiyou_to_keyword_dashboard(request: Request, call_next):
-    """Keep the Xiyou API boundary independent from Amazon/LingXing routes."""
+async def scope_dashboard_request(request: Request, call_next):
+    """Apply write auth and isolate dashboard caches and external APIs."""
 
-    if request.url.path.rstrip("/") == "/api/keyword-dashboard":
-        with xiyou_keyword_dashboard_scope():
-            return await call_next(request)
-    return await call_next(request)
+    path = request.url.path.rstrip("/")
+    method = request.method.upper()
+    cache_namespaces = {
+        "/api/amazon/dashboard": "amazon-product-dashboard",
+        "/api/amazon/ads-charts": "amazon-ads-charts",
+        "/api/amazon/strategy-board": "amazon-strategy-board",
+        "/api/amazon/sales-dashboard": "amazon-sales-targets",
+    }
+    namespace = next((value for prefix, value in cache_namespaces.items() if path.startswith(prefix)), "shared")
+    cache_token = _amazon_cache_scope.set(namespace)
+    try:
+        if method not in {"GET", "HEAD", "OPTIONS"}:
+            expected_key = os.environ.get("SYNC_API_KEY")
+            supplied_key = request.headers.get("X-Sync-Key")
+            if not expected_key:
+                return JSONResponse(status_code=503, content={"detail": "看板写接口未配置访问密钥"})
+            if not supplied_key or not hmac.compare_digest(supplied_key, expected_key):
+                return JSONResponse(status_code=401, content={"detail": "看板接口需要有效的 X-Sync-Key"})
+            origin = request.headers.get("Origin")
+            if origin and origin.rstrip("/") not in _DASHBOARD_ORIGINS:
+                return JSONResponse(status_code=403, content={"detail": "看板写接口来源不允许"})
+        if path == "/api/keyword-dashboard":
+            with xiyou_keyword_dashboard_scope():
+                return await call_next(request)
+        return await call_next(request)
+    finally:
+        _amazon_cache_scope.reset(cache_token)
 KEYWORD_CATEGORIES = (
     "comu品牌词",
     "AI核心词",
@@ -439,6 +515,7 @@ class AmazonCampaignStrategy(Base):
     campaign_name = Column(String(500), nullable=False, default="")
     strategy = Column(String(80), nullable=False, default="/")
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonCampaignAssignment(Base):
@@ -458,6 +535,7 @@ class AmazonCampaignAssignment(Base):
     series = Column(String(160), nullable=False, default="")
     product = Column(String(160), nullable=False, default="")
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonAdPlan(Base):
@@ -474,6 +552,7 @@ class AmazonAdPlan(Base):
     review = Column(Text, nullable=False, default="")
     plan = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonOperationPlan(Base):
@@ -490,6 +569,7 @@ class AmazonOperationPlan(Base):
     review = Column(Text, nullable=False, default="")
     plan = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonStrategyNote(Base):
@@ -508,6 +588,7 @@ class AmazonStrategyNote(Base):
     strategy = Column(String(80), nullable=False)
     note = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonMonthlyTarget(Base):
@@ -533,6 +614,7 @@ class AmazonMonthlyTarget(Base):
     target_ad_cvr = Column(Numeric(18, 8), nullable=True)
     target_ad_cost = Column(Numeric(18, 4), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class AmazonWeeklyTarget(Base):
@@ -554,6 +636,7 @@ class AmazonWeeklyTarget(Base):
     target_ad_sales_share = Column(Numeric(18, 8), nullable=True)
     target_ad_cvr = Column(Numeric(18, 8), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class KeywordDashboardTerm(Base):
@@ -572,6 +655,7 @@ class KeywordDashboardTerm(Base):
     sort_order = Column(Integer, nullable=False, default=0)
     enabled = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
 
 
 class KeywordDashboardWeeklyRecord(Base):
@@ -632,6 +716,61 @@ def parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is not None:
         return parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def dashboard_editor(value: str | None) -> str:
+    editor = str(value or "").strip()
+    return editor[:80] if editor else "未知编辑者"
+
+
+def edit_metadata(item: Any) -> dict[str, str | None]:
+    updated_at = getattr(item, "updated_at", None)
+    if updated_at is None:
+        return {"updated_at": None, "updated_by": None}
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return {
+        "updated_at": updated_at.isoformat(),
+        "updated_by": getattr(item, "updated_by", None),
+    }
+
+
+def ensure_edit_freshness(
+    item: Any,
+    base_updated_at: Any,
+    *,
+    force: bool = False,
+) -> None:
+    """Reject stale overwrites so shared edits do not silently replace each other."""
+
+    if force or item is None:
+        return
+    current = getattr(item, "updated_at", None)
+    if current is None:
+        return
+    if base_updated_at in (None, ""):
+        # New rows have no client version. An existing row requires a version.
+        raise_conflict(item)
+    try:
+        base = parse_datetime(str(base_updated_at))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="保存基准时间格式无效") from None
+    current_utc = current.astimezone(timezone.utc) if current.tzinfo is not None else current
+    if base is None or base < current_utc:
+        raise_conflict(item)
+
+
+def raise_conflict(item: Any) -> None:
+    raise HTTPException(status_code=409, detail={
+        "code": "edit_conflict",
+        "message": "云端内容已被其他人更新，请选择加载云端内容或覆盖保存。",
+        **edit_metadata(item),
+    })
+
+
+def latest_edit_metadata(items: list[Any]) -> dict[str, str | None]:
+    latest = max(items, key=lambda item: getattr(item, "updated_at", None) or datetime.min, default=None)
+    return edit_metadata(latest)
 
 
 def decimal_value(value: Any) -> Decimal:
@@ -1128,6 +1267,7 @@ def amazon_sales_country_target_payload(items: list[Any]) -> list[dict[str, Any]
                 key: float(value) if (value := getattr(by_site.get(site), f"target_{key}", None)) is not None else None
                 for key in AMAZON_SALES_TARGET_FIELDS
             },
+            **edit_metadata(by_site.get(site)),
         }
         for site in AMAZON_SITE_CODES
     ]
@@ -1221,7 +1361,7 @@ async def amazon_sales_actual_rows(
             raise HTTPException(status_code=502, detail="领星店铺列表获取失败") from exc
         store_rows = []
     if refresh:
-        _amazon_cache.clear()
+        _amazon_cache.clear_current_namespace()
     # A single site reports in that site's native marketplace currency.  For
     # all sites, fetch product performance in native currency and convert it
     # with the same FX source/date used by the campaign report.
@@ -1956,6 +2096,31 @@ def migrate_amazon_monthly_targets(engine) -> None:
                 connection.execute(text(f"CREATE UNIQUE INDEX {unique_name} ON {table} (year, month, model, site)"))
 
 
+def migrate_shared_edit_metadata(engine) -> None:
+    """Add editor metadata without rewriting existing dashboard content."""
+
+    tables = (
+        AmazonCampaignStrategy.__tablename__,
+        AmazonCampaignAssignment.__tablename__,
+        AmazonAdPlan.__tablename__,
+        AmazonOperationPlan.__tablename__,
+        AmazonStrategyNote.__tablename__,
+        AmazonMonthlyTarget.__tablename__,
+        AmazonWeeklyTarget.__tablename__,
+        KeywordDashboardTerm.__tablename__,
+    )
+    with engine.begin() as connection:
+        inspector = sql_inspect(connection)
+        existing_tables = set(inspector.get_table_names())
+        for table in tables:
+            if table not in existing_tables:
+                continue
+            columns = {column["name"] for column in inspector.get_columns(table)}
+            if "updated_by" not in columns:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN updated_by VARCHAR(80) NULL"))
+            existing_tables.add(table)
+
+
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
@@ -1974,6 +2139,7 @@ def engine():
         _session_factory = sessionmaker(bind=_engine, expire_on_commit=False)
         Base.metadata.create_all(_engine)
         migrate_amazon_monthly_targets(_engine)
+        migrate_shared_edit_metadata(_engine)
     return _engine
 
 
@@ -3600,6 +3766,8 @@ def amazon_strategy_board_groups(
             "product": "",
             "strategy": strategy,
             "currency": item["currency"],
+            "updated_at": item.get("updated_at"),
+            "updated_by": item.get("updated_by"),
             **finalize_strategy_metrics(item["metrics"]),
         })
 
@@ -3791,22 +3959,28 @@ async def amazon_strategy_board_payload(
         fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
     assignments: dict[tuple[str, str, str], dict[str, str]] = {}
+    assignment_metadata: dict[tuple[str, str, str], dict[str, str | None]] = {}
     notes: dict[tuple[date, str, str, str], str] = {}
+    note_metadata: dict[tuple[date, str, str, str], dict[str, str | None]] = {}
     with session_factory()() as db:
         for item in db.scalars(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
-            assignments[(item.site_code, str(item.store_sid), item.campaign_id)] = {
+            exact_key = (item.site_code, str(item.store_sid), item.campaign_id)
+            assignments[exact_key] = {
                 "strategy": normalize_strategy(item.strategy),
                 "series": item.series or "",
                 "product": item.product or "",
                 "campaign_name": item.campaign_name or "",
                 "store_name": item.store_name or "",
             }
+            assignment_metadata[exact_key] = edit_metadata(item)
         for item in db.scalars(select(AmazonCampaignStrategy).where(AmazonCampaignStrategy.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
             assignments.setdefault((item.site_code, "", item.campaign_id), {
                 "strategy": normalize_strategy(item.strategy), "series": "", "product": "", "campaign_name": item.campaign_name or "", "store_name": "",
             })
         for item in db.scalars(select(AmazonStrategyNote).where(AmazonStrategyNote.site_code.in_([strategy_site_code(s) for s in selected_sites]))):
-            notes[(item.week_start, item.site_code, item.series, normalize_strategy(item.strategy))] = item.note
+            note_key = (item.week_start, item.site_code, item.series, normalize_strategy(item.strategy))
+            notes[note_key] = item.note
+            note_metadata[note_key] = edit_metadata(item)
 
     # A store-specific assignment must override a legacy site-wide assignment,
     # but an empty field on the specific row should not hide the useful legacy
@@ -3830,6 +4004,7 @@ async def amazon_strategy_board_payload(
             campaign_name = strategy_campaign_name(raw)
             store_sid = ad_report_store_sid(raw)
             assignment = assignments.get((site_code, store_sid, campaign_id)) or assignments.get((site_code, "", campaign_id)) or {}
+            assignment_version = assignment_metadata.get((site_code, store_sid, campaign_id)) or assignment_metadata.get((site_code, "", campaign_id)) or {"updated_at": None, "updated_by": None}
             if campaign_name == "未命名广告活动" and assignment.get("campaign_name"):
                 campaign_name = str(assignment["campaign_name"]).strip()
             if not campaign_id or not campaign_name:
@@ -3842,6 +4017,7 @@ async def amazon_strategy_board_payload(
             default_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
             row_currency = ad_report_currency(raw, default_currency)
             item = aggregate.setdefault(key, {"site": site_name, "site_code": site_code, "store_sid": store_sid, "store_name": store_name, "campaign_id": campaign_id, "campaign_name": campaign_name, "ad_type": ad_report_type(raw), "metrics": {name: 0.0 for name in ("impressions", "clicks", "ad_cost", "ad_sales", "ad_units", "ad_orders")}, "currency": row_currency})
+            item.update(assignment_version)
             if str(item.get("currency") or "") != row_currency:
                 raise RuntimeError(
                     f"广告活动同一分组返回混合币种，拒绝相加：{site_name} {campaign_name} "
@@ -3871,7 +4047,17 @@ async def amazon_strategy_board_payload(
         for (site, currency), value in unassigned_campaign_spend.items()
         if value > 0.01
     }
-    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": data_quality}
+    campaign_version = max(
+        assignment_metadata.values(),
+        key=lambda value: parse_datetime(value.get("updated_at") or "") or datetime.min,
+        default={"updated_at": None, "updated_by": None},
+    )
+    note_version = max(
+        [metadata for key, metadata in note_metadata.items() if key[0] == week_scope],
+        key=lambda value: parse_datetime(value.get("updated_at") or "") or datetime.min,
+        default={"updated_at": None, "updated_by": None},
+    )
+    response = {"period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "strategies": output, "strategy_options": list(AMAZON_STRATEGY_OPTIONS), "series_options": list(AMAZON_SERIES), "product_options": list(AMAZON_PRODUCTS), "selected_sites": selected_sites, "data_quality": data_quality, "edit_versions": {"campaigns": campaign_version, "notes": note_version}}
     # A degraded OpenAPI response must not occupy the normal 10-minute slot.
     # Leaving it uncached makes the next request retry the authoritative MCP
     # inventory immediately after a catalog or upstream metadata failure.
@@ -3923,8 +4109,9 @@ async def amazon_strategy_board(
 def save_campaign_strategy(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     site_code = str(payload.get("site_code") or "").strip().upper()
     store_sid = str(payload.get("store_sid") or "").strip()
     campaign_id = str(payload.get("campaign_id") or "").strip()
@@ -3940,6 +4127,7 @@ def save_campaign_strategy(
         raise HTTPException(status_code=422, detail="广告活动产品参数无效")
     with session_factory()() as db:
         item = db.scalar(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code == site_code, AmazonCampaignAssignment.store_sid == store_sid, AmazonCampaignAssignment.campaign_id == campaign_id))
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         if item is None:
             item = AmazonCampaignAssignment(site_code=site_code, store_sid=store_sid, campaign_id=campaign_id)
             db.add(item)
@@ -3949,18 +4137,20 @@ def save_campaign_strategy(
         item.series = series
         item.product = product
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
-    _amazon_cache.clear()
-    return {"ok": True, "site_code": site_code, "store_sid": store_sid, "campaign_id": campaign_id, "strategy": strategy, "series": series, "product": product}
+    _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
+    return {"ok": True, "site_code": site_code, "store_sid": store_sid, "campaign_id": campaign_id, "strategy": strategy, "series": series, "product": product, **edit_metadata(item)}
 
 
 @app.post("/api/amazon/strategy-board/campaign-strategy/batch")
 def save_campaign_strategies(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Persist all visible campaign classifications in one transaction."""
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     raw_items = payload.get("items")
     if not isinstance(raw_items, list) or not raw_items:
         raise HTTPException(status_code=422, detail="至少需要一条广告活动分类")
@@ -3995,9 +4185,12 @@ def save_campaign_strategies(
         site_codes = {item["site_code"] for item in normalized.values()}
         existing = db.scalars(select(AmazonCampaignAssignment).where(AmazonCampaignAssignment.site_code.in_(site_codes))).all()
         by_key = {(item.site_code, str(item.store_sid), item.campaign_id): item for item in existing}
+        force = bool(payload.get("force"))
+        scope_base_updated_at = payload.get("base_updated_at")
         for values in normalized.values():
             key = (values["site_code"], values["store_sid"], values["campaign_id"])
             item = by_key.get(key)
+            ensure_edit_freshness(item, values.get("base_updated_at") or scope_base_updated_at, force=force)
             if item is None:
                 item = AmazonCampaignAssignment(site_code=values["site_code"], store_sid=values["store_sid"], campaign_id=values["campaign_id"])
                 db.add(item)
@@ -4010,14 +4203,20 @@ def save_campaign_strategies(
             item.series = values["series"]
             item.product = values["product"]
             item.updated_at = utcnow()
+            item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
-    _amazon_cache.clear()
-    return {"ok": True, "saved": len(normalized)}
+    _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
+    latest = max(by_key.values(), key=lambda item: item.updated_at or datetime.min, default=None)
+    return {"ok": True, "saved": len(normalized), **edit_metadata(latest)}
 
 
 @app.post("/api/amazon/strategy-board/notes/batch")
-def save_strategy_notes_batch(payload: dict[str, Any] = Body(...), x_sync_key: str | None = Header(default=None, alias="X-Sync-Key")):
-    require_business_access(x_sync_key, allow_public=True)
+def save_strategy_notes_batch(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
+):
+    require_business_access(x_sync_key, allow_public=False)
     try:
         week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
     except ValueError as exc:
@@ -4036,24 +4235,32 @@ def save_strategy_notes_batch(payload: dict[str, Any] = Body(...), x_sync_key: s
             raise HTTPException(status_code=422, detail="策略备注参数无效")
         normalized.append((site_code, series, strategy, str(raw.get("note") or "")))
     with session_factory()() as db:
+        force = bool(payload.get("force"))
+        scope_base_updated_at = payload.get("base_updated_at")
+        saved_items: list[AmazonStrategyNote] = []
         for site_code, series, strategy, note in normalized:
             item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.week_start == week_start, AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.series == series, AmazonStrategyNote.strategy == strategy))
+            ensure_edit_freshness(item, scope_base_updated_at, force=force)
             if item is None:
                 item = AmazonStrategyNote(week_start=week_start, site_code=site_code, series=series, strategy=strategy)
                 db.add(item)
             item.note = note
             item.updated_at = utcnow()
+            item.updated_by = dashboard_editor(x_dashboard_editor)
+            saved_items.append(item)
         db.commit()
-    _amazon_cache.clear()
-    return {"ok": True, "saved": len(normalized), "week_start": week_start.isoformat()}
+    _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
+    latest = max(saved_items, key=lambda item: item.updated_at or datetime.min, default=None)
+    return {"ok": True, "saved": len(normalized), "week_start": week_start.isoformat(), **edit_metadata(latest)}
 
 
 @app.post("/api/amazon/strategy-board/note")
 def save_strategy_note(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     site_code = str(payload.get("site_code") or "").strip().upper()
     try:
         week_start = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
@@ -4066,14 +4273,16 @@ def save_strategy_note(
         raise HTTPException(status_code=422, detail="策略备注参数无效")
     with session_factory()() as db:
         item = db.scalar(select(AmazonStrategyNote).where(AmazonStrategyNote.week_start == week_start, AmazonStrategyNote.site_code == site_code, AmazonStrategyNote.series == series, AmazonStrategyNote.strategy == strategy))
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         if item is None:
             item = AmazonStrategyNote(week_start=week_start, site_code=site_code, series=series, strategy=strategy)
             db.add(item)
         item.note = note
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
-    _amazon_cache.clear()
-    return {"ok": True, "week_start": week_start.isoformat(), "site_code": site_code, "series": series, "strategy": strategy, "note": note}
+    _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
+    return {"ok": True, "week_start": week_start.isoformat(), "site_code": site_code, "series": series, "strategy": strategy, "note": note, **edit_metadata(item)}
 
 
 def normalize_week_start(value: date | None) -> date:
@@ -4490,9 +4699,7 @@ def keyword_terms_payload(rows: list[KeywordDashboardTerm]) -> list[dict[str, An
             "keyword": row.keyword,
             "sort_order": row.sort_order,
             "enabled": row.enabled,
-            "updated_at": row.updated_at.isoformat() if row.updated_at and row.updated_at.tzinfo else (
-                row.updated_at.replace(tzinfo=timezone.utc).isoformat() if row.updated_at else None
-            ),
+            **edit_metadata(row),
         }
         for row in rows
     ]
@@ -4516,17 +4723,19 @@ def get_keyword_dashboard_terms(
             .order_by(KeywordDashboardTerm.sort_order, KeywordDashboardTerm.id)
         ).all()
         payload = keyword_terms_payload(rows)
-    return {"site": site_name, "site_code": site_code, "terms": payload}
+        latest = max(rows, key=lambda row: row.updated_at or datetime.min, default=None)
+    return {"site": site_name, "site_code": site_code, "terms": payload, **edit_metadata(latest)}
 
 
 @app.post("/api/keyword-dashboard/terms")
 def save_keyword_dashboard_terms(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Replace all keywords for one site so additions/deletes stay explicit."""
 
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     global _amazon_cache
     try:
         site_name = keyword_dashboard_site(payload.get("site"))
@@ -4568,6 +4777,11 @@ def save_keyword_dashboard_terms(
 
     now = utcnow()
     with session_factory()() as db:
+        current_rows = db.scalars(
+            select(KeywordDashboardTerm).where(KeywordDashboardTerm.site_code == site_code)
+        ).all()
+        latest = max(current_rows, key=lambda row: row.updated_at or datetime.min, default=None)
+        ensure_edit_freshness(latest, payload.get("base_updated_at"), force=bool(payload.get("force")))
         db.execute(delete(KeywordDashboardTerm).where(KeywordDashboardTerm.site_code == site_code))
         for category, keyword, sort_order in normalized:
             db.add(KeywordDashboardTerm(
@@ -4577,6 +4791,7 @@ def save_keyword_dashboard_terms(
                 sort_order=sort_order,
                 enabled=True,
                 updated_at=now,
+                updated_by=dashboard_editor(x_dashboard_editor),
             ))
         db.commit()
         rows = db.scalars(
@@ -4586,7 +4801,8 @@ def save_keyword_dashboard_terms(
         ).all()
         saved = keyword_terms_payload(rows)
 
-    return {"ok": True, "site": site_name, "site_code": site_code, "terms": saved, "saved": len(saved)}
+    latest = max(rows, key=lambda row: row.updated_at or datetime.min, default=None)
+    return {"ok": True, "site": site_name, "site_code": site_code, "terms": saved, "saved": len(saved), **edit_metadata(latest)}
 
 
 @app.get("/api/keyword-dashboard")
@@ -4614,11 +4830,29 @@ async def keyword_dashboard(
     if week_count > 52:
         raise HTTPException(status_code=422, detail="关键词看板最多支持 52 周")
     latest_completed_start = latest_completed_keyword_week_start()
+    requested_start, requested_end = start, end
     # Xiyou rejects ranges containing an in-progress week. Clamping keeps API
     # callers and a page left open across a week boundary from repeatedly
     # spending credits on a range that can never return data.
     start = min(start, latest_completed_start)
     end = min(end, latest_completed_start)
+    range_adjusted = (start, end) != (requested_start, requested_end)
+    latest_completed_end = latest_completed_start + timedelta(days=6)
+    requested_period = {
+        "start": requested_start.isoformat(),
+        "end": requested_end.isoformat(),
+    }
+    period = {"start": start.isoformat(), "end": end.isoformat()}
+    latest_completed_week = {
+        "start": latest_completed_start.isoformat(),
+        "end": latest_completed_end.isoformat(),
+    }
+    range_adjustment = {
+        "adjusted": range_adjusted,
+        "requested_period": requested_period,
+        "period": period,
+        "latest_completed_week": latest_completed_week,
+    }
 
     weeks = keyword_week_columns(start, end)
     with session_factory()() as db:
@@ -4633,7 +4867,13 @@ async def keyword_dashboard(
         return {
             "site": site_name,
             "site_code": site_code,
-            "period": {"start": start.isoformat(), "end": end.isoformat()},
+            "period": period,
+            "requested_period": requested_period,
+            "latest_completed_week": latest_completed_week,
+            "range_adjustment": range_adjustment,
+            "warnings": [
+                f"西柚当前最新可用周为 {latest_completed_start.isoformat()}~{latest_completed_end.isoformat()}，已自动切换；已抓取历史不会重复消耗 Credit。"
+            ] if range_adjusted else [],
             "weeks": weeks,
             "terms": term_payload,
             "rows": [],
@@ -4713,10 +4953,19 @@ async def keyword_dashboard(
         if row.search_rank is not None or row.search_volume is not None
     ]
     rows = keyword_dashboard_rows(term_rows, weeks, records)
+    clamp_warning = (
+        f"西柚当前最新可用周为 {latest_completed_start.isoformat()}~{latest_completed_end.isoformat()}，"
+        "已自动切换；已抓取历史不会重复消耗 Credit。"
+    )
+    if range_adjusted and clamp_warning not in warnings:
+        warnings.insert(0, clamp_warning)
     return {
         "site": site_name,
         "site_code": site_code,
-        "period": {"start": start.isoformat(), "end": end.isoformat()},
+        "period": period,
+        "requested_period": requested_period,
+        "latest_completed_week": latest_completed_week,
+        "range_adjustment": range_adjustment,
         "weeks": weeks,
         "terms": term_payload,
         "rows": rows,
@@ -4881,7 +5130,7 @@ async def amazon_ads_charts(
     if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
         store_rows = await lingxing_store_rows()
     if refresh:
-        _amazon_cache.clear()
+        _amazon_cache.clear_current_namespace()
 
     site_today = min(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
@@ -4949,16 +5198,17 @@ def get_ad_plan(
     with session_factory()() as db:
         item = db.scalar(select(AmazonAdPlan).where(AmazonAdPlan.week_start == week, AmazonAdPlan.site_code == site_code, AmazonAdPlan.series == series))
         if item is None:
-            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": ""}
-        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, "updated_at": item.updated_at.isoformat() if item.updated_at else None}
+            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": "", "updated_at": None, "updated_by": None}
+        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, **edit_metadata(item)}
 
 
 @app.post("/api/amazon/ad-plan")
 def save_ad_plan(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     site = str(payload.get("site") or "美国").strip()
     site_code = AMAZON_SITE_CODES.get(site, str(payload.get("site_code") or "").strip().upper())
     series = str(payload.get("series") or "").strip()
@@ -4972,14 +5222,16 @@ def save_ad_plan(
     plan = str(payload.get("plan") or "")[:20000]
     with session_factory()() as db:
         item = db.scalar(select(AmazonAdPlan).where(AmazonAdPlan.week_start == week_start, AmazonAdPlan.site_code == site_code, AmazonAdPlan.series == series))
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         if item is None:
             item = AmazonAdPlan(week_start=week_start, site_code=site_code, series=series)
             db.add(item)
         item.review = review
         item.plan = plan
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
-    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan}
+    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan, **edit_metadata(item)}
 
 
 @app.get("/api/amazon/operation-plan")
@@ -4997,16 +5249,17 @@ def get_operation_plan(
     with session_factory()() as db:
         item = db.scalar(select(AmazonOperationPlan).where(AmazonOperationPlan.week_start == week, AmazonOperationPlan.site_code == site_code, AmazonOperationPlan.series == series))
         if item is None:
-            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": ""}
-        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, "updated_at": item.updated_at.isoformat() if item.updated_at else None}
+            return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": "", "plan": "", "updated_at": None, "updated_by": None}
+        return {"week_start": week.isoformat(), "site": site, "site_code": site_code, "series": series, "review": item.review, "plan": item.plan, **edit_metadata(item)}
 
 
 @app.post("/api/amazon/operation-plan")
 def save_operation_plan(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     site = str(payload.get("site") or "美国").strip()
     site_code = AMAZON_SITE_CODES.get(site, str(payload.get("site_code") or "").strip().upper())
     series = str(payload.get("series") or "").strip()
@@ -5020,14 +5273,16 @@ def save_operation_plan(
     plan = str(payload.get("plan") or "")[:20000]
     with session_factory()() as db:
         item = db.scalar(select(AmazonOperationPlan).where(AmazonOperationPlan.week_start == week_start, AmazonOperationPlan.site_code == site_code, AmazonOperationPlan.series == series))
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         if item is None:
             item = AmazonOperationPlan(week_start=week_start, site_code=site_code, series=series)
             db.add(item)
         item.review = review
         item.plan = plan
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
-    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan}
+    return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan, **edit_metadata(item)}
 
 
 @app.get("/api/amazon/dashboard")
@@ -5096,7 +5351,7 @@ async def amazon_dashboard(
     if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
         store_rows = await lingxing_store_rows()
     if refresh:
-        _amazon_cache.clear()
+        _amazon_cache.clear_current_namespace()
     return await amazon_dashboard_periodic(
         comparison,
         start_date,
@@ -5170,9 +5425,11 @@ async def amazon_sales_dashboard(
         country_target_payload = amazon_sales_country_target_payload(country_items)
         if site == AMAZON_SALES_EUROPE:
             targets = amazon_sales_europe_target_values(country_items)
+            target_edit = latest_edit_metadata([item for item in country_items if item.site in AMAZON_SITE_ORDER])
         else:
             item = next((entry for entry in country_items if entry.site == site), None)
             targets = amazon_sales_target_values(item)
+            target_edit = edit_metadata(item)
 
     actual_end = min(month_end, site_today) if month_start <= site_today else None
     rows: list[dict[str, Any]] = []
@@ -5250,6 +5507,7 @@ async def amazon_sales_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "target_edit": target_edit,
         "country_targets": country_target_payload,
         "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
         "comparison": comparison_payload,
@@ -5322,9 +5580,11 @@ async def amazon_sales_weekly_dashboard(
         country_target_payload = amazon_sales_country_target_payload(country_items)
         if site == AMAZON_SALES_EUROPE:
             targets = amazon_sales_europe_target_values(country_items)
+            target_edit = latest_edit_metadata([item for item in country_items if item.site in AMAZON_SITE_ORDER])
         else:
             item = next((entry for entry in country_items if entry.site == site), None)
             targets = amazon_sales_target_values(item)
+            target_edit = edit_metadata(item)
 
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
@@ -5400,6 +5660,7 @@ async def amazon_sales_weekly_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "target_edit": target_edit,
         "country_targets": country_target_payload,
         "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
         "comparison": comparison_payload,
@@ -5426,9 +5687,10 @@ async def amazon_sales_weekly_dashboard(
 def save_amazon_sales_weekly_targets(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Upsert all editable weekly targets for one week/model/site scope."""
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     try:
         week = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
     except (TypeError, ValueError) as exc:
@@ -5468,10 +5730,13 @@ def save_amazon_sales_weekly_targets(
         if item is None:
             item = AmazonWeeklyTarget(week_start=week, model=model, site=site)
             db.add(item)
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         for key, value in normalized.items():
             setattr(item, f"target_{key}", value)
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
+    _amazon_cache.clear_namespaces("amazon-sales-targets")
 
     return {
         "ok": True,
@@ -5479,6 +5744,7 @@ def save_amazon_sales_weekly_targets(
         "model": model,
         "site": site,
         "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
+        **edit_metadata(item),
     }
 
 
@@ -5486,9 +5752,10 @@ def save_amazon_sales_weekly_targets(
 def save_amazon_sales_weekly_targets_bulk(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Quick-enter weekly unit targets for every country in one transaction."""
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     try:
         week = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
     except (TypeError, ValueError) as exc:
@@ -5512,6 +5779,11 @@ def save_amazon_sales_weekly_targets_bulk(
                 )
             )
         }
+        ensure_edit_freshness(
+            max(items.values(), key=lambda item: item.updated_at or datetime.min, default=None),
+            payload.get("base_updated_at"),
+            force=bool(payload.get("force")),
+        )
         for site_name, target_units in normalized.items():
             item = items.get(site_name)
             if item is None:
@@ -5519,7 +5791,9 @@ def save_amazon_sales_weekly_targets_bulk(
                 db.add(item)
             item.target_units = target_units
             item.updated_at = utcnow()
+            item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
+        _amazon_cache.clear_namespaces("amazon-sales-targets")
         saved_items = list(db.scalars(
             select(AmazonWeeklyTarget).where(
                 AmazonWeeklyTarget.week_start == week,
@@ -5533,6 +5807,7 @@ def save_amazon_sales_weekly_targets_bulk(
         "week_start": week.isoformat(),
         "model": model,
         "country_targets": amazon_sales_country_target_payload(saved_items),
+        **latest_edit_metadata(saved_items),
     }
 
 
@@ -5540,9 +5815,10 @@ def save_amazon_sales_weekly_targets_bulk(
 def save_amazon_sales_targets(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Upsert all editable monthly targets for one year/month/model/site scope."""
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     try:
         year = int(payload.get("year"))
         month = int(payload.get("month"))
@@ -5581,10 +5857,13 @@ def save_amazon_sales_targets(
         if item is None:
             item = AmazonMonthlyTarget(year=year, month=month, model=model, site=site)
             db.add(item)
+        ensure_edit_freshness(item, payload.get("base_updated_at"), force=bool(payload.get("force")))
         for key, value in normalized.items():
             setattr(item, f"target_{key}", value)
         item.updated_at = utcnow()
+        item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
+    _amazon_cache.clear_namespaces("amazon-sales-targets")
 
     return {
         "ok": True,
@@ -5593,6 +5872,7 @@ def save_amazon_sales_targets(
         "model": model,
         "site": site,
         "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
+        **edit_metadata(item),
     }
 
 
@@ -5600,9 +5880,10 @@ def save_amazon_sales_targets(
 def save_amazon_sales_targets_bulk(
     payload: dict[str, Any] = Body(...),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+    x_dashboard_editor: str | None = Header(default=None, alias="X-Dashboard-Editor"),
 ):
     """Quick-enter monthly unit targets for every country in one transaction."""
-    require_business_access(x_sync_key, allow_public=True)
+    require_business_access(x_sync_key, allow_public=False)
     try:
         year = int(payload.get("year"))
         month = int(payload.get("month"))
@@ -5628,6 +5909,11 @@ def save_amazon_sales_targets_bulk(
                 )
             )
         }
+        ensure_edit_freshness(
+            max(items.values(), key=lambda item: item.updated_at or datetime.min, default=None),
+            payload.get("base_updated_at"),
+            force=bool(payload.get("force")),
+        )
         for site_name, target_units in normalized.items():
             item = items.get(site_name)
             if item is None:
@@ -5635,7 +5921,9 @@ def save_amazon_sales_targets_bulk(
                 db.add(item)
             item.target_units = target_units
             item.updated_at = utcnow()
+            item.updated_by = dashboard_editor(x_dashboard_editor)
         db.commit()
+        _amazon_cache.clear_namespaces("amazon-sales-targets")
         saved_items = list(db.scalars(
             select(AmazonMonthlyTarget).where(
                 AmazonMonthlyTarget.year == year,
@@ -5651,6 +5939,7 @@ def save_amazon_sales_targets_bulk(
         "month": month,
         "model": model,
         "country_targets": amazon_sales_country_target_payload(saved_items),
+        **latest_edit_metadata(saved_items),
     }
 
 

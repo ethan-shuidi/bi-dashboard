@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
-import { init } from "echarts/core"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import DashboardState from "./DashboardState.vue"
 import WeekPicker from "./WeekPicker.vue"
 
 const props = defineProps({ apiBase: { type: String, default: "" } })
@@ -31,6 +31,28 @@ let conversionChart
 let trafficChart
 let resizeObserver
 let chartRequestSeq = 0
+let eChartsLoader
+
+function ensureECharts() {
+  eChartsLoader ??= Promise.all([
+    import("echarts/core"),
+    import("echarts/charts"),
+    import("echarts/components"),
+    import("echarts/renderers"),
+  ]).then(([{ init, use }, charts, components, renderers]) => {
+    use([
+      charts.BarChart,
+      charts.LineChart,
+      components.GridComponent,
+      components.TooltipComponent,
+      components.LegendComponent,
+      components.AriaComponent,
+      renderers.CanvasRenderer,
+    ])
+    return init
+  })
+  return eChartsLoader
+}
 
 function parseDate(value) {
   if (!value) return new Date()
@@ -131,14 +153,14 @@ async function load({ refresh = false } = {}) {
     currency.value = body.currency || "USD"
     fieldAvailability.value = body.field_availability || null
     await nextTick()
-    renderCharts()
+    await renderCharts()
   } catch (e) {
     if (requestSeq !== chartRequestSeq) return
     error.value = e.message || "广告图表加载失败"
     rows.value = []
     fieldAvailability.value = null
     await nextTick()
-    renderCharts()
+    await renderCharts()
   } finally {
     if (requestSeq === chartRequestSeq) loading.value = false
   }
@@ -178,7 +200,7 @@ function yAxis(label, options = {}) {
   }
 }
 
-function ensureChart(chart, element) {
+function ensureChart(chart, element, init) {
   if (!chart || chart.getDom() !== element) {
     chart?.dispose()
     return init(element)
@@ -186,9 +208,9 @@ function ensureChart(chart, element) {
   return chart
 }
 
-function renderSalesChart() {
+function renderSalesChart(init) {
   if (!salesChartElement.value) return
-  salesChart = ensureChart(salesChart, salesChartElement.value)
+  salesChart = ensureChart(salesChart, salesChartElement.value, init)
   salesChart.setOption({
     ...baseOption("按周展示销售额、广告销售额和费比。"),
     color: ["#3b82f6", "#22c55e", "#f97316"],
@@ -204,9 +226,9 @@ function renderSalesChart() {
   }, true)
 }
 
-function renderConversionChart() {
+function renderConversionChart(init) {
   if (!conversionChartElement.value) return
-  conversionChart = ensureChart(conversionChart, conversionChartElement.value)
+  conversionChart = ensureChart(conversionChart, conversionChartElement.value, init)
   conversionChart.setOption({
     ...baseOption("按周展示点击数和广告转化率。"),
     color: ["#6366f1", "#f59e0b"],
@@ -221,9 +243,9 @@ function renderConversionChart() {
   }, true)
 }
 
-function renderTrafficChart() {
+function renderTrafficChart(init) {
   if (!trafficChartElement.value) return
-  trafficChart = ensureChart(trafficChart, trafficChartElement.value)
+  trafficChart = ensureChart(trafficChart, trafficChartElement.value, init)
   trafficChart.setOption({
     ...baseOption("按周展示领星 Sessions-Total 和 PV-Total。"),
     color: ["#0ea5e9", "#a855f7"],
@@ -235,10 +257,12 @@ function renderTrafficChart() {
   }, true)
 }
 
-function renderCharts() {
-  renderSalesChart()
-  renderConversionChart()
-  renderTrafficChart()
+async function renderCharts() {
+  if (!rows.value.length) return
+  const init = await ensureECharts()
+  renderSalesChart(init)
+  renderConversionChart(init)
+  renderTrafficChart(init)
 }
 
 onMounted(async () => {
@@ -289,9 +313,9 @@ onBeforeUnmount(() => {
       <label><span>站点</span><el-select v-model="site"><el-option v-for="item in siteOptions" :key="item" :label="item" :value="item" /></el-select></label>
       <label><span>型号</span><el-select v-model="model"><el-option v-for="item in modelOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></label>
     </div>
-    <div v-if="error" class="ads-chart-error">{{ error }}</div>
-    <div v-else-if="loading && !rows.length" class="ads-chart-loading">正在同步领星产品表现数据…</div>
-    <div v-else-if="!rows.length" class="ads-chart-empty">当前周度范围暂无数据</div>
+    <DashboardState v-if="error" class="ads-chart-state" state="error" title="广告周度图表加载失败" :message="error" />
+    <DashboardState v-else-if="loading && !rows.length" class="ads-chart-state" state="loading" title="正在同步领星产品表现数据" message="正在读取产品表现与广告指标，请稍候。" />
+    <DashboardState v-else-if="!rows.length" class="ads-chart-state" state="empty" title="当前周度范围暂无数据" message="可调整开始周、结束周、站点或型号后重新加载。" />
     <div v-else class="ads-chart-grid">
       <article>
         <header><span class="ads-chart-icon money" aria-hidden="true"><svg viewBox="0 0 24 24" role="presentation"><path d="M12 3.75a1 1 0 0 1 .97.757L13.45 7h2.3a1 1 0 1 1 0 2h-1.85l-.65 3h1.75a1 1 0 1 1 0 2h-2.18l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L10.88 14H8.7l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L6.28 14H5a1 1 0 1 1 0-2h1.68l.65-3H5.75a1 1 0 1 1 0-2h2.05l.48-2.24a1 1 0 0 1 1.955.42L10.12 7h2.18l.35-1.49A1 1 0 0 1 12 3.75ZM9.78 9l-.65 3h2.18l.65-3H9.78Z"/></svg></span><div><strong>销售看板</strong><small>销售额 · 广告销售额 · 费比</small></div></header>
@@ -314,8 +338,7 @@ onBeforeUnmount(() => {
 .ads-chart-module{position:relative;z-index:1;margin-top:20px;padding:18px;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:var(--shadow-sm)}
 .ads-chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.ads-chart-head span{color:#73849a;font-size:12px;font-weight:750}.ads-chart-head h2{margin:3px 0 0;color:#132f5b;font-size:18px}.ads-chart-head p{margin:5px 0 0;color:#73849a;font-size:12px}.ads-chart-head button{height:36px;padding:0 14px;border:0;border-radius:9px;background:#1e57c8;color:#fff;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.ads-chart-head button:disabled{opacity:.65;cursor:not-allowed}
 .ads-chart-filters{display:grid;grid-template-columns:repeat(5,minmax(136px,1fr));gap:12px;margin-top:16px;padding:14px;border:0;border-radius:12px;background:#f7fbff}.ads-chart-filters label{display:grid;gap:6px;min-width:0}.ads-chart-filters span{color:#5f7188;font-size:12px;font-weight:750}
-.ads-chart-error,.ads-chart-loading,.ads-chart-empty{margin-top:16px;padding:34px 16px;border-radius:12px;text-align:center;color:#75869c;background:#f8fbff}
-.ads-chart-error{color:#b52e45;background:#fff4f6}
+.ads-chart-state{margin-top:16px}
 .ads-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:16px}.ads-chart-grid article{position:relative;min-width:0;padding:14px;border:1px solid #e5edf7;border-radius:14px;background:#fff}.ads-chart-grid header{display:flex;align-items:center;gap:10px;margin-bottom:8px}.ads-chart-grid header div{display:grid;min-width:0}.ads-chart-grid strong{color:#173d70;font-size:14px}.ads-chart-grid small{overflow:hidden;color:#75869c;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ads-chart-icon{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:10px}.ads-chart-icon svg{width:18px;height:18px;fill:currentColor}.ads-chart-icon.money{color:#1d4ed8;background:#e8f1ff}.ads-chart-icon.click{color:#b45309;background:#fff4df}.ads-chart-icon.traffic{color:#7c3aed;background:#f2ecff}.ads-chart-canvas{width:100%;height:310px}.ads-chart-missing{position:absolute;right:14px;bottom:14px;left:14px;margin:0;padding:7px 10px;border-radius:8px;background:rgba(255,247,235,.94);color:#a05a00;font-size:11px;text-align:center}
 @media (max-width:1500px){.ads-chart-grid{grid-template-columns:1fr}.ads-chart-filters{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:720px){.ads-chart-filters{grid-template-columns:1fr}}
