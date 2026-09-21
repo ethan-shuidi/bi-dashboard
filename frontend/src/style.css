@@ -198,6 +198,9 @@
    displayed total. The popover is available on hover, keyboard focus, and
    click so it also works on touch devices. */
 .metric-with-breakdown{display:inline-flex;align-items:center;justify-content:center;gap:4px;max-width:100%}
+.comparison-toggle{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 11px;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff;color:#254a78;font-size:12px;font-weight:800;white-space:nowrap;cursor:pointer;user-select:none}.comparison-toggle:hover{border-color:#8db4e0;background:#f2f7ff}.comparison-toggle input{width:14px;height:14px;margin:0;accent-color:#2563eb;cursor:pointer}
+.metric-cell-stack{display:grid;min-width:0;justify-items:center;gap:2px;line-height:1.15}.metric-cell-stack>.metric-with-breakdown{justify-self:center}.period-comparison-delta{font-size:10px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}.period-comparison-delta.red{color:#b52e45}.period-comparison-delta.green{color:#08704f}.period-comparison-delta.gray{color:#82909f}
+.amazon-table.comparison-enabled td,.strategy-table.comparison-enabled td{height:58px;white-space:normal}.amazon-table.comparison-enabled td.period-cell,.amazon-table.comparison-enabled td.site-cell,.amazon-table.comparison-enabled td.series-cell{white-space:nowrap}
 .ad-breakdown-control{position:relative;display:inline-flex;align-items:center;justify-content:center;z-index:3}
 .ad-breakdown-button{width:16px;height:16px;padding:0;border:1px solid #b9cce4;border-radius:50%;background:#f7faff;color:#52769f;font:700 10px/14px Arial,sans-serif;cursor:pointer}
 .ad-breakdown-button:hover,.ad-breakdown-control.open .ad-breakdown-button,.ad-breakdown-button:focus-visible{border-color:#4d8fd6;background:#eaf3ff;color:#1f64b7;outline:none}

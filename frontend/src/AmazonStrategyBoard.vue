@@ -9,9 +9,10 @@ const SITE_ORDER = ["美国", "日本", "德国", "英国", "法国", "加拿大
 const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链接）汇总", "TN20系列（主链接）汇总", "TN20系列（小链接）汇总"]
 const STRATEGIES = ["品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/"]
 const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr", MXN: "MX$", PLN: "zł" }
-const rows = ref([]); const stores = ref([]); const seriesOptions = ref([...DEFAULT_SERIES])
+const rows = ref([]); const previousRows = ref([]); const stores = ref([]); const seriesOptions = ref([...DEFAULT_SERIES])
 const loading = ref(false); const error = ref(""); const saving = ref(""); const toast = ref(""); const expanded = ref(new Set()); const noteDrafts = ref({}); const campaignDrafts = ref({})
 const strategySite = ref("美国"); const strategyStore = ref(""); const strategySeries = ref(""); const strategyWeekStart = ref("")
+const showComparison = ref(false)
 const configOpen = ref(false); const configPosition = ref({ top: 0, left: 0 }); const configButton = ref(null)
 const columns = [{ key: "clicks", label: "点击量", width: 100 }, { key: "cpc", label: "CPC", width: 110, money: true }, { key: "ad_cost", label: "广告花费", width: 130, money: true }, { key: "ad_sales", label: "广告销售额", width: 135, money: true }, { key: "ad_orders", label: "广告订单量", width: 115 }, { key: "ad_units", label: "广告销量", width: 105 }, { key: "acos", label: "ACOS", width: 105, percent: true }, { key: "roas", label: "ROAS", width: 105 }, { key: "ad_cvr", label: "广告CVR", width: 115, percent: true }]
 const nameColumnWidth = ref(430)
@@ -25,18 +26,22 @@ const strategyTableWidth = computed(() => visibleColumns.value.reduce((sum, colu
 const tableStyle = computed(() => ({ "--strategy-name-width": `${nameColumnWidth}px`, "--strategy-note-width": `${noteColumnWidth}px`, "--strategy-table-width": `${strategyTableWidth.value}px` }))
 const campaignCount = computed(() => new Set(rows.value.flatMap((row) => row.campaigns || []).map(campaignKey)).size)
 const availableStores = computed(() => stores.value.filter((item) => item.country === strategySite.value && item.status !== 0))
+const percentMetricKeys = new Set(["acos", "ad_cvr"])
+const moneyMetricKeys = new Set(["cpc", "ad_cost", "ad_sales"])
+const lowerIsBetterMetricKeys = new Set(["cpc", "ad_cost", "acos"])
 function formatLocalDate(date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}` }
 function formatDotDate(value) { return String(value || "").replaceAll("-", ".") }
-const weekEnd = (start) => { const date = new Date(`${monday(start || previousWeekStart())}T00:00:00`); date.setDate(date.getDate() + 6); return formatLocalDate(date) }
+const weekEndFrom = (start) => { const date = new Date(`${monday(start || previousWeekStart())}T00:00:00`); date.setDate(date.getDate() + 6); return formatLocalDate(date) }
+const weekEnd = (start) => weekEndFrom(start)
 const strategyEndDate = computed(() => weekEnd(strategyWeekStart.value))
 function weekNumber(value) { const date = new Date(`${monday(value)}T00:00:00`); const thursday = new Date(date); thursday.setDate(date.getDate() + 3); const firstThursday = new Date(thursday.getFullYear(), 0, 4); const firstMonday = new Date(firstThursday); firstMonday.setDate(firstThursday.getDate() - ((firstThursday.getDay() + 6) % 7)); return Math.floor((date - firstMonday) / 604800000) + 1 }
 const strategyWeekRangeLabel = computed(() => `${formatDotDate(strategyWeekStart.value)}~${formatDotDate(strategyEndDate.value)}`)
 const groups = computed(() => rows.value.map((row) => ({ ...row, campaigns: [...(row.campaigns || [])].sort((a, b) => compare(a[sort.value.key], b[sort.value.key], sort.value.direction)) })).sort((a, b) => compare(a.metrics?.[sort.value.key], b.metrics?.[sort.value.key], sort.value.direction)))
-const summaryMetrics = computed(() => {
+function aggregateStrategyMetrics(sourceRows) {
   const total = { clicks: 0, ad_cost: 0, ad_sales: 0, ad_orders: 0, ad_units: 0 }
-  const currencies = [...new Set(rows.value.map((row) => row.currency).filter(Boolean))]
+  const currencies = [...new Set(sourceRows.map((row) => row.currency).filter(Boolean))]
   const mixedCurrency = currencies.length > 1
-  rows.value.forEach((row) => {
+  sourceRows.forEach((row) => {
     const metrics = row.metrics || {}
     const clicks = Number(metrics.clicks) || 0
     total.clicks += clicks
@@ -56,12 +61,43 @@ const summaryMetrics = computed(() => {
     roas: mixedCurrency ? null : total.ad_cost ? total.ad_sales / total.ad_cost : null,
     ad_cvr: total.clicks ? total.ad_orders / total.clicks : null,
   }
-})
+}
+const summaryMetrics = computed(() => aggregateStrategyMetrics(rows.value))
+const previousSummaryMetrics = computed(() => aggregateStrategyMetrics(previousRows.value))
 const summaryCurrency = computed(() => new Set(rows.value.map((row) => row.currency).filter(Boolean)).size > 1 ? "MIXED" : rows.value[0]?.currency || "")
+const previousStrategyByKey = computed(() => new Map(previousRows.value.map((row) => [groupKey(row), row])))
+const previousCampaignByKey = computed(() => new Map(previousRows.value.flatMap((row) => row.campaigns || []).map((campaign) => [campaignKey(campaign), campaign])))
 function previousWeekStart() { const date = new Date(); date.setHours(0, 0, 0, 0); date.setDate(date.getDate() - ((date.getDay() + 6) % 7) - 7); return formatLocalDate(date) }
 function monday(value) { const date = new Date(`${value}T00:00:00`); if (Number.isNaN(date.getTime())) return previousWeekStart(); date.setDate(date.getDate() - ((date.getDay() + 6) % 7)); return formatLocalDate(date) }
 function compare(left, right, direction) { const a = Number(left); const b = Number(right); if (Number.isNaN(a) && Number.isNaN(b)) return 0; if (Number.isNaN(a)) return 1; if (Number.isNaN(b)) return -1; return direction === "asc" ? a - b : b - a }
 function display(value, column, currency) { if (value == null) return "—"; if (column.percent) return `${(Number(value) * 100).toFixed(2)}%`; if (column.money) return `${currencySymbols[currency] || currency || ""} ${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`; return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 }) }
+function formatSignedNumber(value) { const numericValue = Number(value || 0); const formatted = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Math.abs(numericValue)); return `${numericValue > 0 ? "+" : numericValue < 0 ? "-" : ""}${formatted}` }
+function comparisonResult(current, previous, column, currency) {
+  if (!showComparison.value || current == null || previous == null || !Number.isFinite(Number(current)) || !Number.isFinite(Number(previous))) return null
+  const difference = Number(current) - Number(previous)
+  if (!Number.isFinite(difference)) return null
+  let text
+  if (column.percent) text = `${difference > 0 ? "+" : difference < 0 ? "-" : ""}${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Math.abs(difference * 100))}%`
+  else if (column.money) text = `${difference < 0 ? "-" : difference > 0 ? "+" : ""}${currencySymbols[currency] || currency || ""}${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Math.abs(difference))}`
+  else text = formatSignedNumber(difference)
+  const improved = lowerIsBetterMetricKeys.has(column.key) ? difference < 0 : difference > 0
+  const declined = lowerIsBetterMetricKeys.has(column.key) ? difference > 0 : difference < 0
+  return { status: improved ? "red" : declined ? "green" : "gray", text }
+}
+function rowComparison(row, column) {
+  if (!showComparison.value) return null
+  const previous = previousStrategyByKey.value.get(groupKey(row))
+  return comparisonResult(row.metrics?.[column.key], previous?.metrics?.[column.key], column, row.currency) || { status: "gray", text: "—" }
+}
+function campaignComparison(campaign, column) {
+  if (!showComparison.value) return null
+  const previous = previousCampaignByKey.value.get(campaignKey(campaign))
+  return comparisonResult(campaign[column.key], previous?.[column.key], column, campaign.currency) || { status: "gray", text: "—" }
+}
+function summaryComparison(column) {
+  if (!showComparison.value || !previousRows.value.length) return null
+  return comparisonResult(summaryMetrics.value[column.key], previousSummaryMetrics.value[column.key], column, summaryCurrency.value) || { status: "gray", text: "—" }
+}
 function displaySeries(value) { return ({ "TN10系列（主链接）汇总": "TN10（主）", "TN10系列（小链接）汇总": "TN10（小）", "TN20系列（主链接）汇总": "TN20（主）", "TN20系列（小链接）汇总": "TN20（小）" }[value] || value || "") }
 function groupMeta(row) { return [row.series ? displaySeries(row.series) : "", row.site, `${row.campaigns.length} 个活动`].filter(Boolean).join(" · ") }
 function groupKey(row) { return `${row.site_code}:${row.strategy}:${row.series || ""}:${row.product || ""}` }; function noteKey(row) { return `${strategyWeekStart.value}:${groupKey(row)}` }
@@ -181,10 +217,37 @@ async function saveAllCampaigns() {
   } catch (e) { error.value = e.message || "广告活动归类保存失败" } finally { saving.value = "" }
 }
 async function loadStores() { try { const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/stores`); const data = await response.json(); stores.value = data.stores || [] } catch {} }
-async function load() { if (!props.apiBase || !strategyWeekStart.value) return; loading.value = true; error.value = ""; try { const query = new URLSearchParams({ start_date: strategyWeekStart.value, end_date: strategyEndDate.value, site: strategySite.value }); if (strategyStore.value) query.append("store_sid", strategyStore.value); if (strategySeries.value) query.append("series", strategySeries.value); const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board?${query}`); const data = await response.json(); if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`); rows.value = data.strategies || []; seriesOptions.value = data.series_options || DEFAULT_SERIES; const nextDrafts = {}; const nextCampaignDrafts = {}; rows.value.forEach((row) => { nextDrafts[noteKey(row)] = row.note || ""; (row.campaigns || []).forEach((campaign) => { nextCampaignDrafts[campaignKey(campaign)] = { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } }) }); noteDrafts.value = nextDrafts; campaignDrafts.value = nextCampaignDrafts } catch (e) { error.value = e.message || "广告策略看板加载失败" } finally { loading.value = false; await nextTick(); resizeAllNotes() } }
+async function fetchStrategyBoard(weekStart) {
+  const query = new URLSearchParams({ start_date: weekStart, end_date: weekEndFrom(weekStart), site: strategySite.value })
+  if (strategyStore.value) query.append("store_sid", strategyStore.value)
+  if (strategySeries.value) query.append("series", strategySeries.value)
+  const response = await fetchWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board?${query}`)
+  const data = await response.json()
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+  return data
+}
+async function load() {
+  if (!props.apiBase || !strategyWeekStart.value) return
+  loading.value = true; error.value = ""
+  try {
+    const previousWeek = formatLocalDate(new Date(new Date(`${strategyWeekStart.value}T00:00:00`).getTime() - 7 * 86400000))
+    const [data, previousData] = await Promise.all([
+      fetchStrategyBoard(strategyWeekStart.value),
+      showComparison.value ? fetchStrategyBoard(previousWeek) : Promise.resolve(null),
+    ])
+    rows.value = data.strategies || []; previousRows.value = previousData?.strategies || []
+    seriesOptions.value = data.series_options || DEFAULT_SERIES
+    const nextDrafts = {}; const nextCampaignDrafts = {}
+    rows.value.forEach((row) => {
+      nextDrafts[noteKey(row)] = row.note || ""
+      ;(row.campaigns || []).forEach((campaign) => { nextCampaignDrafts[campaignKey(campaign)] = { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } })
+    })
+    noteDrafts.value = nextDrafts; campaignDrafts.value = nextCampaignDrafts
+  } catch (e) { error.value = e.message || "广告策略看板加载失败" } finally { loading.value = false; await nextTick(); resizeAllNotes() }
+}
 function onStrategySiteChange() { if (!availableStores.value.some((item) => String(item.sid) === strategyStore.value)) strategyStore.value = ""; load() }
 function onWeekChange() { strategyWeekStart.value = monday(strategyWeekStart.value); load() }
-watch(() => [props.apiBase, strategyWeekStart.value, strategySite.value, strategyStore.value, strategySeries.value], load)
+watch(() => [props.apiBase, strategyWeekStart.value, strategySite.value, strategyStore.value, strategySeries.value, showComparison.value], load)
 onMounted(async () => {
   loadColumnPreferences()
   strategyWeekStart.value = previousWeekStart()
@@ -199,11 +262,11 @@ onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", 
 
 <template>
   <el-config-provider :locale="zhCn"><section class="strategy-board-panel">
-    <div class="strategy-board-head"><div><span class="section-label">广告后台数据</span><h2>广告策略看板</h2><p>按周、站点、店铺和系列筛选；展开后可给每条广告活动设置策略和系列。</p></div><div class="strategy-board-actions"><button ref="configButton" class="strategy-config-button" type="button" @click="toggleConfig">列配置</button><button class="strategy-refresh-button" type="button" :disabled="loading" @click="load">刷新</button></div></div>
+    <div class="strategy-board-head"><div><span class="section-label">广告后台数据</span><h2>广告策略看板</h2><p>按周、站点、店铺和系列筛选；展开后可给每条广告活动设置策略和系列。</p></div><div class="strategy-board-actions"><label class="comparison-toggle" title="对比上一周"><input v-model="showComparison" type="checkbox"><span>查看环比</span></label><button ref="configButton" class="strategy-config-button" type="button" @click="toggleConfig">列配置</button><button class="strategy-refresh-button" type="button" :disabled="loading" @click="load">刷新</button></div></div>
     <div class="strategy-filter-bar"><label class="week-filter"><span>周 <b class="week-filter-code">{{ strategyWeekRangeLabel }}</b></span><div class="week-picker-control"><WeekPicker v-model="strategyWeekStart" @change="onWeekChange"/></div></label><label><span>站点</span><el-select v-model="strategySite" @change="onStrategySiteChange"><el-option v-for="item in orderedSites" :key="item" :label="item" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>店铺（可不选）</span><el-select v-model="strategyStore" clearable placeholder="全部店铺"><el-option v-for="item in availableStores" :key="item.sid" :label="`${item.name}（${item.sid}）`" :value="String(item.sid)" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>系列</span><el-select v-model="strategySeries" clearable placeholder="全部系列"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><button class="campaign-batch-save-button" type="button" :disabled="loading || saving === 'campaigns' || !campaignCount" @click="saveAllCampaigns">{{ saving === "campaigns" ? "保存中" : "保存所有广告策略分类" }}</button></div>
     <Teleport to="body"><div v-if="configOpen" class="strategy-config-panel strategy-config-panel-floating" role="dialog" aria-label="广告策略列配置" :style="{ top: `${configPosition.top}px`, left: `${configPosition.left}px` }"><button v-for="column in columns" :key="column.key" type="button" @click="toggleColumn(column)"><span>{{ column.label }}</span><span>{{ visible[column.key] ? "◉" : "○" }}</span></button></div></Teleport>
-    <div v-if="error" class="strategy-board-error">{{ error }}</div><div v-else-if="loading" class="strategy-board-loading">正在同步广告后台数据…</div><div v-else-if="!groups.length" class="strategy-board-empty">暂无广告活动数据</div><div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined" @wheel="handleTableWheel"><table class="strategy-table" :style="tableStyle"><colgroup><col :style="{ width: `${nameColumnWidth}px` }"><col v-for="column in visibleColumns" :key="column.key" :style="{ width: `${widths[column.key]}px` }"><col :style="{ width: `${noteColumnWidth}px` }"></colgroup><thead><tr><th class="strategy-name-column">策略 / 系列<i class="strategy-resize-handle" title="拖动调整策略 / 系列列宽" @pointerdown="startNameResize"></i></th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column"><div class="strategy-note-header"><span>优化方向</span><button class="strategy-note-save strategy-save-all-notes" type="button" :disabled="loading || saving === 'notes' || !groups.length" @click="saveAllNotes">{{ saving === "notes" ? "保存中" : "保存所有优化方向" }}</button></div><i class="strategy-resize-handle" title="拖动调整优化方向列宽" @pointerdown="startNoteResize"></i></th></tr></thead><tbody><template v-for="row in groups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ groupMeta(row) }}</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(row.metrics?.[column.key], column, row.currency) }}</td><td class="strategy-note-cell"><div class="strategy-note-editor"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…" @input="resizeNote"></textarea></div></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}`" class="strategy-campaign-row"><td class="strategy-name-column campaign-assignment-cell"><div class="campaign-selectors"><el-select :model-value="campaignDraftFor(row, campaign).strategy" size="small" @change="setCampaignDraft(campaign, 'strategy', $event)"><el-option v-for="option in STRATEGIES" :key="option" :label="option" :value="option" /></el-select><el-select :model-value="campaignDraftFor(row, campaign).series" size="small" clearable placeholder="系列" @change="setCampaignDraft(campaign, 'series', $event)"><el-option v-for="option in seriesOptions" :key="option" :label="displaySeries(option)" :value="option" /></el-select></div><button type="button" class="campaign-name" :title="`Campaign ID：${campaign.campaign_id}，点击复制`" @click="copyCampaignId(campaign)">{{ campaign.campaign_name || `未命名广告活动 · ${campaign.campaign_id}` }}</button><small class="campaign-meta">{{ campaign.store_name || (campaign.store_sid ? `店铺 ${campaign.store_sid}` : "店铺信息缺失") }} · {{ campaign.ad_type || "广告活动" }} · ID {{ campaign.campaign_id }}</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(campaign[column.key], column, campaign.currency) }}</td><td></td></tr></template></template></tbody>
-      <tfoot><tr class="strategy-summary-row"><td class="strategy-name-column strategy-summary-label"><strong>汇总</strong><small>当前筛选范围</small></td><td v-for="column in visibleColumns" :key="column.key">{{ display(summaryMetrics[column.key], column, summaryCurrency) }}</td><td></td></tr></tfoot>
+    <div v-if="error" class="strategy-board-error">{{ error }}</div><div v-else-if="loading" class="strategy-board-loading">正在同步广告后台数据…</div><div v-else-if="!groups.length" class="strategy-board-empty">暂无广告活动数据</div><div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined" @wheel="handleTableWheel"><table class="strategy-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><colgroup><col :style="{ width: `${nameColumnWidth}px` }"><col v-for="column in visibleColumns" :key="column.key" :style="{ width: `${widths[column.key]}px` }"><col :style="{ width: `${noteColumnWidth}px` }"></colgroup><thead><tr><th class="strategy-name-column">策略 / 系列<i class="strategy-resize-handle" title="拖动调整策略 / 系列列宽" @pointerdown="startNameResize"></i></th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column"><div class="strategy-note-header"><span>优化方向</span><button class="strategy-note-save strategy-save-all-notes" type="button" :disabled="loading || saving === 'notes' || !groups.length" @click="saveAllNotes">{{ saving === "notes" ? "保存中" : "保存所有优化方向" }}</button></div><i class="strategy-resize-handle" title="拖动调整优化方向列宽" @pointerdown="startNoteResize"></i></th></tr></thead><tbody><template v-for="row in groups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ groupMeta(row) }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(row.metrics?.[column.key], column, row.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', rowComparison(row, column)?.status]">{{ rowComparison(row, column)?.text }}</span></div></td><td class="strategy-note-cell"><div class="strategy-note-editor"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…" @input="resizeNote"></textarea></div></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}`" class="strategy-campaign-row"><td class="strategy-name-column campaign-assignment-cell"><div class="campaign-selectors"><el-select :model-value="campaignDraftFor(row, campaign).strategy" size="small" @change="setCampaignDraft(campaign, 'strategy', $event)"><el-option v-for="option in STRATEGIES" :key="option" :label="option" :value="option" /></el-select><el-select :model-value="campaignDraftFor(row, campaign).series" size="small" clearable placeholder="系列" @change="setCampaignDraft(campaign, 'series', $event)"><el-option v-for="option in seriesOptions" :key="option" :label="displaySeries(option)" :value="option" /></el-select></div><button type="button" class="campaign-name" :title="`Campaign ID：${campaign.campaign_id}，点击复制`" @click="copyCampaignId(campaign)">{{ campaign.campaign_name || `未命名广告活动 · ${campaign.campaign_id}` }}</button><small class="campaign-meta">{{ campaign.store_name || (campaign.store_sid ? `店铺 ${campaign.store_sid}` : "店铺信息缺失") }} · {{ campaign.ad_type || "广告活动" }} · ID {{ campaign.campaign_id }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(campaign[column.key], column, campaign.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', campaignComparison(campaign, column)?.status]">{{ campaignComparison(campaign, column)?.text }}</span></div></td><td></td></tr></template></template></tbody>
+      <tfoot><tr class="strategy-summary-row"><td class="strategy-name-column strategy-summary-label"><strong>汇总</strong><small>当前筛选范围</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(summaryMetrics[column.key], column, summaryCurrency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', summaryComparison(column)?.status]">{{ summaryComparison(column)?.text }}</span></div></td><td></td></tr></tfoot>
     </table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
     <div v-if="toast" class="amazon-copy-toast" role="status" aria-live="polite">{{ toast }}</div>
   </section></el-config-provider>

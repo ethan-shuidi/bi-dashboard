@@ -26,6 +26,9 @@ const selectedSeries = ref([])
 const selectedProducts = ref([])
 const rows = ref([])
 const periods = ref([])
+const previousRows = ref([])
+const previousPeriods = ref([])
+const showComparison = ref(false)
 const loading = ref(true)
 const error = ref("")
 const currency = ref("original")
@@ -98,6 +101,9 @@ const columnConfigOpen = ref(false)
 const columnConfigPosition = ref({ top: 0, left: 0 })
 const columnConfigButton = ref(null)
 const visibleDataColumns = computed(() => dataColumns.value.filter((column) => column.visible))
+const percentMetricKeys = new Set(["acoas", "ad_sales_share", "ad_order_share", "ctr", "ad_cvr", "cvr", "acos"])
+const moneyMetricKeys = new Set(["net_sales", "cpc", "cpo", "ad_cost"])
+const lowerIsBetterMetricKeys = new Set(["acoas", "ad_sales_share", "ad_order_share", "cpc", "cpo", "ad_cost", "acos"])
 const adBreakdownMetricKeys = new Set(["clicks", "ad_cost", "ad_units", "ad_orders"])
 const authoritativeBreakdownMetricKeys = new Set(["clicks", "ad_units", "ad_orders"])
 const adBreakdownTypes = [
@@ -458,6 +464,25 @@ function rowHasMetricData(metrics) {
 }
 
 const displayRows = computed(() => {
+  const previousIndexByLabel = new Map(previousPeriods.value.map((period, index) => [period.label, index]))
+  const previousDetailsByIndex = new Map()
+  for (const row of previousRows.value) {
+    const periodIndex = previousIndexByLabel.get(row.period)
+    if (periodIndex == null) continue
+    if (!previousDetailsByIndex.has(periodIndex)) previousDetailsByIndex.set(periodIndex, [])
+    previousDetailsByIndex.get(periodIndex).push(row)
+  }
+  const previousDetailByKey = new Map()
+  const previousSeriesByKey = new Map()
+  for (const [periodIndex, details] of previousDetailsByIndex) {
+    for (const item of details) {
+      const previousSite = item.site || (site.value.length === 1 ? site.value[0] : "")
+      previousDetailByKey.set(`${periodIndex}|${previousSite}|${item.series}|${item.product}`, item)
+    }
+    for (const previousSite of new Set(details.map((item) => item.site || (site.value.length === 1 ? site.value[0] : "")))) {
+      previousSeriesByKey.set(`${periodIndex}|${previousSite}|${series}`, details.filter((item) => (item.site || (site.value.length === 1 ? site.value[0] : "")) === previousSite && item.series === series))
+    }
+  }
   const grouped = new Map()
   for (const row of rows.value) {
     // Older deployed backends do not return the new site field.  Preserve a
@@ -507,12 +532,19 @@ const displayRows = computed(() => {
           ))
         periodDetails.push(...orderedDetails)
         const key = `${period}|${siteName}|${series}`
-        periodRows.push({ type: "group", key, period, site: siteName, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails) })
-        if (expanded.value.has(key)) orderedDetails.forEach((item) => periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, site: siteName, series, product: item.product, metrics: item }))
+        const periodIndex = orderedPeriods.indexOf(periodInfo)
+        const previousSeriesRows = previousSeriesByKey.get(`${periodIndex}|${siteName}|${series}`) || []
+        periodRows.push({ type: "group", key, period, site: siteName, series, detail: orderedDetails, expanded: expanded.value.has(key), metrics: aggregate(orderedDetails), previousMetrics: showComparison.value ? aggregate(previousSeriesRows) : null })
+        if (expanded.value.has(key)) orderedDetails.forEach((item) => {
+          const previousItem = previousDetailByKey.get(`${periodIndex}|${item.site}|${item.series}|${item.product}`)
+          periodRows.push({ type: "detail", key: `${key}|${item.product}`, period, site: siteName, series, product: item.product, metrics: item, previousMetrics: showComparison.value && previousItem ? previousItem : null })
+        })
       }
     }
     if (showPeriodTotals.value) {
-      periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails) })
+      const periodIndex = orderedPeriods.indexOf(periodInfo)
+      const previousPeriodRows = previousDetailsByIndex.get(periodIndex) || []
+      periodRows.push({ type: "period-total", key: `${period}|total`, period, site: "", series: `${comparison.value}汇总`, metrics: aggregate(periodDetails), previousMetrics: showComparison.value ? aggregate(previousPeriodRows) : null })
     }
     result.push(...periodRows.filter((row) => rowHasMetricData(row.metrics)))
   }
@@ -599,10 +631,38 @@ function cells(item) {
 
 function cellValue(item, column) {
   const value = metricValue(item, column.key)
-  if (["acoas", "ad_sales_share", "ad_order_share", "ctr", "ad_cvr", "cvr", "acos"].includes(column.key)) return percent(value)
-  if (["net_sales", "cpc", "cpo", "ad_cost"].includes(column.key)) return money(value, item.currency)
+  if (percentMetricKeys.has(column.key)) return percent(value)
+  if (moneyMetricKeys.has(column.key)) return money(value, item.currency)
   return number(value)
 }
+
+function formatSignedNumber(value) {
+  const numericValue = Number(value || 0)
+  const formatted = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Math.abs(numericValue))
+  return `${numericValue > 0 ? "+" : numericValue < 0 ? "-" : ""}${formatted}`
+}
+
+function periodComparison(row, column) {
+  if (!showComparison.value || !row.previousMetrics) return null
+  const current = metricValue(row.metrics, column.key)
+  const previous = metricValue(row.previousMetrics, column.key)
+  if (current == null || previous == null || !Number.isFinite(Number(current)) || !Number.isFinite(Number(previous))) {
+    return { status: "gray", text: "—" }
+  }
+  const difference = Number(current) - Number(previous)
+  if (!Number.isFinite(difference)) return { status: "gray", text: "—" }
+  let text
+  if (percentMetricKeys.has(column.key)) {
+    text = `${difference > 0 ? "+" : difference < 0 ? "-" : ""}${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Math.abs(difference * 100))}%`
+  } else if (moneyMetricKeys.has(column.key)) {
+    text = `${difference < 0 ? "-" : difference > 0 ? "+" : ""}${money(Math.abs(difference), row.metrics?.currency)}`
+  } else {
+    text = formatSignedNumber(difference)
+  }
+  const improved = lowerIsBetterMetricKeys.has(column.key) ? difference < 0 : difference > 0
+  const declined = lowerIsBetterMetricKeys.has(column.key) ? difference > 0 : difference < 0
+  return { status: improved ? "red" : declined ? "green" : "gray", text }
+ }
 
 function updateColumnConfigPosition() { const rect = columnConfigButton.value?.getBoundingClientRect(); if (rect) columnConfigPosition.value = { top: rect.bottom + 8, left: Math.max(8, rect.right - 240) } }
 function toggleColumnConfig() { columnConfigOpen.value = !columnConfigOpen.value; if (columnConfigOpen.value) requestAnimationFrame(updateColumnConfigPosition) }
@@ -737,23 +797,49 @@ async function loadDateContext() {
   } catch {}
 }
 
+function shiftDate(value, days) {
+  const result = toDate(value) || todayDate()
+  result.setDate(result.getDate() + days)
+  return formatDate(result)
+}
+
+async function fetchDashboardData(rangeStart, rangeEnd, forceRefresh = false) {
+  const query = new URLSearchParams({ comparison: comparison.value, start_date: rangeStart, end_date: rangeEnd, currency: currency.value })
+  site.value.forEach((siteName) => query.append("site", siteName))
+  if (forceRefresh) query.set("refresh", "true")
+  selectedSeries.value.forEach((v) => query.append("series", v))
+  selectedProducts.value.forEach((v) => query.append("products", normalize(v)))
+  const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/dashboard?${query}`)
+  const raw = await response.text()
+  let data = {}
+  try { data = raw ? JSON.parse(raw) : {} } catch { throw new Error(raw || `HTTP ${response.status}`) }
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+  return data
+}
+
 async function load(forceRefresh = false) {
   if (!startDate.value || !endDate.value || startDate.value > endDate.value) { error.value = "请选择有效日期范围"; return }
   const requestSeq = ++dashboardRequestSeq
   loading.value = true; error.value = ""
   try {
-    const query = new URLSearchParams({ comparison: comparison.value, start_date: startDate.value, end_date: endDate.value, currency: currency.value })
-    site.value.forEach((siteName) => query.append("site", siteName))
-    if (forceRefresh) query.set("refresh", "true")
-    selectedSeries.value.forEach((v) => query.append("series", v))
-    selectedProducts.value.forEach((v) => query.append("products", normalize(v)))
-    const response = await fetchWithDashboardAuth(`${apiBase.value}/api/amazon/dashboard?${query}`)
-    const raw = await response.text()
-    let data = {}
-    try { data = raw ? JSON.parse(raw) : {} } catch { throw new Error(raw || `HTTP ${response.status}`) }
-    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    const rangeDays = ((toDate(endDate.value) || todayDate()) - (toDate(startDate.value) || todayDate())) / 86400000
+    const previousStart = shiftDate(startDate.value, -(rangeDays + 1))
+    const previousEnd = shiftDate(endDate.value, -(rangeDays + 1))
+    if (forceRefresh && showComparison.value) {
+      const refreshedPrevious = await fetchDashboardData(previousStart, previousEnd, true)
+      if (requestSeq !== dashboardRequestSeq) return
+      previousRows.value = refreshedPrevious.rows || []
+      previousPeriods.value = refreshedPrevious.periods || []
+    }
+    const data = await fetchDashboardData(startDate.value, endDate.value, forceRefresh)
     if (requestSeq !== dashboardRequestSeq) return
     rows.value = data.rows || []; periods.value = data.periods || []; expanded.value = new Set()
+    if (showComparison.value && !forceRefresh) {
+      const previousData = await fetchDashboardData(previousStart, previousEnd)
+      if (requestSeq !== dashboardRequestSeq) return
+      previousRows.value = previousData.rows || []
+      previousPeriods.value = previousData.periods || []
+    }
   } catch (e) {
     if (requestSeq !== dashboardRequestSeq) return
     error.value = e.message || "数据加载失败"
@@ -833,9 +919,9 @@ onBeforeUnmount(() => {
       <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displayProduct(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlyProduct(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label class="amazon-summary-only-filter"><span>查看方式</span><span class="amazon-checkbox-control"><input v-model="summaryOnly" type="checkbox" />仅查看汇总</span></label>
     </section>
-     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><button ref="columnConfigButton" class="column-config-button" type="button" @click="toggleColumnConfig" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><Teleport to="body"><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel column-config-panel-floating" role="dialog" aria-label="列配置" :style="{ top: `${columnConfigPosition.top}px`, left: `${columnConfigPosition.left}px` }"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></Teleport></div></div>
+     <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><label class="comparison-toggle" title="对比上一同长度区间"><input v-model="showComparison" type="checkbox" @change="load"><span>查看环比</span></label><button ref="columnConfigButton" class="column-config-button" type="button" @click="toggleColumnConfig" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><Teleport to="body"><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel column-config-panel-floating" role="dialog" aria-label="列配置" :style="{ top: `${columnConfigPosition.top}px`, left: `${columnConfigPosition.left}px` }"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></Teleport></div></div>
       <div v-if="error" class="amazon-error">数据加载失败：{{ error }}</div><div v-else-if="loading" class="amazon-loading" role="status" aria-live="polite"><span class="amazon-loading-spinner" aria-hidden="true"></span><span>从领星同步数据...</span></div>
-        <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
+        <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-hover', 'product-name-button', { copied: copiedProductKey === row.key }]" :data-asin="row.metrics.asin || ''" :title="row.metrics.asin ? `ASIN：${row.metrics.asin}` : '暂无 ASIN'" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><div class="metric-cell-stack"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template><span v-if="showComparison" :class="['period-comparison-delta', periodComparison(row, column)?.status]">{{ periodComparison(row, column)?.text }}</span></div></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
       <Teleport to="body"><div v-if="breakdownOpenKey && breakdownRow && breakdownColumn" class="ad-breakdown-popover ad-breakdown-popover-floating" role="tooltip" :style="{ top: `${breakdownPosition.top}px`, left: `${breakdownPosition.left}px` }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><strong>{{ breakdownColumn.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(breakdownRow.metrics, breakdownColumn.key, adType.key) }}</em></span><small v-if="!breakdownHasData(breakdownRow.metrics)">暂无四类广告明细</small></div></Teleport>
     </section>
     </section>

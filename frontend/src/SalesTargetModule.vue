@@ -38,7 +38,6 @@ const loading = ref(true)
 const saving = ref(false)
 const error = ref("")
 const notice = ref("")
-const showComparison = ref(false)
 const targetDraft = ref({})
 const savedTargets = ref({})
 let dashboardRequestSeq = 0
@@ -49,23 +48,20 @@ const salesColumnDefaults = {
   target: 214,
   actual: 148,
   completion: 152,
-  comparison: 148,
 }
 const salesColumnBounds = {
   metric: [96, 280],
   target: [160, 340],
   actual: [112, 280],
   completion: [112, 280],
-  comparison: [104, 280],
 }
 const salesColumns = [
   { key: "metric", label: "指标" },
   { key: "target", label: "目标" },
   { key: "actual", label: "实际完成" },
   { key: "completion", label: "完成率" },
-  { key: "comparison", label: "环比" },
 ]
-const displaySalesColumns = computed(() => showComparison.value ? salesColumns : salesColumns.filter(({ key }) => key !== "comparison"))
+const displaySalesColumns = computed(() => salesColumns)
 const columnWidthStorageKey = computed(() => `sales-target-column-widths:${props.variant}`)
 const columnWidths = ref(loadColumnWidths())
 const tableWidth = computed(() => displaySalesColumns.value.reduce((total, column) => total + columnWidths.value[column.key], 0))
@@ -126,7 +122,6 @@ async function loadDashboard({ refresh = false } = {}) {
     const query = new URLSearchParams({ model: model.value, site: site.value })
     if (isWeek.value) query.set("week_start", weekStart.value)
     else query.set("year", String(year.value)), query.set("month", String(month.value))
-    if (showComparison.value) query.set("include_comparison", "true")
     if (refresh) query.set("refresh", "true")
     data.value = await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}?${query}`)
     if (requestSeq !== dashboardRequestSeq) return
@@ -304,20 +299,6 @@ function formatCompletion(row) {
   return `${value > 0 ? "+" : ""}${formatNumber(value * 100)} 个百分点`
 }
 
-function formatPeriodComparison(row) {
-  const comparison = row.period_comparison
-  if (!comparison || comparison.value === null || comparison.value === undefined) return "—"
-  const value = Number(comparison.value)
-  const sign = value > 0 ? "+" : value < 0 ? "-" : ""
-  if (row.format === "money") {
-    return `${sign}${formatMoney(Math.abs(value))}`
-  }
-  if (row.format === "percent") {
-    return `${sign}${formatNumber(Math.abs(value * 100))}%`
-  }
-  return `${sign}${formatNumber(Math.abs(value))}`
-}
-
 function displayPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "—"
   return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(Number(value))}%`
@@ -384,7 +365,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", updateDatePanelPosition)
   window.removeEventListener("scroll", updateDatePanelPosition, true)
 })
-watch(isWeek.value ? [weekStart, model, site, showComparison] : [year, month, model, site, showComparison], () => loadDashboard())
+watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () => loadDashboard())
 </script>
 
 <template>
@@ -431,10 +412,6 @@ watch(isWeek.value ? [weekStart, model, site, showComparison] : [year, month, mo
         <span>筛选范围</span>
         <small>仅作用于销量进度和{{ dimensionName }}目标完成度</small>
       </div>
-      <label class="sales-comparison-toggle" title="对比上一周期同长度区间">
-        <input v-model="showComparison" type="checkbox">
-        <span>查看环比</span>
-      </label>
       <div class="sales-filter-actions">
         <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
         <button class="sales-refresh-button" type="button" :disabled="saving || loading" @click="refreshTargets">刷新</button>
@@ -502,7 +479,6 @@ watch(isWeek.value ? [weekStart, model, site, showComparison] : [year, month, mo
               </td>
               <td>{{ formatMetric(row, "actual") }}</td>
               <td><span :class="['sales-completion', row.completion?.status]">{{ formatCompletion(row) }}</span></td>
-              <td v-if="showComparison"><span :class="['sales-completion', row.period_comparison?.status]">{{ formatPeriodComparison(row) }}</span></td>
             </tr>
           </tbody>
         </table>
@@ -511,7 +487,6 @@ watch(isWeek.value ? [weekStart, model, site, showComparison] : [year, month, mo
         <span>数据源：领星产品表现</span>
         <span v-if="data.data_quality.source">来源状态：{{ data.data_quality.source }}</span>
         <span>时间基准：{{ data.progress?.time?.site_date || "—" }}（{{ data.progress?.time?.timezone_basis || "站点日期" }}）</span>
-        <span v-if="showComparison && data.comparison?.period">环比区间：{{ data.comparison.period.start }} 至 {{ data.comparison.period.actual_end || data.comparison.period.end }}（同长度区间）</span>
       </footer>
     </section>
   </section>
