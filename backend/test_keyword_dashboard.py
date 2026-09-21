@@ -2,6 +2,7 @@ import asyncio
 import os
 import unittest
 from datetime import date, datetime
+from datetime import timedelta, timezone
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,8 +13,11 @@ from app import (
     KEYWORD_CATEGORIES,
     KeywordDashboardTerm,
     KeywordDashboardWeeklyRecord,
+    XiyouInvalidTrendRangeError,
     app,
+    clear_keyword_unavailable_weeks,
     fetch_xiyou_weekly_records,
+    fetch_xiyou_weekly_records_with_recovery,
     keyword_dashboard_cross_process_lock,
     keyword_fetch_groups,
     keyword_dashboard_rows,
@@ -22,6 +26,8 @@ from app import (
     latest_completed_keyword_week_start,
     normalize_keyword_week_start,
     normalize_week_start,
+    keyword_unavailable_weeks,
+    remember_keyword_unavailable_weeks,
     xiyou_weekly_records,
     xiyou_keyword_dashboard_scope,
 )
@@ -203,7 +209,7 @@ class KeywordDashboardTests(unittest.TestCase):
             json={"code": "InvalidTrendsRange", "msg": "Internal Server Error"},
         )
         with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
-            with self.assertRaisesRegex(RuntimeError, "已完成周"):
+            with self.assertRaises(XiyouInvalidTrendRangeError):
                 asyncio.run(fetch_xiyou_weekly_records(
                     "US",
                     ["power bank"],
@@ -211,6 +217,86 @@ class KeywordDashboardTests(unittest.TestCase):
                     date(2026, 9, 20),
                     client,
                 ))
+
+    def test_invalid_multi_week_range_falls_back_to_single_weeks(self):
+        client = AsyncMock()
+        invalid = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://example.test/weekly"),
+            json={"code": "InvalidTrendsRange", "msg": "Internal Server Error"},
+        )
+
+        def success(week: date, rank: int) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://example.test/weekly"),
+                json={"entities": [{
+                    "searchTerm": "power bank",
+                    "trends": [{
+                        "reportFromDate": week.isoformat(),
+                        "searchFrequencyRank": rank,
+                        "weeklySearchVolume": rank * 100,
+                    }],
+                }]},
+            )
+        client.post.side_effect = [
+            invalid,
+            success(date(2026, 9, 13), 20),
+            invalid,
+            success(date(2026, 9, 27), 10),
+        ]
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
+            outcome = asyncio.run(fetch_xiyou_weekly_records_with_recovery(
+                "US",
+                ["power bank"],
+                date(2026, 9, 13),
+                date(2026, 9, 27),
+                client,
+            ))
+        self.assertEqual(outcome.successful_weeks, (date(2026, 9, 13), date(2026, 9, 27)))
+        self.assertEqual(outcome.unavailable_weeks, (date(2026, 9, 20),))
+        self.assertEqual(outcome.request_count, 4)
+        self.assertEqual([(item["week_start"], item["rank"]) for item in outcome.records], [
+            (date(2026, 9, 13), 20),
+            (date(2026, 9, 27), 10),
+        ])
+
+    def test_single_week_fallback_keeps_successful_weeks_when_one_week_fails(self):
+        client = AsyncMock()
+        responses = [
+            httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://example.test/weekly"),
+                json={"code": "InvalidTrendsRange", "msg": "Internal Server Error"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://example.test/weekly"),
+                json={"entities": []},
+            ),
+            httpx.Response(
+                500,
+                request=httpx.Request("POST", "https://example.test/weekly"),
+                json={"msg": "upstream timeout"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://example.test/weekly"),
+                json={"entities": []},
+            ),
+        ]
+        client.post.side_effect = responses
+        with patch.dict(os.environ, {"XIYOU_API_KEY": "server-only-test-key"}), patch("app.XIYOU_API_BASE", "https://example.test"), xiyou_keyword_dashboard_scope():
+            outcome = asyncio.run(fetch_xiyou_weekly_records_with_recovery(
+                "US",
+                ["power bank"],
+                date(2026, 9, 13),
+                date(2026, 9, 27),
+                client,
+            ))
+        self.assertEqual(outcome.successful_weeks, (date(2026, 9, 13), date(2026, 9, 27)))
+        self.assertEqual(outcome.unavailable_weeks, ())
+        self.assertIn("西柚接口请求失败：HTTP 500 upstream timeout", outcome.errors)
 
     def test_fetch_xiyou_is_rejected_outside_keyword_dashboard_scope(self):
         client = AsyncMock()
@@ -254,6 +340,45 @@ class KeywordDashboardTests(unittest.TestCase):
 
         refreshed = keyword_fetch_groups(terms, weeks, history, refresh=True)
         self.assertEqual(refreshed, [(date(2026, 9, 13), date(2026, 9, 27), ["A", "B"])])
+
+        unavailable = keyword_fetch_groups(
+            terms,
+            weeks,
+            history,
+            refresh=False,
+            unavailable_weeks={date(2026, 9, 20)},
+        )
+        self.assertEqual(unavailable, [
+            (date(2026, 9, 13), date(2026, 9, 13), ["B"]),
+            (date(2026, 9, 27), date(2026, 9, 27), ["A", "B"]),
+        ])
+        forced_refresh = keyword_fetch_groups(
+            terms,
+            weeks,
+            history,
+            refresh=True,
+            unavailable_weeks={date(2026, 9, 20)},
+        )
+        self.assertEqual(forced_refresh, [(date(2026, 9, 13), date(2026, 9, 27), ["A", "B"])])
+
+    def test_unavailable_week_memory_expires_and_refresh_clears_it(self):
+        weeks = keyword_week_columns(date(2026, 9, 13), date(2026, 9, 20))
+        failed_at = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+        try:
+            remember_keyword_unavailable_weeks("US", [date(2026, 9, 20)], now=failed_at)
+            self.assertEqual(
+                keyword_unavailable_weeks("US", weeks, now=failed_at + timedelta(hours=1)),
+                {date(2026, 9, 20)},
+            )
+            self.assertEqual(
+                keyword_unavailable_weeks("US", weeks, now=failed_at + timedelta(hours=6, seconds=1)),
+                set(),
+            )
+            remember_keyword_unavailable_weeks("US", [date(2026, 9, 20)], now=failed_at)
+            clear_keyword_unavailable_weeks("US")
+            self.assertEqual(keyword_unavailable_weeks("US", weeks, now=failed_at), set())
+        finally:
+            clear_keyword_unavailable_weeks("US")
 
     def test_rejects_all_site_and_ranges_over_52_weeks(self):
         client = TestClient(app)

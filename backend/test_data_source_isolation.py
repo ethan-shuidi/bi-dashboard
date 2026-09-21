@@ -53,7 +53,7 @@ class DataSourceIsolationTests(unittest.TestCase):
     def test_keyword_dashboard_does_not_reference_lingxing(self):
         node = functions()["keyword_dashboard"]
         values = identifiers(node)
-        self.assertIn("fetch_xiyou_weekly_records", values)
+        self.assertIn("fetch_xiyou_weekly_records_with_recovery", values)
         self.assertFalse(
             any("lingxing" in identifier.lower() for identifier in values),
             "搜索词看板不允许引用领星数据链路",

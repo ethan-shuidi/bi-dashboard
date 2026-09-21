@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import math
 import time
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -96,6 +97,8 @@ _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
+_keyword_unavailable_weeks_lock = threading.RLock()
+_keyword_unavailable_weeks: dict[tuple[str, date], datetime] = {}
 _xiyou_keyword_dashboard_scope: ContextVar[bool] = ContextVar(
     "xiyou_keyword_dashboard_scope",
     default=False,
@@ -209,6 +212,7 @@ KEYWORD_CATEGORIES = (
 )
 KEYWORD_FETCH_TERM_BATCH_SIZE = 20
 KEYWORD_FETCH_WEEK_CHUNK = 5
+KEYWORD_UNAVAILABLE_WEEK_TTL_SECONDS = 6 * 60 * 60
 KEYWORD_DASHBOARD_FETCH_LOCK_NAME = "bi_dashboard_keyword_fetch"
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
@@ -4348,6 +4352,65 @@ def latest_completed_keyword_week_start(selected: date | datetime | None = None)
     return current_start - timedelta(days=7)
 
 
+class XiyouInvalidTrendRangeError(RuntimeError):
+    """Xiyou rejected a range because one of its weeks is unavailable."""
+
+
+@dataclass(frozen=True)
+class XiyouWeeklyFetchOutcome:
+    """Describe exactly which cells can safely be persisted."""
+
+    records: list[dict[str, Any]]
+    successful_weeks: tuple[date, ...]
+    unavailable_weeks: tuple[date, ...]
+    request_count: int
+    errors: tuple[str, ...] = ()
+
+
+def keyword_unavailable_weeks(
+    site_code: str,
+    weeks: list[dict[str, str]],
+    *,
+    now: datetime | None = None,
+) -> set[date]:
+    """Return recent Xiyou week failures without repeatedly probing them."""
+
+    current = now or datetime.now(timezone.utc)
+    selected = {date.fromisoformat(week["start"]) for week in weeks}
+    with _keyword_unavailable_weeks_lock:
+        expired = [
+            key for key, failed_at in _keyword_unavailable_weeks.items()
+            if current - failed_at >= timedelta(seconds=KEYWORD_UNAVAILABLE_WEEK_TTL_SECONDS)
+        ]
+        for key in expired:
+            _keyword_unavailable_weeks.pop(key, None)
+        return {
+            week for site, week in _keyword_unavailable_weeks
+            if site == site_code and week in selected
+        }
+
+
+def remember_keyword_unavailable_weeks(
+    site_code: str,
+    weeks: list[date],
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Remember unavailable weeks briefly; refresh can explicitly clear this."""
+
+    failed_at = now or datetime.now(timezone.utc)
+    with _keyword_unavailable_weeks_lock:
+        for week in weeks:
+            _keyword_unavailable_weeks[(site_code, week)] = failed_at
+
+
+def clear_keyword_unavailable_weeks(site_code: str) -> None:
+    with _keyword_unavailable_weeks_lock:
+        for site, week in list(_keyword_unavailable_weeks):
+            if site == site_code:
+                del _keyword_unavailable_weeks[(site, week)]
+
+
 def keyword_date_value(value: Any) -> date | None:
     if value is None:
         return None
@@ -4540,11 +4603,16 @@ def keyword_fetch_groups(
     history: dict[str, dict[date, KeywordDashboardWeeklyRecord]],
     *,
     refresh: bool,
+    unavailable_weeks: set[date] | None = None,
 ) -> list[tuple[date, date, list[str]]]:
     """Build exact consecutive missing-week runs, chunked for Xiyou limits."""
 
     by_run: dict[tuple[date, date], set[str]] = {}
-    week_dates = [date.fromisoformat(week["start"]) for week in weeks]
+    skipped_weeks = set() if refresh else (unavailable_weeks or set())
+    week_dates = [
+        date.fromisoformat(week["start"]) for week in weeks
+        if date.fromisoformat(week["start"]) not in skipped_weeks
+    ]
     for term in terms:
         keyword = term.keyword
         missing = [
@@ -4680,7 +4748,7 @@ async def fetch_xiyou_weekly_records(
         if response.status_code >= 400:
             error_code = str(payload.get("code") or "")
             if error_code == "InvalidTrendsRange":
-                raise RuntimeError("西柚接口暂不支持所选周范围，请选择已完成周")
+                raise XiyouInvalidTrendRangeError("西柚接口暂不支持所选周范围")
             message = payload.get("msg") or payload.get("message") or response.text[:200]
             raise RuntimeError(f"西柚接口请求失败：HTTP {response.status_code} {message}")
         return xiyou_weekly_records(payload)
@@ -4689,6 +4757,60 @@ async def fetch_xiyou_weekly_records(
         return await request(client)
     async with httpx.AsyncClient(timeout=45) as created:
         return await request(created)
+
+
+async def fetch_xiyou_weekly_records_with_recovery(
+    country: str,
+    terms: list[str],
+    start: date,
+    end: date,
+    client: httpx.AsyncClient | None = None,
+) -> XiyouWeeklyFetchOutcome:
+    """Fetch a batch, then split an invalid multi-week range into single weeks.
+
+    Xiyou returns ``InvalidTrendsRange`` when any week in a range is not
+    published yet. Retrying the same range as individual weeks preserves every
+    available week and identifies the exact week that must be skipped for a
+    short period. Billing is based on keywords multiplied by weeks, so this
+    fallback does not increase the theoretical Credit cost.
+    """
+
+    try:
+        records = await fetch_xiyou_weekly_records(country, terms, start, end, client)
+        successful_weeks = tuple(
+            start + timedelta(days=7 * offset)
+            for offset in range((end - start).days // 7 + 1)
+        )
+        return XiyouWeeklyFetchOutcome(records, successful_weeks, (), 1)
+    except XiyouInvalidTrendRangeError:
+        if start == end:
+            return XiyouWeeklyFetchOutcome([], (), (start,), 1)
+
+    records: list[dict[str, Any]] = []
+    successful_weeks: list[date] = []
+    unavailable_weeks: list[date] = []
+    errors: list[str] = []
+    request_count = 1
+    cursor = start
+    while cursor <= end:
+        try:
+            records.extend(await fetch_xiyou_weekly_records(country, terms, cursor, cursor, client))
+            successful_weeks.append(cursor)
+        except XiyouInvalidTrendRangeError:
+            unavailable_weeks.append(cursor)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            message = str(exc) or "西柚关键词数据获取失败"
+            if message not in errors:
+                errors.append(message)
+        request_count += 1
+        cursor += timedelta(days=7)
+    return XiyouWeeklyFetchOutcome(
+        records,
+        tuple(successful_weeks),
+        tuple(unavailable_weeks),
+        request_count,
+        tuple(errors),
+    )
 
 
 def keyword_terms_payload(rows: list[KeywordDashboardTerm]) -> list[dict[str, Any]]:
@@ -4887,6 +5009,8 @@ async def keyword_dashboard(
     requested_fetch_count = 0
     fetched_record_count = 0
     fetch_in_progress_elsewhere = False
+    if refresh:
+        clear_keyword_unavailable_weeks(site_code)
 
     # Compute missing ranges while holding the fetch lock. A completed request
     # persists its history before the next viewer can compute its own gaps. The
@@ -4905,31 +5029,70 @@ async def keyword_dashboard(
                         .where(KeywordDashboardWeeklyRecord.week_start <= end)
                     ).all()
                     history = keyword_history_index(list(history_rows))
-                    groups = keyword_fetch_groups(term_rows, weeks, history, refresh=refresh)
-                requested_fetch_count = len(groups)
+                    unavailable_weeks = keyword_unavailable_weeks(site_code, weeks)
+                    groups = keyword_fetch_groups(
+                        term_rows,
+                        weeks,
+                        history,
+                        refresh=refresh,
+                        unavailable_weeks=unavailable_weeks,
+                    )
+                if unavailable_weeks:
+                    unavailable_text = "、".join(week.isoformat() for week in sorted(unavailable_weeks))
+                    warnings.append(
+                        f"以下周西柚暂未发布或暂不支持：{unavailable_text}；已展示可用历史，点击刷新可重新检测。"
+                    )
                 for range_start, range_end, keywords in groups:
                     group_weeks = [
                         week for week in weeks
                         if range_start <= date.fromisoformat(week["start"]) <= range_end
                     ]
                     try:
-                        fetched = await fetch_xiyou_weekly_records(
+                        outcome = await fetch_xiyou_weekly_records_with_recovery(
                             site_code,
                             keywords,
                             range_start,
                             range_end,
                         )
-                        fetched_record_count += len(fetched)
-                        fetched_at = datetime.now(timezone.utc)
-                        with session_factory()() as db:
-                            persist_keyword_weekly_records(
-                                db,
+                        requested_fetch_count += outcome.request_count
+                        fetched_record_count += len(outcome.records)
+                        for message in outcome.errors:
+                            if message not in warnings:
+                                warnings.append(message)
+                        if outcome.unavailable_weeks:
+                            remember_keyword_unavailable_weeks(
                                 site_code,
-                                keywords,
-                                group_weeks,
-                                fetched,
-                                fetched_at=fetched_at,
+                                list(outcome.unavailable_weeks),
                             )
+                            unavailable_text = "、".join(
+                                week.isoformat() for week in outcome.unavailable_weeks
+                            )
+                            warning = (
+                                f"以下周西柚暂未发布或暂不支持：{unavailable_text}；"
+                                "已展示可用历史，点击刷新可重新检测。"
+                            )
+                            if warning not in warnings:
+                                warnings.append(warning)
+                        successful_weeks = {
+                            date.fromisoformat(week["start"])
+                            for week in group_weeks
+                            if date.fromisoformat(week["start"]) in outcome.successful_weeks
+                        }
+                        if successful_weeks:
+                            persist_weeks = [
+                                week for week in group_weeks
+                                if date.fromisoformat(week["start"]) in successful_weeks
+                            ]
+                            fetched_at = datetime.now(timezone.utc)
+                            with session_factory()() as db:
+                                persist_keyword_weekly_records(
+                                    db,
+                                    site_code,
+                                    keywords,
+                                    persist_weeks,
+                                    outcome.records,
+                                    fetched_at=fetched_at,
+                                )
                     except (httpx.HTTPError, RuntimeError) as exc:
                         message = str(exc) or "西柚关键词数据获取失败"
                         if message not in warnings:
