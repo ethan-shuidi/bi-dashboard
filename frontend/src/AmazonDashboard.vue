@@ -480,7 +480,10 @@ const displayRows = computed(() => {
       previousDetailByKey.set(`${periodIndex}|${previousSite}|${item.series}|${item.product}`, item)
     }
     for (const previousSite of new Set(details.map((item) => item.site || (site.value.length === 1 ? site.value[0] : "")))) {
-      previousSeriesByKey.set(`${periodIndex}|${previousSite}|${series}`, details.filter((item) => (item.site || (site.value.length === 1 ? site.value[0] : "")) === previousSite && item.series === series))
+      const siteDetails = details.filter((item) => (item.site || (site.value.length === 1 ? site.value[0] : "")) === previousSite)
+      for (const seriesName of new Set(siteDetails.map((item) => item.series))) {
+        previousSeriesByKey.set(`${periodIndex}|${previousSite}|${seriesName}`, siteDetails.filter((item) => item.series === seriesName))
+      }
     }
   }
   const grouped = new Map()
