@@ -31,7 +31,7 @@ const modelOptions = [
   { label: "TN20", value: "TN20" },
 ]
 const site = ref("全部站点")
-const siteOptions = ["全部站点", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
+const siteOptions = ["全部站点", "欧洲", "美国", "日本", "德国", "英国", "法国", "加拿大", "澳洲", "西班牙", "意大利", "荷兰", "比利时", "墨西哥", "爱尔兰", "波兰", "瑞典"]
 const months = Array.from({ length: 12 }, (_, index) => index + 1)
 const data = ref(null)
 const loading = ref(true)
@@ -40,6 +40,10 @@ const error = ref("")
 const notice = ref("")
 const targetDraft = ref({})
 const savedTargets = ref({})
+const quickTargetOpen = ref(false)
+const quickTargetDraft = ref({})
+const quickTargetSaving = ref(false)
+const quickTargetError = ref("")
 let dashboardRequestSeq = 0
 let columnResizeCleanup = null
 
@@ -68,7 +72,9 @@ const tableWidth = computed(() => displaySalesColumns.value.reduce((total, colum
 
 const metricRows = computed(() => data.value?.metrics || [])
 const editableRows = computed(() => metricRows.value.filter(({ target_input }) => target_input))
-const dirty = computed(() => editableRows.value.some(({ key }) => String(targetDraft.value[key] ?? "") !== String(savedTargets.value[key] ?? "")))
+const isEuropeSite = computed(() => site.value === "欧洲")
+const dirty = computed(() => !isEuropeSite.value && editableRows.value.some(({ key }) => String(targetDraft.value[key] ?? "") !== String(savedTargets.value[key] ?? "")))
+const countryTargets = computed(() => data.value?.country_targets || [])
 const salesProgress = computed(() => data.value?.progress?.sales || {})
 const timeProgress = computed(() => data.value?.progress?.time || {})
 const salesProgressPercent = computed(() => {
@@ -195,6 +201,10 @@ function changeSite(nextSite) {
 }
 
 async function saveTargets() {
+  if (isEuropeSite.value) {
+    error.value = "欧洲销量目标由各国目标汇总，请使用快速写入目标"
+    return
+  }
   saving.value = true
   error.value = ""
   notice.value = ""
@@ -223,6 +233,51 @@ async function saveTargets() {
     error.value = exception.message
   } finally {
     saving.value = false
+  }
+}
+
+function openQuickTargets() {
+  if (quickTargetSaving.value) return
+  if (dirty.value && !window.confirm(`当前${dimensionName.value}目标尚未保存，打开快速写入后将丢失未保存的修改。是否继续？`)) return
+  quickTargetError.value = ""
+  quickTargetDraft.value = Object.fromEntries(countryTargets.value.map((item) => [
+    item.site,
+    item.targets?.units === null || item.targets?.units === undefined ? "" : String(item.targets.units),
+  ]))
+  quickTargetOpen.value = true
+}
+
+function closeQuickTargets() {
+  if (quickTargetSaving.value) return
+  quickTargetOpen.value = false
+  quickTargetError.value = ""
+}
+
+async function saveQuickTargets() {
+  if (quickTargetSaving.value) return
+  quickTargetSaving.value = true
+  quickTargetError.value = ""
+  try {
+    const items = countryTargets.value.map((item) => {
+      const value = quickTargetDraft.value[item.site] ?? ""
+      if (value !== "" && !Number.isFinite(Number(value))) throw new Error(`${item.site}销量目标必须是数字`)
+      if (value !== "" && Number(value) < 0) throw new Error(`${item.site}销量目标不能小于 0`)
+      return { site: item.site, target_units: value === "" ? null : Number(value) }
+    })
+    const payload = isWeek.value
+      ? { week_start: weekStart.value, model: model.value, items }
+      : { year: year.value, month: month.value, model: model.value, items }
+    await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}/targets/bulk`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+    quickTargetOpen.value = false
+    await loadDashboard()
+    notice.value = `${dimensionName.value}各国销量目标已保存`
+  } catch (exception) {
+    quickTargetError.value = exception.message
+  } finally {
+    quickTargetSaving.value = false
   }
 }
 
@@ -413,8 +468,9 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
         <small>仅作用于销量进度和{{ dimensionName }}目标完成度</small>
       </div>
       <div class="sales-filter-actions">
-        <button class="sales-save-button" type="button" :disabled="saving || loading" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
+        <button class="sales-save-button" type="button" :disabled="saving || loading || isEuropeSite" :title="isEuropeSite ? '欧洲目标由各国销量目标汇总，请使用快速写入目标' : undefined" @click="saveTargets">{{ saving ? "保存中" : dirty ? "保存*" : "保存" }}</button>
         <button class="sales-refresh-button" type="button" :disabled="saving || loading" @click="refreshTargets">刷新</button>
+        <button class="sales-quick-target-button" type="button" :disabled="saving || loading || quickTargetSaving" @click="openQuickTargets">快速写入目标</button>
       </div>
     </section>
 
@@ -470,7 +526,10 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
             <tr v-for="row in metricRows" :key="row.key">
               <th scope="row">{{ row.label }}</th>
               <td>
-                <div v-if="row.target_input && row.format === 'percent'" class="sales-percent-input">
+                <div v-if="isEuropeSite && row.target_input" class="sales-region-target" :title="row.key === 'units' ? '由欧洲各国销量目标汇总' : '欧洲范围不做跨国家汇总'">
+                  {{ row.key === "units" ? "各国销量目标汇总" : "不汇总" }}
+                </div>
+                <div v-else-if="row.target_input && row.format === 'percent'" class="sales-percent-input">
                   <input v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="请输入目标" :aria-label="`${row.label} ${dimensionName}目标（百分比）`">
                   <span>%</span>
                 </div>
@@ -489,5 +548,34 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
         <span>时间基准：{{ data.progress?.time?.site_date || "—" }}（{{ data.progress?.time?.timezone_basis || "站点日期" }}）</span>
       </footer>
     </section>
+
+    <Teleport to="body">
+      <div v-if="quickTargetOpen" class="sales-quick-target-overlay" role="presentation" @click.self="closeQuickTargets">
+        <section class="sales-quick-target-dialog" role="dialog" aria-modal="true" :aria-label="`${dimensionName}销量目标快速写入`">
+          <header>
+            <div>
+              <span>{{ dimensionName }}目标</span>
+              <h3>快速写入各国销量目标</h3>
+            </div>
+            <button type="button" :disabled="quickTargetSaving" @click="closeQuickTargets">×</button>
+          </header>
+          <p>仅写入销量目标；空值会保存为空。其它指标仍保留各国家原值，欧洲只汇总销量目标。</p>
+          <div class="sales-quick-target-grid">
+            <label v-for="item in countryTargets" :key="item.site">
+              <span>{{ item.site }}</span>
+              <input v-model="quickTargetDraft[item.site]" type="number" min="0" step="any" placeholder="请输入目标" :aria-label="`${item.site}${dimensionName}销量目标`">
+            </label>
+          </div>
+          <div v-if="quickTargetError" class="sales-quick-target-error" role="alert">{{ quickTargetError }}</div>
+          <footer>
+            <span>{{ model === "ALL" ? "全部型号" : model }} · {{ isWeek ? weekRangeLabel : `${year}年${month}月` }}</span>
+            <div>
+              <button type="button" :disabled="quickTargetSaving" @click="closeQuickTargets">取消</button>
+              <button type="button" :disabled="quickTargetSaving" @click="saveQuickTargets">{{ quickTargetSaving ? "保存中" : "保存" }}</button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </Teleport>
   </section>
 </template>

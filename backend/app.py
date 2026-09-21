@@ -201,6 +201,10 @@ AMAZON_SALES_MODELS = ("TN10", "TN20")
 AMAZON_SALES_ALL_MODEL = "ALL"
 AMAZON_SALES_MODEL_CHOICES = (AMAZON_SALES_ALL_MODEL, *AMAZON_SALES_MODELS)
 AMAZON_SALES_ALL_SITES = "全部站点"
+AMAZON_SALES_EUROPE = "欧洲"
+AMAZON_SALES_EUROPE_SITES = (
+    "英国", "德国", "法国", "意大利", "西班牙", "荷兰", "比利时", "爱尔兰", "波兰", "瑞典",
+)
 AMAZON_SALES_TN20_SMALL_SERIES = "TN20系列（小链接）汇总"
 AMAZON_SALES_METRICS = (
     {
@@ -768,10 +772,12 @@ def amazon_sales_scope(model: str) -> tuple[set[str], set[str]]:
     return products, series
 
 
-def amazon_sales_selected_sites(site: str) -> list[str]:
+def amazon_sales_selected_sites(site: str, include_regions: bool = False) -> list[str]:
     normalized = str(site or AMAZON_SALES_ALL_SITES).strip() or AMAZON_SALES_ALL_SITES
     if normalized == AMAZON_SALES_ALL_SITES:
         return list(AMAZON_SITE_CODES)
+    if include_regions and normalized == AMAZON_SALES_EUROPE:
+        return list(AMAZON_SALES_EUROPE_SITES)
     if normalized not in AMAZON_SITE_CODES:
         raise ValueError("销售看板站点无效")
     return [normalized]
@@ -1106,6 +1112,60 @@ def amazon_sales_target_values(item: Any | None) -> dict[str, float | None]:
     if values.get("aov") is None and legacy_sales is not None and values.get("units"):
         values["aov"] = float(legacy_sales) / float(values["units"])
     return values
+
+
+def amazon_sales_country_target_payload(items: list[Any]) -> list[dict[str, Any]]:
+    """Return one target slot per country, including countries with no target."""
+    by_site = {str(item.site): item for item in items}
+    return [
+        {
+            "site": site,
+            "targets": {
+                key: float(value) if (value := getattr(by_site.get(site), f"target_{key}", None)) is not None else None
+                for key in AMAZON_SALES_TARGET_FIELDS
+            },
+        }
+        for site in AMAZON_SITE_CODES
+    ]
+
+
+def amazon_sales_europe_target_values(items: list[Any]) -> dict[str, float | None]:
+    """Aggregate only unit targets for the virtual Europe scope.
+
+    Ratios and money-per-click targets are not additive across marketplaces.
+    They intentionally stay unset at the Europe scope; operators continue to
+    maintain them country by country.
+    """
+    by_site = {str(item.site): item for item in items}
+    unit_targets = [
+        float(item.target_units)
+        for site in AMAZON_SALES_EUROPE_SITES
+        if (item := by_site.get(site)) is not None and item.target_units is not None
+    ]
+    values = {key: None for key in AMAZON_SALES_TARGET_FIELDS}
+    if unit_targets:
+        values["units"] = sum(unit_targets)
+    return values
+
+
+def amazon_sales_bulk_unit_targets(raw_items: Any) -> dict[str, float | None]:
+    """Validate a quick-entry country/unit-target payload."""
+    if not isinstance(raw_items, list):
+        raise ValueError("销量目标批量保存格式无效")
+    output: dict[str, float | None] = {}
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValueError("销量目标批量保存行格式无效")
+        site = str(raw.get("site") or "").strip()
+        if site not in AMAZON_SITE_CODES:
+            raise ValueError(f"销量目标批量保存站点无效：{site or '空'}")
+        if site in output:
+            raise ValueError(f"销量目标批量保存站点重复：{site}")
+        output[site] = amazon_sales_target_number(raw.get("target_units"))
+    missing = [site for site in AMAZON_SITE_CODES if site not in output]
+    if missing:
+        raise ValueError(f"销量目标批量保存缺少站点：{'、'.join(missing)}")
+    return output
 
 
 def amazon_sales_week_time_progress(week_start: date, week_end: date, site_today: date) -> float:
@@ -5048,7 +5108,7 @@ async def amazon_sales_dashboard(
     if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="销售看板型号无效")
     try:
-        selected_sites = amazon_sales_selected_sites(site)
+        selected_sites = amazon_sales_selected_sites(site, include_regions=True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -5064,7 +5124,11 @@ async def amazon_sales_dashboard(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
         for site_name in selected_sites
     )
-    timezone_basis = selected_sites[0] if len(selected_sites) == 1 else "全部站点站点日期的最小值"
+    timezone_basis = (
+        selected_sites[0]
+        if len(selected_sites) == 1
+        else ("欧洲站点日期的最小值" if site == AMAZON_SALES_EUROPE else "全部站点站点日期的最小值")
+    )
     selected_month = (year, month)
     current_month = (site_today.year, site_today.month)
     if selected_month < current_month:
@@ -5075,15 +5139,20 @@ async def amazon_sales_dashboard(
         time_progress = site_today.day / month_end.day
 
     with session_factory()() as db:
-        item = db.scalar(
+        country_items = list(db.scalars(
             select(AmazonMonthlyTarget).where(
                 AmazonMonthlyTarget.year == year,
                 AmazonMonthlyTarget.month == month,
                 AmazonMonthlyTarget.model == model,
-                AmazonMonthlyTarget.site == site,
+                AmazonMonthlyTarget.site.in_([AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER]),
             )
-        )
-        targets = amazon_sales_target_values(item)
+        ))
+        country_target_payload = amazon_sales_country_target_payload(country_items)
+        if site == AMAZON_SALES_EUROPE:
+            targets = amazon_sales_europe_target_values(country_items)
+        else:
+            item = next((entry for entry in country_items if entry.site == site), None)
+            targets = amazon_sales_target_values(item)
 
     actual_end = min(month_end, site_today) if month_start <= site_today else None
     rows: list[dict[str, Any]] = []
@@ -5148,7 +5217,7 @@ async def amazon_sales_dashboard(
         "model": model,
         "models": list(AMAZON_SALES_MODEL_CHOICES),
         "site": site,
-        "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
+        "sites": [AMAZON_SALES_ALL_SITES, AMAZON_SALES_EUROPE, *AMAZON_SITE_ORDER],
         "currency": amazon_sales_currency(selected_sites),
         "period": {
             "start": month_start.isoformat(),
@@ -5161,6 +5230,7 @@ async def amazon_sales_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "country_targets": country_target_payload,
         "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
         "comparison": comparison_payload,
         "progress": {
@@ -5201,7 +5271,7 @@ async def amazon_sales_weekly_dashboard(
     if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="销售看板型号无效")
     try:
-        selected_sites = amazon_sales_selected_sites(site)
+        selected_sites = amazon_sales_selected_sites(site, include_regions=True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -5214,18 +5284,27 @@ async def amazon_sales_weekly_dashboard(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
         for site_name in selected_sites
     )
-    timezone_basis = selected_sites[0] if len(selected_sites) == 1 else "全部站点站点日期的最小值"
+    timezone_basis = (
+        selected_sites[0]
+        if len(selected_sites) == 1
+        else ("欧洲站点日期的最小值" if site == AMAZON_SALES_EUROPE else "全部站点站点日期的最小值")
+    )
     time_progress = amazon_sales_week_time_progress(week, week_end, site_today)
 
     with session_factory()() as db:
-        item = db.scalar(
+        country_items = list(db.scalars(
             select(AmazonWeeklyTarget).where(
                 AmazonWeeklyTarget.week_start == week,
                 AmazonWeeklyTarget.model == model,
-                AmazonWeeklyTarget.site == site,
+                AmazonWeeklyTarget.site.in_([AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER]),
             )
-        )
-        targets = amazon_sales_target_values(item)
+        ))
+        country_target_payload = amazon_sales_country_target_payload(country_items)
+        if site == AMAZON_SALES_EUROPE:
+            targets = amazon_sales_europe_target_values(country_items)
+        else:
+            item = next((entry for entry in country_items if entry.site == site), None)
+            targets = amazon_sales_target_values(item)
 
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
@@ -5288,7 +5367,7 @@ async def amazon_sales_weekly_dashboard(
         "model": model,
         "models": list(AMAZON_SALES_MODEL_CHOICES),
         "site": site,
-        "sites": [AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER],
+        "sites": [AMAZON_SALES_ALL_SITES, AMAZON_SALES_EUROPE, *AMAZON_SITE_ORDER],
         "currency": amazon_sales_currency(selected_sites),
         "period": {
             "start": week.isoformat(),
@@ -5301,6 +5380,7 @@ async def amazon_sales_weekly_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
+        "country_targets": country_target_payload,
         "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
         "comparison": comparison_payload,
         "progress": {
@@ -5338,7 +5418,9 @@ def save_amazon_sales_weekly_targets(
     if model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="周度目标保存参数无效")
     try:
-        amazon_sales_selected_sites(site)
+        amazon_sales_selected_sites(site, include_regions=True)
+        if site == AMAZON_SALES_EUROPE:
+            raise ValueError("欧洲销量目标由各国目标汇总，请使用快速写入目标")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raw_targets = payload.get("targets")
@@ -5380,6 +5462,60 @@ def save_amazon_sales_weekly_targets(
     }
 
 
+@app.post("/api/amazon/sales-dashboard/weekly/targets/bulk")
+def save_amazon_sales_weekly_targets_bulk(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Quick-enter weekly unit targets for every country in one transaction."""
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        week = normalize_week_start(date.fromisoformat(str(payload.get("week_start") or "")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="周度销量目标批量保存周格式无效") from exc
+    model = str(payload.get("model") or "").strip().upper()
+    if model not in AMAZON_SALES_MODEL_CHOICES:
+        raise HTTPException(status_code=422, detail="周度销量目标批量保存参数无效")
+    try:
+        normalized = amazon_sales_bulk_unit_targets(payload.get("items"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    with session_factory()() as db:
+        items = {
+            str(item.site): item
+            for item in db.scalars(
+                select(AmazonWeeklyTarget).where(
+                    AmazonWeeklyTarget.week_start == week,
+                    AmazonWeeklyTarget.model == model,
+                    AmazonWeeklyTarget.site.in_(AMAZON_SITE_ORDER),
+                )
+            )
+        }
+        for site_name, target_units in normalized.items():
+            item = items.get(site_name)
+            if item is None:
+                item = AmazonWeeklyTarget(week_start=week, model=model, site=site_name)
+                db.add(item)
+            item.target_units = target_units
+            item.updated_at = utcnow()
+        db.commit()
+        saved_items = list(db.scalars(
+            select(AmazonWeeklyTarget).where(
+                AmazonWeeklyTarget.week_start == week,
+                AmazonWeeklyTarget.model == model,
+                AmazonWeeklyTarget.site.in_(AMAZON_SITE_ORDER),
+            )
+        ))
+
+    return {
+        "ok": True,
+        "week_start": week.isoformat(),
+        "model": model,
+        "country_targets": amazon_sales_country_target_payload(saved_items),
+    }
+
+
 @app.post("/api/amazon/sales-dashboard/targets")
 def save_amazon_sales_targets(
     payload: dict[str, Any] = Body(...),
@@ -5397,7 +5533,9 @@ def save_amazon_sales_targets(
     if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODEL_CHOICES:
         raise HTTPException(status_code=422, detail="月度目标保存参数无效")
     try:
-        amazon_sales_selected_sites(site)
+        amazon_sales_selected_sites(site, include_regions=True)
+        if site == AMAZON_SALES_EUROPE:
+            raise ValueError("欧洲销量目标由各国目标汇总，请使用快速写入目标")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raw_targets = payload.get("targets")
@@ -5435,6 +5573,64 @@ def save_amazon_sales_targets(
         "model": model,
         "site": site,
         "targets": {key: float(value) if value is not None else None for key, value in normalized.items()},
+    }
+
+
+@app.post("/api/amazon/sales-dashboard/targets/bulk")
+def save_amazon_sales_targets_bulk(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Quick-enter monthly unit targets for every country in one transaction."""
+    require_business_access(x_sync_key, allow_public=True)
+    try:
+        year = int(payload.get("year"))
+        month = int(payload.get("month"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="月度销量目标批量保存年月无效") from exc
+    model = str(payload.get("model") or "").strip().upper()
+    if year < 2000 or year > 2100 or month < 1 or month > 12 or model not in AMAZON_SALES_MODEL_CHOICES:
+        raise HTTPException(status_code=422, detail="月度销量目标批量保存参数无效")
+    try:
+        normalized = amazon_sales_bulk_unit_targets(payload.get("items"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    with session_factory()() as db:
+        items = {
+            str(item.site): item
+            for item in db.scalars(
+                select(AmazonMonthlyTarget).where(
+                    AmazonMonthlyTarget.year == year,
+                    AmazonMonthlyTarget.month == month,
+                    AmazonMonthlyTarget.model == model,
+                    AmazonMonthlyTarget.site.in_(AMAZON_SITE_ORDER),
+                )
+            )
+        }
+        for site_name, target_units in normalized.items():
+            item = items.get(site_name)
+            if item is None:
+                item = AmazonMonthlyTarget(year=year, month=month, model=model, site=site_name)
+                db.add(item)
+            item.target_units = target_units
+            item.updated_at = utcnow()
+        db.commit()
+        saved_items = list(db.scalars(
+            select(AmazonMonthlyTarget).where(
+                AmazonMonthlyTarget.year == year,
+                AmazonMonthlyTarget.month == month,
+                AmazonMonthlyTarget.model == model,
+                AmazonMonthlyTarget.site.in_(AMAZON_SITE_ORDER),
+            )
+        ))
+
+    return {
+        "ok": True,
+        "year": year,
+        "month": month,
+        "model": model,
+        "country_targets": amazon_sales_country_target_payload(saved_items),
     }
 
 

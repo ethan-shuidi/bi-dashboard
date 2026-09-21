@@ -7,10 +7,16 @@ from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from fastapi.testclient import TestClient
 import httpx
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+import app as app_module
 from app import (
     AMAZON_SALES_ALL_SITES,
+    AMAZON_SALES_EUROPE,
+    AMAZON_SALES_EUROPE_SITES,
     AMAZON_SALES_ALL_MODEL,
     AMAZON_PRODUCTS,
     AMAZON_STRATEGY_OPTIONS,
@@ -21,6 +27,7 @@ from app import (
     AMAZON_SALES_TARGET_FIELDS,
     ASIN_MAPPING,
     AMAZON_SITE_CODES,
+    AMAZON_SITE_ORDER,
     AmazonMonthlyTarget,
     AmazonWeeklyTarget,
     Base,
@@ -39,7 +46,10 @@ from app import (
     amazon_sales_completion,
     amazon_convert_sales_money_rows,
     amazon_sales_currency,
+    amazon_sales_bulk_unit_targets,
+    amazon_sales_country_target_payload,
     amazon_sales_derived_targets,
+    amazon_sales_europe_target_values,
     amazon_sales_metric_rows,
     amazon_sales_period_change,
     amazon_previous_month_comparison_period,
@@ -630,8 +640,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_sales_dashboard_site_scope_is_validated(self):
         self.assertEqual(amazon_sales_selected_sites("美国"), ["美国"])
         self.assertEqual(amazon_sales_selected_sites(AMAZON_SALES_ALL_SITES), list(AMAZON_SITE_CODES))
+        self.assertEqual(
+            amazon_sales_selected_sites(AMAZON_SALES_EUROPE, include_regions=True),
+            list(AMAZON_SALES_EUROPE_SITES),
+        )
         with self.assertRaisesRegex(ValueError, "站点无效"):
-            amazon_sales_selected_sites("火星")
+            amazon_sales_selected_sites("火星", include_regions=True)
+        with self.assertRaisesRegex(ValueError, "站点无效"):
+            amazon_sales_selected_sites(AMAZON_SALES_EUROPE)
 
     def test_dashboard_site_parser_rejects_scope_widening_values(self):
         self.assertEqual(amazon_dashboard_selected_sites(["美国"]), ["美国"])
@@ -653,6 +669,117 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("美国")), "USD")
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("德国")), "EUR")
         self.assertEqual(amazon_sales_currency(amazon_sales_selected_sites("日本")), "JPY")
+
+    def test_europe_sales_scope_only_aggregates_unit_targets(self):
+        items = [
+            SimpleNamespace(site="英国", target_units=Decimal("10"), target_cpc=Decimal("0.8")),
+            SimpleNamespace(site="德国", target_units=Decimal("15"), target_cpc=Decimal("0.7")),
+            SimpleNamespace(site="法国", target_units=None, target_cpc=Decimal("0.6")),
+            SimpleNamespace(site="美国", target_units=Decimal("999"), target_cpc=Decimal("0.5")),
+        ]
+        targets = amazon_sales_europe_target_values(items)
+        self.assertEqual(targets["units"], 25)
+        self.assertIsNone(targets["cpc"])
+        self.assertIsNone(targets["aov"])
+        self.assertIsNone(targets["ad_sales_share"])
+        self.assertIsNone(targets["ad_cvr"])
+
+        payload = amazon_sales_country_target_payload(items)
+        self.assertEqual([item["site"] for item in payload], list(AMAZON_SITE_CODES))
+        by_site = {item["site"]: item["targets"] for item in payload}
+        self.assertEqual(by_site["英国"]["units"], 10)
+        self.assertIsNone(by_site["法国"]["units"])
+
+    def test_quick_target_bulk_payload_requires_every_country_and_allows_empty(self):
+        items = [{"site": site, "target_units": 10 if site == "美国" else None} for site in AMAZON_SITE_ORDER]
+        normalized = amazon_sales_bulk_unit_targets(items)
+        self.assertEqual(normalized["美国"], 10)
+        self.assertIsNone(normalized["英国"])
+        with self.assertRaisesRegex(ValueError, "缺少站点"):
+            amazon_sales_bulk_unit_targets(items[:-1])
+        with self.assertRaisesRegex(ValueError, "站点重复"):
+            amazon_sales_bulk_unit_targets([*items, {"site": "美国", "target_units": 2}])
+
+    def test_monthly_quick_target_bulk_endpoint_preserves_other_targets(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[AmazonMonthlyTarget.__table__])
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+        with Session(database) as db:
+            db.add(AmazonMonthlyTarget(
+                year=2026, month=9, model="TN10", site="英国",
+                target_aov=Decimal("99.5"), target_cpc=Decimal("0.8"),
+                updated_at=datetime(2026, 9, 17, tzinfo=timezone.utc),
+            ))
+            db.commit()
+
+        items = [
+            {"site": site, "target_units": 10 if site in AMAZON_SALES_EUROPE_SITES else None}
+            for site in AMAZON_SITE_CODES
+        ]
+        with patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             TestClient(app_module.app) as client:
+            response = client.post("/api/amazon/sales-dashboard/targets/bulk", json={
+                "year": 2026, "month": 9, "model": "TN10", "items": items,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        by_site = {item["site"]: item["targets"] for item in body["country_targets"]}
+        self.assertEqual(by_site["英国"]["units"], 10)
+        self.assertEqual(by_site["英国"]["aov"], 99.5)
+        self.assertEqual(by_site["英国"]["cpc"], 0.8)
+        self.assertIsNone(by_site["美国"]["units"])
+
+        with Session(database) as db:
+            saved = list(db.scalars(app_module.select(AmazonMonthlyTarget).where(
+                AmazonMonthlyTarget.year == 2026,
+                AmazonMonthlyTarget.month == 9,
+                AmazonMonthlyTarget.model == "TN10",
+            )))
+        self.assertEqual(
+            amazon_sales_europe_target_values(saved)["units"],
+            10 * len(AMAZON_SALES_EUROPE_SITES),
+        )
+        self.assertEqual({str(item.site) for item in saved if item.target_aov is not None}, {"英国"})
+
+    def test_weekly_quick_target_bulk_endpoint_writes_every_country(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[AmazonWeeklyTarget.__table__])
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+        items = [
+            {"site": site, "target_units": 3 if site in AMAZON_SALES_EUROPE_SITES else None}
+            for site in AMAZON_SITE_CODES
+        ]
+        with patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             TestClient(app_module.app) as client:
+            response = client.post("/api/amazon/sales-dashboard/weekly/targets/bulk", json={
+                "week_start": "2026-09-14", "model": "TN20", "items": items,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        with Session(database) as db:
+            values = {
+                str(item.site): item.target_units
+                for item in db.scalars(app_module.select(AmazonWeeklyTarget).where(
+                    AmazonWeeklyTarget.week_start == date(2026, 9, 14),
+                    AmazonWeeklyTarget.model == "TN20",
+                ))
+            }
+        self.assertEqual(sum(value for value in values.values() if value is not None), 30)
+        self.assertEqual(len(values), len(AMAZON_SITE_CODES))
+        self.assertIsNone(values["美国"])
 
     def test_sales_actuals_use_campaign_report_money(self):
         series = AMAZON_SERIES[0]
