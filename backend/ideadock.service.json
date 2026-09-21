@@ -74,7 +74,19 @@
       ]
     },
     {
+      "path": "/api/amazon/sales-dashboard/weekly/targets/bulk",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
       "path": "/api/amazon/sales-dashboard/targets",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/amazon/sales-dashboard/targets/bulk",
       "methods": [
         "POST"
       ]
