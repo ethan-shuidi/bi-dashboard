@@ -684,6 +684,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIsNone(targets["ad_sales_share"])
         self.assertIsNone(targets["ad_cvr"])
 
+    def test_europe_sales_scope_treats_missing_country_targets_as_zero(self):
+        items = [
+            SimpleNamespace(site="英国", target_units=Decimal("10")),
+            SimpleNamespace(site="德国", target_units=None),
+        ]
+        self.assertEqual(amazon_sales_europe_target_values(items)["units"], 10)
+        self.assertEqual(amazon_sales_europe_target_values([])["units"], 0)
+
         payload = amazon_sales_country_target_payload(items)
         self.assertEqual([item["site"] for item in payload], list(AMAZON_SITE_CODES))
         by_site = {item["site"]: item["targets"] for item in payload}

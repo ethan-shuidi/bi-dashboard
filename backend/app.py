@@ -1137,14 +1137,16 @@ def amazon_sales_europe_target_values(items: list[Any]) -> dict[str, float | Non
     maintain them country by country.
     """
     by_site = {str(item.site): item for item in items}
-    unit_targets = [
-        float(item.target_units)
-        for site in AMAZON_SALES_EUROPE_SITES
-        if (item := by_site.get(site)) is not None and item.target_units is not None
-    ]
     values = {key: None for key in AMAZON_SALES_TARGET_FIELDS}
-    if unit_targets:
-        values["units"] = sum(unit_targets)
+    # A missing country target is deliberately zero for the Europe rollup.  The
+    # explicit zero keeps the API, progress bar, and target table on one rule
+    # even when only part of the region has entered a target.
+    values["units"] = sum(
+        float(item.target_units)
+        if (item := by_site.get(site)) is not None and item.target_units is not None
+        else 0.0
+        for site in AMAZON_SALES_EUROPE_SITES
+    )
     return values
 
 

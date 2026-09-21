@@ -315,8 +315,7 @@
 .sales-target-grid>.sales-target-module{min-width:0;margin-top:0}
 .sales-target-module{position:relative;margin-top:20px;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:var(--shadow-sm)}
 .sales-filter-bar{position:relative;z-index:20;margin:0;padding:16px 18px;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;border:0;border-bottom:1px solid #eef3f9;border-radius:18px 18px 0 0;background:#fbfdff;box-shadow:none}
-.sales-date-field{position:relative;display:grid;gap:6px}
-.sales-week-field{position:relative;display:grid;gap:6px;min-width:220px}
+.sales-date-field,.sales-week-field{position:relative;display:grid;width:168px;min-width:168px;gap:6px}
 .sales-week-field>span{display:flex;align-items:center;gap:10px;min-height:18px;color:#5f7188;font-size:12px;font-weight:700}
 .sales-week-field b{color:#2563eb;font-size:12px;font-weight:800;letter-spacing:.2px}
 .sales-week-picker-control{overflow:visible}

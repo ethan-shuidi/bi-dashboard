@@ -526,8 +526,13 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
             <tr v-for="row in metricRows" :key="row.key">
               <th scope="row">{{ row.label }}</th>
               <td>
-                <div v-if="isEuropeSite && row.target_input" class="sales-region-target" :title="row.key === 'units' ? '由欧洲各国销量目标汇总' : '欧洲范围不做跨国家汇总'">
-                  {{ row.key === "units" ? "各国销量目标汇总" : "不汇总" }}
+                <div
+                  v-if="isEuropeSite"
+                  class="sales-region-target"
+                  :class="{ numeric: row.key === 'units' }"
+                  :title="row.key === 'units' ? '欧洲各国销量目标汇总，未填写按 0 计算' : '欧洲范围不做跨国家汇总'"
+                >
+                  {{ row.key === "units" ? formatNumber(savedTargets.units) : "-" }}
                 </div>
                 <div v-else-if="row.target_input && row.format === 'percent'" class="sales-percent-input">
                   <input v-model="targetDraft[row.key]" type="number" min="0" step="any" placeholder="请输入目标" :aria-label="`${row.label} ${dimensionName}目标（百分比）`">
