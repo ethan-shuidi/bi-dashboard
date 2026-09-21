@@ -1,6 +1,7 @@
 <script setup>
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import { loadDashboardRuntimeOnce } from "./dashboardRuntime"
 
 const AmazonDashboard = defineAsyncComponent(() => import("./AmazonDashboard.vue"))
 const AmazonSalesDashboard = defineAsyncComponent(() => import("./AmazonSalesDashboard.vue"))
@@ -32,6 +33,7 @@ const apiBase = ref("")
 const loading = ref(true)
 const syncing = ref(false)
 const error = ref("")
+const runtimeError = ref("")
 const notice = ref("")
 const dateError = ref("")
 const status = ref(null)
@@ -218,16 +220,12 @@ async function renderCharts() {
 }
 
 async function loadRuntime() {
+  runtimeError.value = ""
   try {
-    const response = await fetch("./ideadock.runtime.json", { cache: "no-store" })
-    if (!response.ok) throw new Error("runtime config unavailable")
-    const config = await response.json()
-    apiBase.value = String(config.backend_base_url || "").replace(/\/$/, "")
-    if (apiBase.value) {
-      await fetchWithDashboardAuth(`${apiBase.value}/health`, { cache: "no-store" }).catch(() => null)
-    }
+    apiBase.value = (await loadDashboardRuntimeOnce()).backendBaseUrl
   } catch {
-    apiBase.value = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000"
+    apiBase.value = ""
+    runtimeError.value = "看板运行配置缺失或无效，请重新发布前端并确认后端部署状态。"
   }
 }
 
@@ -338,6 +336,11 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
+    <section v-if="runtimeError" class="runtime-error" role="alert">
+      <strong>看板运行配置异常</strong>
+      <span>{{ runtimeError }}</span>
+    </section>
+
     <div class="workspace">
       <aside :class="['dashboard-sidebar', { collapsed: sidebarCollapsed }]" aria-label="看板导航">
         <div class="dashboard-sidebar-head"><span class="dashboard-sidebar-label">看板导航</span><button class="sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开看板导航' : '收起看板导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="sidebarCollapsed = !sidebarCollapsed"><span aria-hidden="true">{{ sidebarCollapsed ? '›' : '‹' }}</span></button></div>
@@ -370,9 +373,9 @@ onBeforeUnmount(() => {
         </button>
       </aside>
 
-      <AmazonDashboard v-if="activeDashboard === 'amazon'" class="amazon-dashboard-frame" />
-      <AmazonSalesDashboard v-else-if="activeDashboard === 'amazon-sales'" class="amazon-dashboard-frame" :api-base="apiBase" />
-      <KeywordDashboard v-else-if="activeDashboard === 'keyword'" class="amazon-dashboard-frame" :api-base="apiBase" />
+      <AmazonDashboard v-if="activeDashboard === 'amazon' && apiBase" class="amazon-dashboard-frame" />
+      <AmazonSalesDashboard v-else-if="activeDashboard === 'amazon-sales' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
+      <KeywordDashboard v-else-if="activeDashboard === 'keyword' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
 
       <div v-else class="content-shell">
       <section class="page-header">
@@ -465,3 +468,21 @@ onBeforeUnmount(() => {
     </div>
   </main>
 </template>
+
+<style scoped>
+.runtime-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px clamp(16px, 4vw, 40px) 0;
+  padding: 14px 18px;
+  border: 1px solid #fecdd3;
+  border-radius: 14px;
+  background: #fff1f2;
+  color: #991b1b;
+}
+
+.runtime-error span {
+  opacity: .85;
+}
+</style>

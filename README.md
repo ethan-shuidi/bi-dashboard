@@ -87,9 +87,12 @@ python3 -m uvicorn app:app --app-dir backend --reload --port 8000
 python3 -m compileall backend
 cd frontend && npm run build
 cd ..
+.venv/bin/python scripts/verify_dashboard_release.py
 shuidi ideadock backend lint backend
 shuidi ideadock frontend lint frontend/dist
 ```
+
+`scripts/verify_dashboard_release.py` 是发布防线：它会检查浏览器端是否只使用短期写权限、生产运行配置是否绑定健康的 HTTPS 后端、FastAPI 实际路由与 IdeaDock 服务清单是否一致，以及构建产物是否携带必要的安全逻辑。修改任何看板接口、保存动作或发布配置后都必须执行。
 
 ## IdeaDock 发布
 

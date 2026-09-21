@@ -1,6 +1,7 @@
 <script setup>
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { fetchWithDashboardAuth } from "./dashboardAuth"
+import { loadDashboardRuntimeOnce } from "./dashboardRuntime"
 import DashboardState from "./DashboardState.vue"
 const AmazonAdsCharts = defineAsyncComponent(() => import("./AmazonAdsCharts.vue"))
 const AmazonPlanBoard = defineAsyncComponent(() => import("./AmazonPlanBoard.vue"))
@@ -805,7 +806,12 @@ async function refreshData() {
 
 async function loadRuntime() {
   await fetch("./ideadock.verify.json", { cache: "no-store" }).catch(() => null)
-  try { const response = await fetch("./ideadock.runtime.json", { cache: "no-store" }); apiBase.value = String((await response.json()).backend_base_url || "").replace(/\/$/, "") } catch { apiBase.value = "http://127.0.0.1:8000" }
+  try {
+    apiBase.value = (await loadDashboardRuntimeOnce()).backendBaseUrl
+  } catch (error) {
+    apiBase.value = ""
+    error.value = "看板运行配置缺失或无效，请重新发布前端并确认后端部署状态。"
+  }
 }
 
 async function loadDateContext() {
@@ -929,6 +935,10 @@ onMounted(async () => {
   window.addEventListener("resize", updateBreakdownPosition)
   loadColumnPreferences()
   await loadRuntime()
+  if (!apiBase.value) {
+    loading.value = false
+    return
+  }
   await loadSites()
   await loadDateContext()
   const [start, end] = quickDateRange("previous-week")
