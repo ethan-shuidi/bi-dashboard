@@ -333,6 +333,9 @@
 .sales-filter-scope{display:grid;gap:3px;margin-left:auto}
 .sales-filter-scope span{color:#5f7188;font-size:12px;font-weight:700}
 .sales-filter-scope small{color:#8195aa;font-size:11px;font-weight:600}
+.sales-comparison-toggle{display:flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 13px;border:1px solid #d5e2f1;border-radius:9px;background:#f8fbff;color:#254a78;font-size:12px;font-weight:800;white-space:nowrap;cursor:pointer;user-select:none}
+.sales-comparison-toggle:hover{border-color:#8db4e0;background:#f2f7ff}
+.sales-comparison-toggle input{width:15px;height:15px;margin:0;accent-color:#2563eb;cursor:pointer}
 .sales-filter-actions{display:flex;flex:0 0 auto;gap:8px}
 .sales-percent-input{position:relative;display:inline-block}
 .sales-percent-input input{padding-right:30px}
@@ -381,5 +384,5 @@
 .sales-completion.gray{color:#68788c}
 .sales-table-panel>footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;padding:12px 20px;border-top:1px solid var(--line);background:#fbfdff;color:#71839a;font-size:12px}
 @media(max-width:1280px){.sales-target-grid{grid-template-columns:1fr}}
-@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-date-field,.sales-week-field,.sales-model-field{width:calc(50% - 8px)}.sales-date-trigger{width:100%}.sales-filter-scope{width:calc(100% - 180px)}.sales-filter-actions{width:172px}.sales-save-button{flex:1;margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-table-wrap{overflow-x:auto}}
-@media(max-width:520px){.sales-date-field,.sales-week-field,.sales-model-field,.sales-filter-scope{width:100%}.sales-filter-actions{width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:900px){.sales-filter-bar{align-items:stretch}.sales-date-field,.sales-week-field,.sales-model-field{width:calc(50% - 8px)}.sales-date-trigger{width:100%}.sales-filter-scope{width:calc(100% - 350px);margin-left:0}.sales-comparison-toggle{width:calc(50% - 8px)}.sales-filter-actions{width:172px}.sales-save-button{flex:1;margin-left:0}.sales-progress-copy{align-items:start;flex-direction:column}.sales-progress-copy small{text-align:left}.sales-progress-meta{flex-direction:column}.sales-table-panel>header{align-items:start;flex-direction:column}.sales-table-panel>header small{text-align:left}.sales-table-wrap{overflow-x:auto}}
+@media(max-width:520px){.sales-date-field,.sales-week-field,.sales-model-field,.sales-filter-scope,.sales-comparison-toggle{width:100%}.sales-filter-actions{width:100%}.sales-month-grid{grid-template-columns:repeat(4,1fr)}}

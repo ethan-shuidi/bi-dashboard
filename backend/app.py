@@ -1257,23 +1257,84 @@ def amazon_sales_completion(
     return {"value": value, "status": status}
 
 
+def amazon_sales_period_change(
+    metric_key: str,
+    current: float | None,
+    previous: float | None,
+) -> dict[str, Any]:
+    """Calculate an absolute period-over-period difference.
+
+    Ratio metrics keep their native unit and are formatted as percentage
+    points in the frontend. Red/green follows each metric's business direction:
+    for example, CPC falling is red, while ad CVR rising is red.
+    """
+    definition = next(item for item in AMAZON_SALES_METRICS if item["key"] == metric_key)
+    if current is None or previous is None:
+        return {"value": None, "status": ""}
+    value = float(current) - float(previous)
+    epsilon = 1e-9
+    if abs(value) <= epsilon:
+        status = "gray"
+    elif definition.get("difference_rule", "higher_is_red") == "lower_is_red":
+        status = "red" if value < 0 else "green"
+    else:
+        status = "red" if value > 0 else "green"
+    return {"value": value, "status": status}
+
+
 def amazon_sales_metric_rows(
     targets: dict[str, float | None],
     actuals: dict[str, float | None],
+    previous_actuals: dict[str, float | None] | None = None,
 ) -> list[dict[str, Any]]:
     output = []
     derived_targets = amazon_sales_derived_targets(targets)
+    previous_actuals = previous_actuals or {}
     for definition in AMAZON_SALES_METRICS:
         key = definition["key"]
         target = targets.get(key) if definition.get("target_input") else derived_targets.get(key)
         actual = actuals.get(key)
+        previous_actual = previous_actuals.get(key)
         output.append({
             **definition,
             "target": float(target) if target is not None else None,
             "actual": float(actual) if actual is not None else None,
+            "period_comparison": amazon_sales_period_change(key, actual, previous_actual),
             "completion": amazon_sales_completion(key, target, actual),
         })
     return output
+
+
+def amazon_previous_month_comparison_period(
+    month_start: date,
+    month_end: date,
+    actual_end: date | None,
+) -> tuple[date, date, date | None]:
+    """Return the prior-month period used by month-over-month comparison.
+
+    A complete selected month compares with the complete previous month. An
+    in-progress month compares with the same month-to-date segment. Short prior
+    months are capped at their final day so the comparison never leaks into
+    another month.
+    """
+    previous_year = month_start.year - (1 if month_start.month == 1 else 0)
+    previous_month = 12 if month_start.month == 1 else month_start.month - 1
+    previous_start = date(previous_year, previous_month, 1)
+    previous_end = date(
+        previous_year,
+        previous_month,
+        calendar.monthrange(previous_year, previous_month)[1],
+    )
+    if actual_end is None:
+        return previous_start, previous_end, None
+    if actual_end >= month_end:
+        return previous_start, previous_end, previous_end
+    elapsed_days = (actual_end - month_start).days + 1
+    previous_actual_end = min(
+        previous_end,
+        previous_start + timedelta(days=elapsed_days - 1),
+    )
+    return previous_start, previous_end, previous_actual_end
 
 
 def amazon_sales_target_number(raw: Any) -> float | None:
@@ -4972,6 +5033,7 @@ async def amazon_sales_dashboard(
     model: str = Query(default="TN10"),
     site: str = Query(default=AMAZON_SALES_ALL_SITES),
     refresh: bool = Query(default=False),
+    include_comparison: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return monthly target completion for one merged product model."""
@@ -5019,7 +5081,7 @@ async def amazon_sales_dashboard(
         )
         targets = amazon_sales_target_values(item)
 
-    actual_end = min(month_end, site_today)
+    actual_end = min(month_end, site_today) if month_start <= site_today else None
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     if month_start <= site_today:
@@ -5039,6 +5101,40 @@ async def amazon_sales_dashboard(
             raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
 
     actuals = amazon_sales_actuals(rows)
+    previous_actuals: dict[str, float | None] = {}
+    comparison_payload: dict[str, Any] | None = None
+    if include_comparison and actual_end is not None:
+        previous_start, previous_period_end, previous_actual_end = amazon_previous_month_comparison_period(
+            month_start,
+            month_end,
+            actual_end,
+        )
+        if previous_actual_end is not None:
+            try:
+                previous_rows, previous_quality = await amazon_sales_actual_rows(
+                    previous_start,
+                    previous_actual_end,
+                    "月",
+                    selected_sites,
+                    selected_series,
+                    products,
+                    refresh,
+                )
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=f"领星环比产品表现数据获取失败：{exc}") from exc
+            previous_actuals = amazon_sales_actuals(previous_rows)
+            comparison_payload = {
+                "basis": "previous_month_same_elapsed_scope",
+                "period": {
+                    "start": previous_start.isoformat(),
+                    "end": previous_period_end.isoformat(),
+                    "actual_end": previous_actual_end.isoformat(),
+                },
+                "actuals": {key: float(value) if value is not None else None for key, value in previous_actuals.items()},
+                "data_quality": previous_quality,
+            }
     target_units = targets.get("units")
     actual_units = actuals.get("units")
     sales_rate = actual_units / target_units if target_units and actual_units is not None else None
@@ -5061,7 +5157,8 @@ async def amazon_sales_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
-        "metrics": amazon_sales_metric_rows(targets, actuals),
+        "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
+        "comparison": comparison_payload,
         "progress": {
             "sales": {
                 "target": float(target_units) if target_units is not None else None,
@@ -5087,6 +5184,7 @@ async def amazon_sales_weekly_dashboard(
     model: str = Query(default="TN10"),
     site: str = Query(default=AMAZON_SALES_ALL_SITES),
     refresh: bool = Query(default=False),
+    include_comparison: bool = Query(default=False),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return weekly target completion for one merged product model."""
@@ -5143,10 +5241,41 @@ async def amazon_sales_weekly_dashboard(
         raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
 
     actuals = amazon_sales_actuals(rows)
+    previous_actuals: dict[str, float | None] = {}
+    comparison_payload: dict[str, Any] | None = None
+    actual_end = min(week_end, site_today) if week <= site_today else None
+    if include_comparison and actual_end is not None:
+        previous_start = week - timedelta(days=7)
+        previous_period_end = week_end - timedelta(days=7)
+        previous_actual_end = actual_end - timedelta(days=7)
+        try:
+            previous_rows, previous_quality = await amazon_sales_actual_rows(
+                previous_start,
+                previous_actual_end,
+                "周",
+                selected_sites,
+                selected_series,
+                products,
+                refresh,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"领星环比产品表现数据获取失败：{exc}") from exc
+        previous_actuals = amazon_sales_actuals(previous_rows)
+        comparison_payload = {
+            "basis": "previous_week_same_elapsed_scope",
+            "period": {
+                "start": previous_start.isoformat(),
+                "end": previous_period_end.isoformat(),
+                "actual_end": previous_actual_end.isoformat(),
+            },
+            "actuals": {key: float(value) if value is not None else None for key, value in previous_actuals.items()},
+            "data_quality": previous_quality,
+        }
     target_units = targets.get("units")
     actual_units = actuals.get("units")
     sales_rate = actual_units / target_units if target_units and actual_units is not None else None
-    actual_end = min(week_end, site_today) if week <= site_today else None
     current_day = (site_today - week).days + 1 if week <= site_today <= week_end else None
     return {
         "dimension": "week",
@@ -5168,7 +5297,8 @@ async def amazon_sales_weekly_dashboard(
             "sites": selected_sites,
         },
         "targets": {key: float(value) if value is not None else None for key, value in targets.items()},
-        "metrics": amazon_sales_metric_rows(targets, actuals),
+        "metrics": amazon_sales_metric_rows(targets, actuals, previous_actuals),
+        "comparison": comparison_payload,
         "progress": {
             "sales": {
                 "target": float(target_units) if target_units is not None else None,

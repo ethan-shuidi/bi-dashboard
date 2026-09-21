@@ -41,6 +41,8 @@ from app import (
     amazon_sales_currency,
     amazon_sales_derived_targets,
     amazon_sales_metric_rows,
+    amazon_sales_period_change,
+    amazon_previous_month_comparison_period,
     amazon_sales_selected_sites,
     amazon_sales_scope,
     amazon_sales_week_time_progress,
@@ -1011,6 +1013,50 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual((units["target"], units["actual"], units["completion"]["value"]), (100, 90, 0.9))
         self.assertEqual((cpc["target"], cpc["actual"]), (1, 0.8))
         self.assertAlmostEqual(cpc["completion"]["value"], -0.2)
+
+    def test_sales_period_change_uses_absolute_difference_and_metric_direction(self):
+        ad_cvr = amazon_sales_period_change("ad_cvr", 0.10, 0.09)
+        cpc = amazon_sales_period_change("cpc", 0.90, 1.00)
+        unchanged = amazon_sales_period_change("units", 100, 100)
+        missing = amazon_sales_period_change("units", None, 100)
+        self.assertAlmostEqual(ad_cvr["value"], 0.01)
+        self.assertEqual(ad_cvr["status"], "red")
+        self.assertAlmostEqual(cpc["value"], -0.10)
+        self.assertEqual(cpc["status"], "red")
+        self.assertEqual(unchanged["status"], "gray")
+        self.assertEqual((missing["value"], missing["status"]), (None, ""))
+
+    def test_sales_metric_rows_include_previous_period_difference(self):
+        rows = amazon_sales_metric_rows(
+            {"units": 100},
+            {"units": 110, "cpc": 0.9},
+            {"units": 105, "cpc": 1.0},
+        )
+        by_key = {row["key"]: row for row in rows}
+        self.assertAlmostEqual(by_key["units"]["period_comparison"]["value"], 5)
+        self.assertEqual(by_key["units"]["period_comparison"]["status"], "red")
+        self.assertAlmostEqual(by_key["cpc"]["period_comparison"]["value"], -0.1)
+        self.assertEqual(by_key["cpc"]["period_comparison"]["status"], "red")
+
+    def test_previous_month_comparison_uses_same_elapsed_scope(self):
+        self.assertEqual(
+            amazon_previous_month_comparison_period(
+                date(2026, 3, 1), date(2026, 3, 31), date(2026, 3, 20)
+            ),
+            (date(2026, 2, 1), date(2026, 2, 28), date(2026, 2, 20)),
+        )
+        self.assertEqual(
+            amazon_previous_month_comparison_period(
+                date(2026, 3, 1), date(2026, 3, 31), date(2026, 3, 31)
+            ),
+            (date(2026, 2, 1), date(2026, 2, 28), date(2026, 2, 28)),
+        )
+        self.assertEqual(
+            amazon_previous_month_comparison_period(
+                date(2026, 1, 1), date(2026, 1, 31), date(2026, 1, 31)
+            ),
+            (date(2025, 12, 1), date(2025, 12, 31), date(2025, 12, 31)),
+        )
 
     def test_us_asin_product_mapping_matches_latest_assignment(self):
         expected = {
