@@ -510,6 +510,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             self.assertTrue(dashboard_write_token_valid(issued["token"], "编辑者-abc", origin, now=1_001))
             self.assertFalse(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", "https://example.test", now=1_001))
             self.assertFalse(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=2_901))
+            issued_parts = issued["token"].rsplit(".", 1)
+            tampered_signature = ("A" if not issued_parts[1].startswith("A") else "B") + issued_parts[1][1:]
+            self.assertFalse(dashboard_write_token_valid(
+                f"{issued_parts[0]}.{tampered_signature}",
+                "%E7%BC%96%E8%BE%91%E8%80%85-abc",
+                origin,
+                now=1_001,
+            ))
 
             with TestClient(app_module.app) as client:
                 denied = client.get("/api/dashboard/write-token", headers={
@@ -523,6 +531,10 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                     "X-Dashboard-Editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc",
                 })
                 self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store, no-cache, must-revalidate, max-age=0")
+                self.assertEqual(response.headers["Pragma"], "no-cache")
+                self.assertEqual(response.headers["Expires"], "0")
+                self.assertIn("Origin", response.headers.get("Vary", ""))
                 token = response.json()["token"]
 
                 accepted = client.post("/api/keyword-dashboard/terms", json={}, headers={

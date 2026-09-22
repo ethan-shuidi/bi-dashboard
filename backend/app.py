@@ -2660,9 +2660,18 @@ def health():
 def dashboard_write_token(request: Request):
     """Issue a short-lived browser write credential without exposing SYNC_API_KEY."""
 
-    return issue_dashboard_write_token(
+    issued = issue_dashboard_write_token(
         request.headers.get("X-Dashboard-Editor"),
         request.headers.get("Origin"),
+    )
+    return JSONResponse(
+        content=issued,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Vary": "Origin",
+        },
     )
 
 

@@ -9,6 +9,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_SRC = PROJECT_ROOT / "frontend" / "src"
+FRONTEND_ROOT = PROJECT_ROOT / "frontend"
 
 
 def _source(relative_path: str) -> str:
@@ -27,6 +28,13 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
         "cachedDashboardEditorId",
         "0x7e",
         "invalidateDashboardWriteToken",
+        "headerEntries",
+        "safeHttpHeaderName",
+        "dashboardRequestUrl",
+        'cache: "no-store"',
+        'credentials: "omit"',
+        'mode: "cors"',
+        'redirect: "error"',
     )
     for fragment in required_fragments:
         if fragment not in source:
@@ -54,6 +62,7 @@ def _check_frontend_runtime(errors: list[str]) -> None:
 
 def _check_direct_frontend_fetches(errors: list[str]) -> None:
     fetch_pattern = re.compile(r"(?<![A-Za-z])fetch\s*\(")
+    legacy_network_pattern = re.compile(r"\b(?:XMLHttpRequest|sendBeacon\s*\(|axios\s*\()")
     allowed_markers = ("ideadock.runtime.json", "ideadock.verify.json")
     for path in sorted(FRONTEND_SRC.rglob("*")):
         if not path.is_file() or path.suffix not in {".js", ".vue"}:
@@ -67,13 +76,24 @@ def _check_direct_frontend_fetches(errors: list[str]) -> None:
             if any(marker in line for marker in allowed_markers):
                 continue
             errors.append(f"{path.relative_to(PROJECT_ROOT)}:{line_number} 存在未统一的 fetch 调用")
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            if legacy_network_pattern.search(line):
+                errors.append(f"{path.relative_to(PROJECT_ROOT)}:{line_number} 使用了未统一的网络请求通道")
 
 
 def _check_frontend_secrets(errors: list[str]) -> None:
     secret_pattern = re.compile(r"VITE_[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)")
     credential_pattern = re.compile(r"\b(?:sk-[A-Za-z0-9]|hook/[0-9a-f]{8}-)")
-    for path in sorted(FRONTEND_SRC.rglob("*")):
-        if not path.is_file() or path.suffix not in {".js", ".vue"}:
+    public_root = FRONTEND_ROOT / "public"
+    candidate_paths = [
+        *FRONTEND_SRC.rglob("*"),
+        *(public_root.rglob("*") if public_root.exists() else []),
+        *FRONTEND_ROOT.glob("*.json"),
+        *FRONTEND_ROOT.glob("*.mjs"),
+        *FRONTEND_ROOT.glob("*.html"),
+    ]
+    for path in sorted(set(candidate_paths)):
+        if not path.is_file() or path.suffix not in {".js", ".vue", ".json", ".mjs", ".html"}:
             continue
         source = path.read_text(encoding="utf-8")
         if secret_pattern.search(source):
@@ -139,7 +159,13 @@ def _check_dist_if_present(errors: list[str]) -> None:
     dist = PROJECT_ROOT / "frontend" / "dist"
     if not dist.exists():
         return
-    javascript = "\n".join(path.read_text(encoding="utf-8") for path in sorted(dist.rglob("*.js")))
+
+    javascript_files = sorted(dist.rglob("*.js"))
+    all_javascript = "\n".join(path.read_text(encoding="utf-8") for path in javascript_files)
+    auth_chunks = [
+        path for path in javascript_files
+        if "/api/dashboard/write-token" in path.read_text(encoding="utf-8")
+    ]
     runtime_path = dist / "ideadock.runtime.json"
     if not runtime_path.is_file():
         errors.append("构建产物缺少后端运行配置")
@@ -147,12 +173,25 @@ def _check_dist_if_present(errors: list[str]) -> None:
         runtime_config = json.loads(runtime_path.read_text(encoding="utf-8"))
         if runtime_config.get("deployment_status") != "healthy":
             errors.append("构建产物绑定了非健康后端部署")
-    if "/api/dashboard/write-token" not in javascript:
+
+    if not auth_chunks:
         errors.append("构建产物缺少短期写权限获取逻辑")
-    if "X-Dashboard-Write-Token" not in javascript:
-        errors.append("构建产物缺少短期写权限请求头")
-    if '"X-Sync-Key"' in javascript:
+    for path in auth_chunks:
+        javascript = path.read_text(encoding="utf-8")
+        if "X-Dashboard-Write-Token" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少短期写权限请求头")
+        if "X-Dashboard-Editor" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少看板编辑者请求头")
+        for option in ("cache", "credentials", "mode", "redirect"):
+            if not re.search(rf"{option}\s*:\s*[\"'](no-store|omit|cors|error)[\"']", javascript):
+                errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少 {option} 请求安全策略")
+
+    # 第三方组件（例如上传组件）可能自带 XMLHttpRequest。绕过通道以第一方源码
+    # 检查为准；构建产物继续检查长期密钥与前端构建凭据，避免 vendor 噪音掩盖真实风险。
+    if '"X-Sync-Key"' in all_javascript:
         errors.append("构建产物不允许携带长期同步密钥请求头")
+    if re.search(r"VITE_[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)", all_javascript):
+        errors.append("构建产物疑似包含前端构建凭据")
 
 
 def run_all_checks() -> list[str]:
@@ -165,3 +204,10 @@ def run_all_checks() -> list[str]:
     _check_runtime_manifest(errors)
     _check_dist_if_present(errors)
     return errors
+
+
+if __name__ == "__main__":
+    checks = run_all_checks()
+    for check in checks:
+        print(check)
+    raise SystemExit(bool(checks))

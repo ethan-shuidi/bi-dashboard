@@ -47,26 +47,83 @@ const protectedDashboardHeaderNames = new Set([
   "x-dashboard-editor",
 ])
 
+const validHttpHeaderName = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+function safeHttpHeaderName(name) {
+  const normalized = String(name ?? "").trim()
+  if (!validHttpHeaderName.test(normalized)) {
+    throw new DashboardApiError("看板请求头名称无效", 400)
+  }
+  return normalized
+}
+
+function headerEntries(headers) {
+  if (!headers) return []
+  if (typeof headers.entries === "function") {
+    try {
+      return Array.from(headers.entries(), ([name, value]) => [name, value])
+    } catch (error) {
+      if (error instanceof DashboardApiError) throw error
+      throw new DashboardApiError("看板请求头格式无效", 400)
+    }
+  }
+  if (Array.isArray(headers)) {
+    return headers.map((entry) => {
+      if (!Array.isArray(entry) || entry.length < 2) {
+        throw new DashboardApiError("看板请求头格式无效", 400)
+      }
+      return [entry[0], entry[1]]
+    })
+  }
+  if (typeof headers !== "object") {
+    throw new DashboardApiError("看板请求头格式无效", 400)
+  }
+  return Object.entries(headers)
+}
+
 function safeHeaders(headers, { preserveProtectedHeaders = false } = {}) {
   return Object.fromEntries(
-    Object.entries(headers || {})
+    headerEntries(headers)
       .filter(([name]) => preserveProtectedHeaders || !protectedDashboardHeaderNames.has(String(name).toLowerCase()))
-      .map(([name, value]) => [name, safeHttpHeaderValue(value)])
+      .map(([name, value]) => [safeHttpHeaderName(name), safeHttpHeaderValue(value)])
   )
 }
 
 const writeTokenStates = new Map()
 
 function dashboardWriteTokenUrl(url) {
-  const value = String(url)
-  const apiIndex = value.indexOf("/api/")
-  const base = apiIndex >= 0 ? value.slice(0, apiIndex) : new URL("/", value).toString().replace(/\/$/, "")
-  return `${base}/api/dashboard/write-token`
+  return new URL("/api/dashboard/write-token", dashboardRequestUrl(url)).toString()
+}
+
+function dashboardRequestUrl(url) {
+  let parsed
+  try {
+    parsed = new URL(String(url), globalThis.location?.href)
+  } catch {
+    throw new DashboardApiError("看板接口地址无效", 400)
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new DashboardApiError("看板接口协议无效", 400)
+  }
+  if (parsed.username || parsed.password) {
+    throw new DashboardApiError("看板接口地址不允许携带凭据", 400)
+  }
+  if (
+    import.meta.env?.PROD &&
+    parsed.protocol !== "https:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
+  ) {
+    throw new DashboardApiError("生产环境看板接口必须使用 HTTPS", 400)
+  }
+  return parsed.toString()
 }
 
 async function requestDashboardWriteToken(editor, targetUrl) {
   const response = await fetch(dashboardWriteTokenUrl(targetUrl), {
     cache: "no-store",
+    credentials: "omit",
+    mode: "cors",
+    redirect: "error",
     headers: safeHeaders({ "X-Dashboard-Editor": editor }, { preserveProtectedHeaders: true }),
   })
   const body = await response.json().catch(() => ({}))
@@ -147,6 +204,7 @@ function dashboardHeaders(writeToken = null) {
 }
 
 export async function fetchWithDashboardAuth(url, options = {}) {
+  const requestUrl = dashboardRequestUrl(url)
   const method = String(options.method || "GET").toUpperCase()
   const isWriteMethod = method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
   let writeToken = null
@@ -155,17 +213,23 @@ export async function fetchWithDashboardAuth(url, options = {}) {
     writeToken = await ensureDashboardWriteToken(url)
     headers = dashboardHeaders(writeToken)
   }
-  let response = await fetch(url, {
-    cache: "no-store",
+  let response = await fetch(requestUrl, {
     ...options,
+    cache: "no-store",
+    credentials: "omit",
+    mode: "cors",
+    redirect: "error",
     headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...headers }, { preserveProtectedHeaders: true }),
   })
   if (response.status === 401 && isWriteMethod && writeToken) {
     invalidateDashboardWriteToken(url)
     writeToken = await ensureDashboardWriteToken(url)
-    response = await fetch(url, {
-      cache: "no-store",
+    response = await fetch(requestUrl, {
       ...options,
+      cache: "no-store",
+      credentials: "omit",
+      mode: "cors",
+      redirect: "error",
       headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...dashboardHeaders(writeToken) }, { preserveProtectedHeaders: true }),
     })
   }
