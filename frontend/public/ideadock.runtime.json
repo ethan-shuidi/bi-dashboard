@@ -2,5 +2,5 @@
   "schema": "ideadock.runtime.v1",
   "deployment_status": "healthy",
   "backend_base_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb",
-  "active_deployment_id": 591
+  "active_deployment_id": 592
 }
