@@ -32,6 +32,10 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
         "safeHttpHeaderName",
         "dashboardRequestUrl",
         "dashboardWriteRequestUrl",
+        "dashboardApiRouteBase",
+        "dashboardWriteTokenRouteGuardMarker",
+        'match(/^(.*?\\/)api\\//)',
+        " IdeaDock may expose the same FastAPI service under a deployment prefix",
         "dashboard_write_token",
         "text/plain;charset=UTF-8",
         "dashboardFetchRetryDelaysMilliseconds",
@@ -196,6 +200,10 @@ def _check_dist_if_present(errors: list[str]) -> None:
         errors.append("构建产物缺少短期写权限获取逻辑")
     for path in auth_chunks:
         javascript = path.read_text(encoding="utf-8")
+        if re.search(r"""new\s+URL\(\s*["']\/api\/dashboard\/write-token["']""", javascript):
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 的写权限请求会丢弃 IdeaDock 部署前缀")
+        if "ideadock-write-token-prefix.v1" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少写权限部署前缀保护标记")
         if "dashboard_write_token" not in javascript:
             errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少短期写权限参数")
         if "dashboard_editor" not in javascript:

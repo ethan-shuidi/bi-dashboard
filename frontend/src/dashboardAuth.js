@@ -92,9 +92,25 @@ function safeHeaders(headers, { preserveProtectedHeaders = false } = {}) {
 
 const writeTokenStates = new Map()
 const dashboardFetchRetryDelaysMilliseconds = [250, 1_000]
+const dashboardWriteTokenRouteGuardMarker = "ideadock-write-token-prefix.v1"
+
+function dashboardApiRouteBase(pathname) {
+  // IdeaDock may expose the same FastAPI service under a deployment prefix such
+  // as /_ideadock/bs_xxx/. A URL built from the server root bypasses that proxy
+  // route and returns nginx's 404 page in production.
+  const match = String(pathname || "").match(/^(.*?\/)api\//)
+  if (!match) {
+    throw new DashboardApiError(`看板接口路径无效（${dashboardWriteTokenRouteGuardMarker}）`, 400)
+  }
+  return match[1]
+}
 
 function dashboardWriteTokenUrl(url, editor) {
-  const tokenUrl = new URL("/api/dashboard/write-token", dashboardRequestUrl(url))
+  const requestUrl = new URL(dashboardRequestUrl(url))
+  const tokenUrl = new URL(requestUrl)
+  tokenUrl.pathname = `${dashboardApiRouteBase(requestUrl.pathname).replace(/\/$/, "")}/api/dashboard/write-token`
+  tokenUrl.search = ""
+  tokenUrl.hash = ""
   tokenUrl.searchParams.set("editor", editor)
   return tokenUrl.toString()
 }

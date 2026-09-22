@@ -72,6 +72,31 @@ test("write requests use safe no-preflight credentials", async () => {
   assert.equal(requests[1].redirect, "error")
 })
 
+test("write-token requests keep the IdeaDock deployment prefix", async () => {
+  requests.length = 0
+  const response = await fetchWithDashboardAuth(
+    "https://backend.example.test/_ideadock/bs_test/api/amazon/ad-plan",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    },
+  )
+
+  assert.equal(response.status, 200)
+  assert.equal(requests.length, 2)
+  const tokenUrl = new URL(requests[0].url)
+  assert.equal(
+    tokenUrl.origin + tokenUrl.pathname,
+    "https://backend.example.test/_ideadock/bs_test/api/dashboard/write-token",
+  )
+  const writeUrl = new URL(requests[1].url)
+  assert.equal(
+    writeUrl.origin + writeUrl.pathname,
+    "https://backend.example.test/_ideadock/bs_test/api/amazon/ad-plan",
+  )
+})
+
 test("standard Headers objects keep business headers and cannot disable request safety", async () => {
   requests.length = 0
   const response = await fetchWithDashboardAuth("https://headers-object.example.test/api/amazon/ad-plan", {
