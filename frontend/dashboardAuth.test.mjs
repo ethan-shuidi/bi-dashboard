@@ -22,7 +22,7 @@ globalThis.fetch = async (url, init = {}) => {
     redirect: init.redirect,
   })
   fetchSequence += 1
-  const value = String(url).endsWith("/api/dashboard/write-token")
+  const value = String(url).includes("/api/dashboard/write-token")
     ? {
         token: `${Math.floor(Date.now() / 1000) + 600}.test-signature-${fetchSequence}`,
         expires_at: Math.floor(Date.now() / 1000) + 600,
@@ -33,7 +33,7 @@ globalThis.fetch = async (url, init = {}) => {
 
 const { DashboardApiError, fetchWithDashboardAuth } = await import("./src/dashboardAuth.js")
 
-test("write requests keep the trusted short-lived token headers", async () => {
+test("write requests use safe no-preflight credentials", async () => {
   const response = await fetchWithDashboardAuth("https://backend.example.test/api/amazon/ad-plan", {
     method: "POST",
     headers: {
@@ -46,17 +46,22 @@ test("write requests keep the trusted short-lived token headers", async () => {
 
   assert.equal(response.status, 200)
   assert.equal(requests.length, 2)
-  assert.equal(requests[0].url, "https://backend.example.test/api/dashboard/write-token")
-  assert.equal(requests[0].headers["X-Dashboard-Editor"], "%E7%BC%96%E8%BE%91%E8%80%85-abc")
+  const tokenUrl = new URL(requests[0].url)
+  assert.equal(tokenUrl.origin + tokenUrl.pathname, "https://backend.example.test/api/dashboard/write-token")
+  assert.equal(tokenUrl.search, "?editor=%E7%BC%96%E8%BE%91%E8%80%85-abc")
+  assert.equal(Object.hasOwn(requests[0].headers, "X-Dashboard-Editor"), false)
   assert.equal(requests[0].cache, "no-store")
   assert.equal(requests[0].credentials, "omit")
   assert.equal(requests[0].mode, "cors")
   assert.equal(requests[0].redirect, "error")
 
-  assert.equal(requests[1].url, "https://backend.example.test/api/amazon/ad-plan")
-  assert.equal(requests[1].headers["Content-Type"], "application/json")
-  assert.equal(requests[1].headers["X-Dashboard-Editor"], "%E7%BC%96%E8%BE%91%E8%80%85-abc")
-  assert.match(requests[1].headers["X-Dashboard-Write-Token"], /^\d+\.test-signature-\d+$/)
+  const writeUrl = new URL(requests[1].url)
+  assert.equal(writeUrl.origin + writeUrl.pathname, "https://backend.example.test/api/amazon/ad-plan")
+  assert.equal(writeUrl.searchParams.get("dashboard_editor"), "编辑者-abc")
+  assert.match(writeUrl.searchParams.get("dashboard_write_token"), /^\d+\.test-signature-\d+$/)
+  assert.equal(requests[1].headers["Content-Type"], "text/plain;charset=UTF-8")
+  assert.equal(Object.hasOwn(requests[1].headers, "X-Dashboard-Editor"), false)
+  assert.equal(Object.hasOwn(requests[1].headers, "X-Dashboard-Write-Token"), false)
   assert.equal(Object.hasOwn(requests[1].headers, "X-Sync-Key"), false)
   for (const value of Object.values(requests[1].headers)) {
     assert.equal(value, Buffer.from(value, "latin1").toString("latin1"), `header must be ISO-8859-1: ${value}`)
@@ -82,10 +87,11 @@ test("standard Headers objects keep business headers and cannot disable request 
   })
 
   assert.equal(response.status, 200)
-  assert.equal(requests[1].headers["content-type"], "application/json")
+  assert.equal(requests[1].headers["Content-Type"], "text/plain;charset=UTF-8")
   assert.equal(requests[1].headers["x-custom-editor"], "custom-value")
   assert.equal(Object.hasOwn(requests[1].headers, "X-Sync-Key"), false)
-  assert.match(requests[1].headers["X-Dashboard-Write-Token"], /^\d+\.test-signature-\d+$/)
+  const writeUrl = new URL(requests[1].url)
+  assert.match(writeUrl.searchParams.get("dashboard_write_token"), /^\d+\.test-signature-\d+$/)
   assert.equal(requests[1].cache, "no-store")
   assert.equal(requests[1].credentials, "omit")
 })
@@ -96,7 +102,7 @@ test("write requests refresh the short-lived token once after 401", async () => 
   let targetCalls = 0
   globalThis.fetch = async (url, init = {}) => {
     const response = await originalFetch(url, init)
-    if (!String(url).endsWith("/api/dashboard/write-token")) {
+    if (!String(url).includes("/api/dashboard/write-token")) {
       targetCalls += 1
       return targetCalls === 1 ? { ...response, ok: false, status: 401 } : response
     }
@@ -110,8 +116,13 @@ test("write requests refresh the short-lived token once after 401", async () => 
     })
     assert.equal(response.status, 200)
     assert.equal(requests.length, 4)
-    assert.equal(requests.filter((request) => request.url.endsWith("/api/dashboard/write-token")).length, 2)
-    assert.notEqual(requests[1].headers["X-Dashboard-Write-Token"], requests[3].headers["X-Dashboard-Write-Token"])
+    assert.equal(requests.filter((request) => request.url.includes("/api/dashboard/write-token")).length, 2)
+    const firstWriteUrl = new URL(requests[1].url)
+    const secondWriteUrl = new URL(requests[3].url)
+    assert.notEqual(
+      firstWriteUrl.searchParams.get("dashboard_write_token"),
+      secondWriteUrl.searchParams.get("dashboard_write_token"),
+    )
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -122,7 +133,7 @@ test("write-token requests retry once after a transient network failure", async 
   const originalFetch = globalThis.fetch
   let tokenCalls = 0
   globalThis.fetch = async (url, init = {}) => {
-    if (String(url).endsWith("/api/dashboard/write-token")) {
+    if (String(url).includes("/api/dashboard/write-token")) {
       tokenCalls += 1
       if (tokenCalls === 1) throw new TypeError("Failed to fetch")
     }
@@ -136,8 +147,33 @@ test("write-token requests retry once after a transient network failure", async 
     })
     assert.equal(response.status, 200)
     assert.equal(tokenCalls, 2)
-    assert.equal(requests.filter((request) => request.url.endsWith("/api/dashboard/write-token")).length, 1)
-    assert.equal(requests.filter((request) => !request.url.endsWith("/api/dashboard/write-token")).length, 1)
+    assert.equal(requests.filter((request) => request.url.includes("/api/dashboard/write-token")).length, 1)
+    assert.equal(requests.filter((request) => !request.url.includes("/api/dashboard/write-token")).length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("write-token requests recover from two transient network failures", async () => {
+  requests.length = 0
+  const originalFetch = globalThis.fetch
+  let tokenCalls = 0
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("/api/dashboard/write-token")) {
+      tokenCalls += 1
+      if (tokenCalls <= 2) throw new TypeError("Failed to fetch")
+    }
+    return originalFetch(url, init)
+  }
+  try {
+    const response = await fetchWithDashboardAuth("https://token-retry-twice.example.test/api/amazon/ad-plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })
+    assert.equal(response.status, 200)
+    assert.equal(tokenCalls, 3)
+    assert.equal(requests.filter((request) => !String(request.url).includes("/api/dashboard/write-token")).length, 1)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -147,7 +183,7 @@ test("write requests do not auto-retry and never expose raw Failed to fetch", as
   requests.length = 0
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (url, init = {}) => {
-    if (String(url).endsWith("/api/dashboard/write-token")) return originalFetch(url, init)
+    if (String(url).includes("/api/dashboard/write-token")) return originalFetch(url, init)
     requests.push({ url: String(url), headers: { ...(init.headers || {}) } })
     throw new TypeError("Failed to fetch")
   }
@@ -167,7 +203,7 @@ test("write requests do not auto-retry and never expose raw Failed to fetch", as
         return true
       },
     )
-    assert.equal(requests.filter((request) => !request.url.endsWith("/api/dashboard/write-token")).length, 1)
+    assert.equal(requests.filter((request) => !request.url.includes("/api/dashboard/write-token")).length, 1)
   } finally {
     globalThis.fetch = originalFetch
   }

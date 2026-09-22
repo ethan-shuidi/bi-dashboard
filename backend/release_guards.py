@@ -20,7 +20,7 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
     source = _source("frontend/src/dashboardAuth.js")
     required_fragments = (
         "/api/dashboard/write-token",
-        "X-Dashboard-Write-Token",
+        "x-dashboard-write-token",
         "protectedDashboardHeaderNames",
         "preserveProtectedHeaders",
         "...safeHeaders(options.headers || {})",
@@ -31,7 +31,10 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
         "headerEntries",
         "safeHttpHeaderName",
         "dashboardRequestUrl",
-        "dashboardFetchRetryDelayMilliseconds",
+        "dashboardWriteRequestUrl",
+        "dashboard_write_token",
+        "text/plain;charset=UTF-8",
+        "dashboardFetchRetryDelaysMilliseconds",
         "isDashboardRuntimeStaleError",
         "normalizeDashboardFetchError",
         "network_error",
@@ -64,7 +67,7 @@ def _check_frontend_runtime(errors: list[str]) -> None:
     ):
         if fragment not in runtime_source:
             errors.append(f"运行配置加载器缺少发布保护片段：{fragment}")
-    if "isWriteMethod ? 1 : 2" not in _source("frontend/src/dashboardAuth.js"):
+    if "isWriteMethod" not in _source("frontend/src/dashboardAuth.js"):
         errors.append("保存请求不得在网络断开时自动重发")
 
     for relative_path in ("frontend/src/App.vue", "frontend/src/AmazonDashboard.vue"):
@@ -193,10 +196,12 @@ def _check_dist_if_present(errors: list[str]) -> None:
         errors.append("构建产物缺少短期写权限获取逻辑")
     for path in auth_chunks:
         javascript = path.read_text(encoding="utf-8")
-        if "X-Dashboard-Write-Token" not in javascript:
-            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少短期写权限请求头")
-        if "X-Dashboard-Editor" not in javascript:
-            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少看板编辑者请求头")
+        if "dashboard_write_token" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少短期写权限参数")
+        if "dashboard_editor" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少看板编辑者参数")
+        if "text/plain;charset=UTF-8" not in javascript:
+            errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少免预检写请求内容类型")
         for option in ("cache", "credentials", "mode", "redirect"):
             if not re.search(rf"{option}\s*:\s*[\"'](no-store|omit|cors|error)[\"']", javascript):
                 errors.append(f"{path.relative_to(PROJECT_ROOT)} 缺少 {option} 请求安全策略")

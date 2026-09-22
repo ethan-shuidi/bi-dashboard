@@ -537,6 +537,25 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 self.assertIn("Origin", response.headers.get("Vary", ""))
                 token = response.json()["token"]
 
+                query_response = client.get(
+                    "/api/dashboard/write-token",
+                    headers={"Origin": origin},
+                    params={"editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc"},
+                )
+                self.assertEqual(query_response.status_code, 200)
+                self.assertEqual(query_response.json()["editor"], "编辑者-abc")
+
+                simple_accepted = client.post(
+                    "/api/keyword-dashboard/terms",
+                    content="{}",
+                    headers={"Origin": origin, "Content-Type": "text/plain;charset=UTF-8"},
+                    params={
+                        "dashboard_editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc",
+                        "dashboard_write_token": query_response.json()["token"],
+                    },
+                )
+                self.assertEqual(simple_accepted.status_code, 422)
+
                 accepted = client.post("/api/keyword-dashboard/terms", json={}, headers={
                     "Origin": origin,
                     "X-Dashboard-Editor": "%E7%BC%96%E8%BE%91%E8%80%85-abc",

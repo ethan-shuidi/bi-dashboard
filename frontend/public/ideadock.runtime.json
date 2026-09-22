@@ -7,7 +7,8 @@
   "service_name": "bi-dashboard-api",
   "route_code": "bs_50fe18fb",
   "backend_base_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb",
-  "active_deployment_id": 596,
+  "run_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_50fe18fb/",
+  "active_deployment_id": 601,
   "deployment_status": "healthy",
-  "generated_at": "2026-09-22T12:56:27"
+  "generated_at": "2026-09-22T15:17:46"
 }

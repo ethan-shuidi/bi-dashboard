@@ -151,6 +151,36 @@ def dashboard_write_token_valid(
         for candidate in editor_candidates
     )
 
+
+def dashboard_write_request_credentials(request: Request) -> tuple[str | None, str | None]:
+    return (
+        request.headers.get("X-Dashboard-Write-Token") or request.query_params.get("dashboard_write_token"),
+        request.headers.get("X-Dashboard-Editor") or request.query_params.get("dashboard_editor"),
+    )
+
+
+def rewrite_simple_json_request(request: Request) -> None:
+    """Treat a browser simple POST body as JSON after authentication.
+
+    The browser client uses ``text/plain;charset=UTF-8`` to avoid a CORS
+    preflight. The credential is carried in short-lived query parameters and the
+    request origin remains bound into the token. Header-authenticated callers
+    continue to use ``application/json`` without any change.
+    """
+
+    content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "text/plain":
+        return
+    scope_headers = [
+        (name, value) for name, value in request.scope.get("headers", [])
+        if name.lower() != b"content-type"
+    ]
+    editor = request.query_params.get("dashboard_editor")
+    has_editor_header = any(name.lower() == b"x-dashboard-editor" for name, _ in scope_headers)
+    if editor and not has_editor_header:
+        scope_headers.append((b"x-dashboard-editor", quote(editor, safe="").encode("ascii")))
+    request.scope["headers"] = scope_headers + [(b"content-type", b"application/json")]
+
 Base = declarative_base()
 _engine = None
 _session_factory = None
@@ -260,12 +290,12 @@ async def scope_dashboard_request(request: Request, call_next):
         if method not in {"GET", "HEAD", "OPTIONS"}:
             expected_key = os.environ.get("SYNC_API_KEY")
             supplied_key = request.headers.get("X-Sync-Key")
-            supplied_write_token = request.headers.get("X-Dashboard-Write-Token")
+            supplied_write_token, supplied_editor = dashboard_write_request_credentials(request)
             if not expected_key:
                 return JSONResponse(status_code=503, content={"detail": "看板写接口未配置访问密钥"})
             if supplied_write_token and dashboard_write_token_valid(
                 supplied_write_token,
-                request.headers.get("X-Dashboard-Editor"),
+                supplied_editor,
                 request.headers.get("Origin"),
             ):
                 authorization_token = _dashboard_write_authorized.set(True)
@@ -274,6 +304,7 @@ async def scope_dashboard_request(request: Request, call_next):
             origin = request.headers.get("Origin")
             if origin and origin.rstrip("/") not in _DASHBOARD_ORIGINS:
                 return JSONResponse(status_code=403, content={"detail": "看板写接口来源不允许"})
+            rewrite_simple_json_request(request)
         if path == "/api/keyword-dashboard":
             with xiyou_keyword_dashboard_scope():
                 return await call_next(request)
@@ -2657,11 +2688,11 @@ def health():
 
 
 @app.get("/api/dashboard/write-token")
-def dashboard_write_token(request: Request):
+def dashboard_write_token(request: Request, editor: str | None = Query(default=None)):
     """Issue a short-lived browser write credential without exposing SYNC_API_KEY."""
 
     issued = issue_dashboard_write_token(
-        request.headers.get("X-Dashboard-Editor"),
+        request.headers.get("X-Dashboard-Editor") or editor,
         request.headers.get("Origin"),
     )
     return JSONResponse(

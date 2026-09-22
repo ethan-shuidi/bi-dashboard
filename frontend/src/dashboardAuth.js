@@ -91,10 +91,19 @@ function safeHeaders(headers, { preserveProtectedHeaders = false } = {}) {
 }
 
 const writeTokenStates = new Map()
-const dashboardFetchRetryDelayMilliseconds = 250
+const dashboardFetchRetryDelaysMilliseconds = [250, 1_000]
 
-function dashboardWriteTokenUrl(url) {
-  return new URL("/api/dashboard/write-token", dashboardRequestUrl(url)).toString()
+function dashboardWriteTokenUrl(url, editor) {
+  const tokenUrl = new URL("/api/dashboard/write-token", dashboardRequestUrl(url))
+  tokenUrl.searchParams.set("editor", editor)
+  return tokenUrl.toString()
+}
+
+function dashboardWriteRequestUrl(url, editor, writeToken) {
+  const requestUrl = new URL(dashboardRequestUrl(url))
+  requestUrl.searchParams.set("dashboard_editor", editor)
+  requestUrl.searchParams.set("dashboard_write_token", writeToken)
+  return requestUrl.toString()
 }
 
 function dashboardRequestUrl(url) {
@@ -121,8 +130,8 @@ function dashboardRequestUrl(url) {
 }
 
 async function requestDashboardWriteToken(editor, targetUrl) {
-  const tokenUrl = dashboardWriteTokenUrl(targetUrl)
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const tokenUrl = dashboardWriteTokenUrl(targetUrl, editor)
+  for (let attempt = 0; attempt <= dashboardFetchRetryDelaysMilliseconds.length; attempt += 1) {
     let response
     try {
       response = await fetch(tokenUrl, {
@@ -130,11 +139,10 @@ async function requestDashboardWriteToken(editor, targetUrl) {
         credentials: "omit",
         mode: "cors",
         redirect: "error",
-        headers: safeHeaders({ "X-Dashboard-Editor": editor }, { preserveProtectedHeaders: true }),
       })
     } catch (error) {
-      if (attempt === 0 && isRetryableDashboardFetchError(error)) {
-        await waitForDashboardFetchRetry()
+      if (attempt < dashboardFetchRetryDelaysMilliseconds.length && isRetryableDashboardFetchError(error)) {
+        await waitForDashboardFetchRetry(dashboardFetchRetryDelaysMilliseconds[attempt])
         continue
       }
       throw normalizeDashboardFetchError(error, tokenUrl, "write-token")
@@ -181,7 +189,7 @@ function validateDashboardWriteTokenResponse(body, nowMilliseconds) {
 
 async function ensureDashboardWriteToken(targetUrl) {
   const editor = dashboardEditorId()
-  const tokenUrl = dashboardWriteTokenUrl(targetUrl)
+  const tokenUrl = dashboardWriteTokenUrl(targetUrl, editor)
   const state = writeTokenState(tokenUrl)
   const now = Date.now()
   if (state.editor === editor && state.token && state.expiresAt > now + 60_000) {
@@ -204,26 +212,19 @@ async function ensureDashboardWriteToken(targetUrl) {
 }
 
 function invalidateDashboardWriteToken(targetUrl) {
-  const state = writeTokenStates.get(dashboardWriteTokenUrl(targetUrl))
+  const state = writeTokenStates.get(dashboardWriteTokenUrl(targetUrl, dashboardEditorId()))
   if (!state) return
   state.token = null
   state.expiresAt = 0
   state.promise = null
 }
 
-function dashboardHeaders(writeToken = null) {
-  return safeHeaders({
-    ...(writeToken ? { "X-Dashboard-Write-Token": writeToken } : {}),
-    "X-Dashboard-Editor": dashboardEditorId(),
-  }, { preserveProtectedHeaders: true })
-}
-
 function isRetryableDashboardFetchError(error) {
   return error instanceof TypeError
 }
 
-function waitForDashboardFetchRetry() {
-  return new Promise((resolve) => setTimeout(resolve, dashboardFetchRetryDelayMilliseconds))
+function waitForDashboardFetchRetry(delayMilliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, delayMilliseconds))
 }
 
 function normalizeDashboardFetchError(error, requestUrl, phase) {
@@ -265,7 +266,7 @@ async function dashboardFetch(requestUrl, options, phase, attempts, trustedHeade
       })
     } catch (error) {
       if (attempt + 1 < attempts && isRetryableDashboardFetchError(error) && options?.signal?.aborted !== true) {
-        await waitForDashboardFetchRetry()
+        await waitForDashboardFetchRetry(dashboardFetchRetryDelaysMilliseconds[Math.min(attempt, dashboardFetchRetryDelaysMilliseconds.length - 1)])
         continue
       }
       throw normalizeDashboardFetchError(error, requestUrl, phase)
@@ -283,23 +284,43 @@ async function ensureCurrentDashboardRuntimeSafely({ force = false } = {}) {
 }
 
 export async function fetchWithDashboardAuth(url, options = {}) {
-  const requestUrl = dashboardRequestUrl(url)
+  const baseUrl = dashboardRequestUrl(url)
   const method = String(options.method || "GET").toUpperCase()
   const isWriteMethod = method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
   await ensureCurrentDashboardRuntimeSafely({ force: isWriteMethod })
-  let writeToken = null
-  let headers = dashboardHeaders()
   if (isWriteMethod) {
-    writeToken = await ensureDashboardWriteToken(url)
-    headers = dashboardHeaders(writeToken)
+    const writeToken = await ensureDashboardWriteToken(baseUrl)
+    const requestUrl = dashboardWriteRequestUrl(baseUrl, dashboardEditorId(), writeToken)
+    let response = await dashboardFetch(requestUrl, dashboardWriteOptions(options), "request", 1, {})
+    if (response.status !== 401) return response
+
+    invalidateDashboardWriteToken(baseUrl)
+    const refreshedToken = await ensureDashboardWriteToken(baseUrl)
+    const retryUrl = dashboardWriteRequestUrl(baseUrl, dashboardEditorId(), refreshedToken)
+    response = await dashboardFetch(
+      retryUrl,
+      dashboardWriteOptions(options),
+      "request",
+      1,
+      {},
+    )
+    return response
   }
-  let response = await dashboardFetch(requestUrl, options, "request", isWriteMethod ? 1 : 2, headers)
-  if (response.status === 401 && isWriteMethod && writeToken) {
-    invalidateDashboardWriteToken(url)
-    writeToken = await ensureDashboardWriteToken(url)
-    response = await dashboardFetch(requestUrl, options, "request", 1, dashboardHeaders(writeToken))
+  return await dashboardFetch(baseUrl, options, "request", 2, {})
+}
+
+function dashboardWriteOptions(options) {
+  const businessHeaders = Object.fromEntries(
+    Object.entries(safeHeaders(options.headers || {}))
+      .filter(([name]) => name.toLowerCase() !== "content-type"),
+  )
+  return {
+    ...options,
+    headers: {
+      ...businessHeaders,
+      "Content-Type": "text/plain;charset=UTF-8",
+    },
   }
-  return response
 }
 
 export class DashboardApiError extends Error {
