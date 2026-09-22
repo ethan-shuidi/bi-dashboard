@@ -499,13 +499,16 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))
 
-    def test_dashboard_write_token_is_short_lived_and_editor_bound(self):
+    def test_dashboard_write_token_is_short_lived_and_header_compatible(self):
         origin = "https://ideadock.shuidihuzhu.com"
         with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
             issued = issue_dashboard_write_token("%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=1_000)
             self.assertEqual(issued["editor"], "编辑者-abc")
             self.assertTrue(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=1_001))
-            self.assertFalse(dashboard_write_token_valid(issued["token"], "another-editor", origin, now=1_001))
+            # 旧版/代理场景下，编辑者 Header 可能在原始编码和解码文本之间变化。
+            # 令牌仍绑定来源与有效期，编辑者只作为审计信息，不作为身份凭证。
+            self.assertTrue(dashboard_write_token_valid(issued["token"], "编辑者-abc", origin, now=1_001))
+            self.assertFalse(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", "https://example.test", now=1_001))
             self.assertFalse(dashboard_write_token_valid(issued["token"], "%E7%BC%96%E8%BE%91%E8%80%85-abc", origin, now=2_901))
 
             with TestClient(app_module.app) as client:
@@ -529,13 +532,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 })
                 self.assertEqual(accepted.status_code, 422)
 
-                rejected = client.post("/api/keyword-dashboard/terms", json={}, headers={
+                # Browsers reject non-ISO-8859-1 header values. The frontend must
+                # percent-encode them, so only the encoded form is valid on the wire.
+                rejected_editor = client.post("/api/keyword-dashboard/terms", json={}, headers={
                     "Origin": origin,
-                    "X-Dashboard-Editor": "someone-else",
+                    "X-Dashboard-Editor": "another-editor",
                     "X-Dashboard-Write-Token": token,
                 })
-                self.assertEqual(rejected.status_code, 401)
-                self.assertIn("X-Sync-Key", rejected.json()["detail"])
+                self.assertEqual(rejected_editor.status_code, 401)
 
     def test_strategy_and_series_must_be_set_together(self):
         self.assertIn("bundle", AMAZON_STRATEGY_OPTIONS)

@@ -22,6 +22,7 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
         "X-Dashboard-Write-Token",
         "protectedDashboardHeaderNames",
         "encodeURIComponent",
+        "cachedDashboardEditorId",
         "0x7e",
         "invalidateDashboardWriteToken",
     )

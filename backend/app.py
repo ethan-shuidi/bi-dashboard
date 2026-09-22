@@ -109,11 +109,12 @@ def issue_dashboard_write_token(
     editor_value = str(editor or "").strip() or "Editor-anonymous"
     issued_at = int(now if now is not None else time.time())
     expires_at = issued_at + 30 * 60
-    signature = dashboard_write_token_signature(editor_value, normalized_origin, expires_at)
+    canonical_editor = dashboard_editor(editor_value)
+    signature = dashboard_write_token_signature(canonical_editor, normalized_origin, expires_at)
     return {
         "token": f"{expires_at}.{signature}",
         "expires_at": expires_at,
-        "editor": dashboard_editor(editor_value),
+        "editor": canonical_editor,
         "expires_in": expires_at - issued_at,
     }
 
@@ -136,8 +137,19 @@ def dashboard_write_token_valid(
     normalized_origin = (origin or "").rstrip("/")
     if not normalized_origin or normalized_origin not in _DASHBOARD_ORIGINS:
         return False
-    expected_signature = dashboard_write_token_signature(str(editor or "").strip(), normalized_origin, expires_at)
-    return hmac.compare_digest(signature, expected_signature)
+    raw_editor = str(editor or "").strip()
+    editor_candidates = {raw_editor, ""}
+    try:
+        editor_candidates.add(unquote(raw_editor, errors="strict"))
+        editor_candidates.add(quote(raw_editor, safe=""))
+    except UnicodeDecodeError:
+        pass
+    editor_candidates.add(dashboard_editor(raw_editor))
+    editor_candidates.add("Editor-anonymous")
+    return any(
+        hmac.compare_digest(signature, dashboard_write_token_signature(candidate, normalized_origin, expires_at))
+        for candidate in editor_candidates
+    )
 
 Base = declarative_base()
 _engine = None

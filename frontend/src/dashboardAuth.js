@@ -2,6 +2,7 @@ import { ElMessageBox } from "element-plus"
 
 const editorStorageKey = "ideadock.dashboard.editor-id.v1"
 const anonymousEditorPrefix = "Editor"
+let cachedDashboardEditorId = null
 
 function randomEditorToken() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID().slice(0, 8)
@@ -9,14 +10,25 @@ function randomEditorToken() {
 }
 
 export function dashboardEditorId() {
+  if (cachedDashboardEditorId) return cachedDashboardEditorId
   try {
     const existing = window.localStorage.getItem(editorStorageKey)
-    if (existing) return existing
+    if (existing) {
+      cachedDashboardEditorId = existing
+      return existing
+    }
     const created = `${anonymousEditorPrefix}-${randomEditorToken()}`
-    window.localStorage.setItem(editorStorageKey, created)
+    try {
+      window.localStorage.setItem(editorStorageKey, created)
+    } catch {
+      // Some preview frames allow reading storage but reject writes. Keep the ID
+      // stable in memory so token issuance and writes use the same editor value.
+    }
+    cachedDashboardEditorId = created
     return created
   } catch {
-    return `${anonymousEditorPrefix}-local`
+    cachedDashboardEditorId = `${anonymousEditorPrefix}-local`
+    return cachedDashboardEditorId
   }
 }
 
