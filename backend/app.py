@@ -203,6 +203,10 @@ _dashboard_write_authorized: ContextVar[bool] = ContextVar(
     "dashboard_write_authorized",
     default=False,
 )
+_dashboard_request_editor: ContextVar[str | None] = ContextVar(
+    "dashboard_request_editor",
+    default=None,
+)
 _amazon_cache_scope: ContextVar[str] = ContextVar(
     "amazon_cache_scope",
     default="shared",
@@ -286,11 +290,13 @@ async def scope_dashboard_request(request: Request, call_next):
     namespace = next((value for prefix, value in cache_namespaces.items() if path.startswith(prefix)), "shared")
     cache_token = _amazon_cache_scope.set(namespace)
     authorization_token = None
+    editor_token = None
     try:
         if method not in {"GET", "HEAD", "OPTIONS"}:
             expected_key = os.environ.get("SYNC_API_KEY")
             supplied_key = request.headers.get("X-Sync-Key")
             supplied_write_token, supplied_editor = dashboard_write_request_credentials(request)
+            editor_token = _dashboard_request_editor.set(dashboard_editor(supplied_editor))
             if not expected_key:
                 return JSONResponse(status_code=503, content={"detail": "看板写接口未配置访问密钥"})
             if supplied_write_token and dashboard_write_token_valid(
@@ -312,6 +318,8 @@ async def scope_dashboard_request(request: Request, call_next):
     finally:
         if authorization_token is not None:
             _dashboard_write_authorized.reset(authorization_token)
+        if editor_token is not None:
+            _dashboard_request_editor.reset(editor_token)
         _amazon_cache_scope.reset(cache_token)
 KEYWORD_CATEGORIES = (
     "comu品牌词",
@@ -845,6 +853,12 @@ def dashboard_editor(value: str | None) -> str:
     return editor[:80] if editor else "未知编辑者"
 
 
+def dashboard_request_editor(fallback: str | None = None) -> str:
+    """Resolve the authenticated editor from query/header once per request."""
+
+    return dashboard_editor(_dashboard_request_editor.get() or fallback)
+
+
 def edit_metadata(item: Any) -> dict[str, str | None]:
     updated_at = getattr(item, "updated_at", None)
     if updated_at is None:
@@ -869,6 +883,13 @@ def ensure_edit_freshness(
         return
     current = getattr(item, "updated_at", None)
     if current is None:
+        return
+    current_editor = dashboard_request_editor()
+    cloud_editor = dashboard_editor(getattr(item, "updated_by", None))
+    # A user's own later edit may advance the cloud version (for example after a
+    # refresh in another tab). That is not a cross-user conflict and must not
+    # interrupt their save. Unknown cloud editors still require an explicit choice.
+    if current_editor != "未知编辑者" and current_editor == cloud_editor:
         return
     if base_updated_at in (None, ""):
         # New rows have no client version. An existing row requires a version.
@@ -4283,7 +4304,7 @@ def save_campaign_strategy(
         item.series = series
         item.product = product
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
     return {"ok": True, "site_code": site_code, "store_sid": store_sid, "campaign_id": campaign_id, "strategy": strategy, "series": series, "product": product, **edit_metadata(item)}
@@ -4349,7 +4370,7 @@ def save_campaign_strategies(
             item.series = values["series"]
             item.product = values["product"]
             item.updated_at = utcnow()
-            item.updated_by = dashboard_editor(x_dashboard_editor)
+            item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
     latest = max(by_key.values(), key=lambda item: item.updated_at or datetime.min, default=None)
@@ -4399,7 +4420,7 @@ def save_strategy_notes_batch(
                 db.add(item)
             item.note = note
             item.updated_at = utcnow()
-            item.updated_by = dashboard_editor(x_dashboard_editor)
+            item.updated_by = dashboard_request_editor(x_dashboard_editor)
             saved_items.append(item)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
@@ -4432,7 +4453,7 @@ def save_strategy_note(
             db.add(item)
         item.note = note
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-strategy-board", "amazon-sales-targets")
     return {"ok": True, "week_start": week_start.isoformat(), "site_code": site_code, "series": series, "strategy": strategy, "note": note, **edit_metadata(item)}
@@ -5062,7 +5083,7 @@ def save_keyword_dashboard_terms(
                 sort_order=sort_order,
                 enabled=True,
                 updated_at=now,
-                updated_by=dashboard_editor(x_dashboard_editor),
+                updated_by=dashboard_request_editor(x_dashboard_editor),
             ))
         db.commit()
         rows = db.scalars(
@@ -5541,7 +5562,7 @@ def save_ad_plan(
         item.review = review
         item.plan = plan
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan, **edit_metadata(item)}
 
@@ -5592,7 +5613,7 @@ def save_operation_plan(
         item.review = review
         item.plan = plan
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     return {"ok": True, "week_start": week_start.isoformat(), "site": site, "site_code": site_code, "series": series, "review": review, "plan": plan, **edit_metadata(item)}
 
@@ -6046,7 +6067,7 @@ def save_amazon_sales_weekly_targets(
         for key, value in normalized.items():
             setattr(item, f"target_{key}", value)
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-sales-targets")
 
@@ -6103,7 +6124,7 @@ def save_amazon_sales_weekly_targets_bulk(
                 db.add(item)
             item.target_units = target_units
             item.updated_at = utcnow()
-            item.updated_by = dashboard_editor(x_dashboard_editor)
+            item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
         _amazon_cache.clear_namespaces("amazon-sales-targets")
         saved_items = list(db.scalars(
@@ -6173,7 +6194,7 @@ def save_amazon_sales_targets(
         for key, value in normalized.items():
             setattr(item, f"target_{key}", value)
         item.updated_at = utcnow()
-        item.updated_by = dashboard_editor(x_dashboard_editor)
+        item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-sales-targets")
 
@@ -6233,7 +6254,7 @@ def save_amazon_sales_targets_bulk(
                 db.add(item)
             item.target_units = target_units
             item.updated_at = utcnow()
-            item.updated_by = dashboard_editor(x_dashboard_editor)
+            item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
         _amazon_cache.clear_namespaces("amazon-sales-targets")
         saved_items = list(db.scalars(

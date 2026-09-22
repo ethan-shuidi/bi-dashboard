@@ -499,6 +499,80 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertIsNone(require_business_access(None))
         self.assertIsNone(require_business_access("legacy-key"))
 
+    def test_strategy_note_conflict_recognizes_the_same_query_editor(self):
+        stale_cloud_item = SimpleNamespace(
+            updated_at=datetime(2026, 9, 22, tzinfo=timezone.utc),
+            updated_by=None,
+        )
+        editor_token = app_module._dashboard_request_editor.set("alice")
+        try:
+            with self.assertRaises(app_module.HTTPException) as unknown_editor:
+                app_module.ensure_edit_freshness(stale_cloud_item, None)
+            self.assertEqual(unknown_editor.exception.status_code, 409)
+        finally:
+            app_module._dashboard_request_editor.reset(editor_token)
+
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[app_module.AmazonStrategyNote.__table__])
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+        week_start = "2026-09-14"
+        series = AMAZON_SERIES[0]
+        strategy = AMAZON_STRATEGY_OPTIONS[0]
+        item = {"site_code": "US", "series": series, "strategy": strategy, "note": "first"}
+        payload = {"week_start": week_start, "items": [item]}
+        with patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}), \
+             TestClient(app_module.app) as client:
+            first = client.post(
+                "/api/amazon/strategy-board/notes/batch",
+                json=payload,
+                headers={"X-Sync-Key": "test-key"},
+                params={"dashboard_editor": "alice"},
+            )
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["updated_by"], "alice")
+
+            # The browser client sends its editor as a query parameter. A stale
+            # base version written by that same editor is not a cross-user conflict.
+            second_payload = {
+                "week_start": week_start,
+                "items": [{**item, "note": "second"}],
+                "base_updated_at": "2020-01-01T00:00:00+00:00",
+            }
+            second = client.post(
+                "/api/amazon/strategy-board/notes/batch",
+                json=second_payload,
+                headers={"X-Sync-Key": "test-key"},
+                params={"dashboard_editor": "alice"},
+            )
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json()["updated_by"], "alice")
+
+            different_editor = client.post(
+                "/api/amazon/strategy-board/notes/batch",
+                json=second_payload,
+                headers={"X-Sync-Key": "test-key"},
+                params={"dashboard_editor": "bob"},
+            )
+            self.assertEqual(different_editor.status_code, 409)
+            self.assertEqual(different_editor.json()["detail"]["code"], "edit_conflict")
+            self.assertEqual(different_editor.json()["detail"]["updated_by"], "alice")
+
+        with Session(database) as db:
+            saved = db.scalar(app_module.select(app_module.AmazonStrategyNote).where(
+                app_module.AmazonStrategyNote.week_start == date(2026, 9, 14),
+                app_module.AmazonStrategyNote.site_code == "US",
+                app_module.AmazonStrategyNote.series == series,
+                app_module.AmazonStrategyNote.strategy == strategy,
+            ))
+            self.assertEqual(saved.note, "second")
+            self.assertEqual(saved.updated_by, "alice")
+
     def test_dashboard_write_token_is_short_lived_and_header_compatible(self):
         origin = "https://ideadock.shuidihuzhu.com"
         with patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}):
