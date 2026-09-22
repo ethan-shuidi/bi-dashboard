@@ -47,10 +47,10 @@ const protectedDashboardHeaderNames = new Set([
   "x-dashboard-editor",
 ])
 
-function safeHeaders(headers) {
+function safeHeaders(headers, { preserveProtectedHeaders = false } = {}) {
   return Object.fromEntries(
     Object.entries(headers || {})
-      .filter(([name]) => !protectedDashboardHeaderNames.has(String(name).toLowerCase()))
+      .filter(([name]) => preserveProtectedHeaders || !protectedDashboardHeaderNames.has(String(name).toLowerCase()))
       .map(([name, value]) => [name, safeHttpHeaderValue(value)])
   )
 }
@@ -67,7 +67,7 @@ function dashboardWriteTokenUrl(url) {
 async function requestDashboardWriteToken(editor, targetUrl) {
   const response = await fetch(dashboardWriteTokenUrl(targetUrl), {
     cache: "no-store",
-    headers: safeHeaders({ "X-Dashboard-Editor": editor }),
+    headers: safeHeaders({ "X-Dashboard-Editor": editor }, { preserveProtectedHeaders: true }),
   })
   const body = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -143,7 +143,7 @@ function dashboardHeaders(writeToken = null) {
   return safeHeaders({
     ...(writeToken ? { "X-Dashboard-Write-Token": writeToken } : {}),
     "X-Dashboard-Editor": dashboardEditorId(),
-  })
+  }, { preserveProtectedHeaders: true })
 }
 
 export async function fetchWithDashboardAuth(url, options = {}) {
@@ -158,7 +158,7 @@ export async function fetchWithDashboardAuth(url, options = {}) {
   let response = await fetch(url, {
     cache: "no-store",
     ...options,
-    headers: safeHeaders({ ...(options.headers || {}), ...headers }),
+    headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...headers }, { preserveProtectedHeaders: true }),
   })
   if (response.status === 401 && isWriteMethod && writeToken) {
     invalidateDashboardWriteToken(url)
@@ -166,7 +166,7 @@ export async function fetchWithDashboardAuth(url, options = {}) {
     response = await fetch(url, {
       cache: "no-store",
       ...options,
-      headers: safeHeaders({ ...(options.headers || {}), ...dashboardHeaders(writeToken) }),
+      headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...dashboardHeaders(writeToken) }, { preserveProtectedHeaders: true }),
     })
   }
   return response
