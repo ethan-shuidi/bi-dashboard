@@ -714,6 +714,26 @@ class AmazonStrategyNote(Base):
     updated_by = Column(String(80), nullable=True)
 
 
+class AmazonDataSourceMapping(Base):
+    """Cloud-editable ASIN source used by both Amazon dashboards."""
+
+    __tablename__ = "amazon_data_source_mappings"
+    __table_args__ = (
+        UniqueConstraint("site_code", "product", name="uq_amazon_data_source_site_product"),
+        UniqueConstraint("site_code", "asin", name="uq_amazon_data_source_site_asin"),
+        Index("ix_amazon_data_source_site_model", "site_code", "model"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    site_code = Column(String(12), nullable=False)
+    model = Column(String(16), nullable=False)
+    series = Column(String(160), nullable=False)
+    product = Column(String(160), nullable=False)
+    asin = Column(String(32), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    updated_by = Column(String(80), nullable=True)
+
+
 class AmazonMonthlyTarget(Base):
     __tablename__ = "amazon_monthly_targets"
     __table_args__ = (
@@ -952,7 +972,103 @@ async def lingxing_access_token() -> str:
         return token
 
 
-def amazon_product(site: str, asin: Any) -> str | None:
+def amazon_data_source_model(product: str) -> str:
+    return "TN10" if product.startswith("TN10-") else "TN20" if product.startswith("TN20-") else ""
+
+
+def amazon_data_source_series_display(series: str) -> str:
+    return {
+        AMAZON_SERIES[0]: "TN10（主）",
+        AMAZON_SERIES[1]: "TN10（小）",
+        AMAZON_SERIES[2]: "TN20（主）",
+        AMAZON_SERIES[3]: "TN20（小）",
+    }.get(series, series)
+
+
+def amazon_data_source_product_display(product: str) -> str:
+    replacements = {
+        "TN10-主链接-黑色": "TN10-主-黑",
+        "TN10-主链接-银色": "TN10-主-银",
+        "TN10-主链接-橙色": "TN10-主-橙",
+        "TN10-小链接-黑色": "TN10-小-黑",
+        "TN10-小链接-银色": "TN10-小-银",
+        "TN10-小链接-橙色": "TN10-小-橙",
+        "TN20-主链接-黑色": "TN20-主-黑",
+        "TN20-主链接-银色": "TN20-主-银",
+        "TN20-主链接-红": "TN20-主-红",
+        "TN20-小链接-黑色": "TN20-小-黑",
+        "TN20-小链接-银色": "TN20-小-银",
+        "TN20-小链接-樱桃红": "TN20-小-红",
+    }
+    return replacements.get(product, product)
+
+
+def amazon_data_source_product_key(product: str) -> str:
+    replacements = {
+        "TN10-主-黑": "TN10-主链接-黑色",
+        "TN10-主-银": "TN10-主链接-银色",
+        "TN10-主-橙": "TN10-主链接-橙色",
+        "TN10-小-黑": "TN10-小链接-黑色",
+        "TN10-小-银": "TN10-小链接-银色",
+        "TN10-小-橙": "TN10-小链接-橙色",
+        "TN20-主-黑": "TN20-主链接-黑色",
+        "TN20-主-银": "TN20-主链接-银色",
+        "TN20-主-红": "TN20-主链接-红",
+        "TN20-小-黑": "TN20-小链接-黑色",
+        "TN20-小-银": "TN20-小链接-银色",
+        "TN20-小-红": "TN20-小链接-樱桃红",
+    }
+    return replacements.get(str(product or "").strip(), str(product or "").strip())
+
+
+def amazon_data_source_mapping(db: Session) -> dict[str, dict[str, str]]:
+    """Load the cloud mapping used by Amazon dashboard aggregation."""
+
+    rows = db.scalars(
+        select(AmazonDataSourceMapping).where(
+            AmazonDataSourceMapping.asin.is_not(None),
+            AmazonDataSourceMapping.asin != "",
+        )
+    ).all()
+    mapping: dict[str, dict[str, str]] = {}
+    for row in rows:
+        asin = str(row.asin or "").strip().upper()
+        product = str(row.product or "")
+        if asin and product in AMAZON_PRODUCTS:
+            mapping.setdefault(str(row.site_code), {})[asin] = product
+    return mapping
+
+
+def amazon_data_source_site_conflicts(rows: Any) -> dict[str, list[str]]:
+    """Return duplicate ASINs within each site."""
+
+    products_by_site_asin: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        asin = str(getattr(row, "asin", "") or "").strip().upper()
+        product = str(getattr(row, "product", "") or "")
+        if asin and product in AMAZON_PRODUCTS:
+            products_by_site_asin.setdefault((str(row.site_code), asin), set()).add(product)
+    return {
+        f"{site}/{asin}": sorted(products)
+        for (site, asin), products in products_by_site_asin.items()
+        if len(products) > 1
+    }
+
+
+def amazon_data_source_mapping_snapshot() -> dict[str, dict[str, str]]:
+    with session_factory()() as db:
+        return amazon_data_source_mapping(db)
+
+
+def amazon_data_source_mapping_fingerprint(mapping: dict[str, dict[str, str]]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted(
+        (site, asin, product)
+        for site, products in mapping.items()
+        for asin, product in products.items()
+    ))
+
+
+def amazon_product(site: str, asin: Any, asin_mapping: dict[str, dict[str, str]] | None = None) -> str | None:
     """Resolve a product from every ASIN candidate returned by LingXing.
 
     The product-performance endpoint returns ``asins`` as an array of objects,
@@ -960,7 +1076,7 @@ def amazon_product(site: str, asin: Any) -> str | None:
     valid performance row whenever the mapped ASIN appeared later in that
     array.
     """
-    mapping = ASIN_MAPPING.get(site, {})
+    mapping = (ASIN_MAPPING if asin_mapping is None else asin_mapping).get(site, {})
 
     def candidates(value: Any):
         if isinstance(value, (list, tuple, set)):
@@ -986,10 +1102,109 @@ def amazon_product(site: str, asin: Any) -> str | None:
     return None
 
 
-def amazon_asins_for_product(site: str, product: str | None) -> list[str]:
+def amazon_asins_for_product(
+    site: str,
+    product: str | None,
+    asin_mapping: dict[str, dict[str, str]] | None = None,
+) -> list[str]:
     if not product:
         return []
-    return [asin for asin, mapped_product in ASIN_MAPPING.get(site, {}).items() if mapped_product == product]
+    return [
+        asin
+        for asin, mapped_product in (ASIN_MAPPING if asin_mapping is None else asin_mapping).get(site, {}).items()
+        if mapped_product == product
+    ]
+
+
+def amazon_data_source_default_asins(site_code: str) -> dict[str, str]:
+    """Build the initial product-to-ASIN seed from the historical static map."""
+
+    defaults: dict[str, str] = {}
+    for asin, product in ASIN_MAPPING.get(site_code, {}).items():
+        normalized = str(asin or "").strip().upper()
+        if normalized and product in AMAZON_PRODUCTS:
+            defaults.setdefault(product, normalized)
+    return defaults
+
+
+def amazon_data_source_asin_rows(rows: Any) -> list[AmazonDataSourceMapping]:
+    """Return catalog rows in the dashboard's canonical site/product order."""
+
+    row_index = {
+        (str(row.site_code), str(row.product)): row
+        for row in rows
+        if str(row.site_code) in AMAZON_SITE_CODES.values() and str(row.product) in AMAZON_PRODUCTS
+    }
+    return [
+        row_index[(AMAZON_SITE_CODES[site_name], product)]
+        for site_name in AMAZON_SITE_ORDER
+        for product in AMAZON_PRODUCTS
+        if (AMAZON_SITE_CODES[site_name], product) in row_index
+    ]
+
+
+def amazon_data_source_row_payload(row: AmazonDataSourceMapping) -> dict[str, Any]:
+    site_name = next((name for name, code in AMAZON_SITE_CODES.items() if code == row.site_code), row.site_code)
+    series = amazon_series(row.product) or row.series
+    return {
+        "site": site_name,
+        "site_code": row.site_code,
+        "model": amazon_data_source_model(row.product),
+        "series": amazon_data_source_series_display(series),
+        "series_key": series,
+        "product": amazon_data_source_product_display(row.product),
+        "product_key": row.product,
+        "asin": str(row.asin or "").strip().upper(),
+        "row_updated_at": edit_metadata(row)["updated_at"],
+        "row_updated_by": row.updated_by,
+    }
+
+
+def initialize_amazon_data_source_mappings(engine) -> None:
+    """Create one editable row for every supported site/product combination.
+
+    Missing rows are seeded from each site's historical static mapping. Existing
+    rows are never rewritten, so clearing an ASIN remains a deliberate cloud edit.
+    """
+
+    Base.metadata.create_all(engine, tables=[AmazonDataSourceMapping.__table__])
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    now = utcnow()
+    with factory() as db:
+        existing_rows = list(db.scalars(select(AmazonDataSourceMapping)))
+        existing = {
+            (row.site_code, row.product)
+            for row in existing_rows
+        }
+        used_site_asins = {
+            (row.site_code, str(row.asin or "").strip().upper())
+            for row in existing_rows
+            if str(row.asin or "").strip()
+        }
+        additions: list[AmazonDataSourceMapping] = []
+        for site_name in AMAZON_SITE_ORDER:
+            site_code = AMAZON_SITE_CODES[site_name]
+            defaults = amazon_data_source_default_asins(site_code)
+            for product in AMAZON_PRODUCTS:
+                if (site_code, product) in existing:
+                    continue
+                default_asin = defaults.get(product)
+                if default_asin and (site_code, default_asin) in used_site_asins:
+                    default_asin = None
+                additions.append(AmazonDataSourceMapping(
+                    site_code=site_code,
+                    model=amazon_data_source_model(product),
+                    series=amazon_series(product) or "",
+                    product=product,
+                    asin=default_asin,
+                    updated_at=now,
+                    updated_by="系统初始化",
+                ))
+                if default_asin:
+                    used_site_asins.add((site_code, default_asin))
+        if additions:
+            db.add_all(additions)
+        db.commit()
 
 
 def amazon_series(product: str | None) -> str | None:
@@ -1474,6 +1689,7 @@ async def amazon_sales_actual_rows(
     selected_series: set[str],
     products: set[str],
     refresh: bool,
+    asin_mapping: dict[str, dict[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fetch sales-dashboard product rows through the existing LingXing path."""
     no_data = {"source": "not_requested", "complete": True, "errors": []}
@@ -1523,6 +1739,7 @@ async def amazon_sales_actual_rows(
         sid_map,
         store_rows,
         performance_currency,
+        asin_mapping,
     )
     periodic_rows = await amazon_convert_sales_money_rows(
         periodic["rows"], requested_currency, actual_end,
@@ -2248,6 +2465,7 @@ def migrate_shared_edit_metadata(engine) -> None:
         AmazonAdPlan.__tablename__,
         AmazonOperationPlan.__tablename__,
         AmazonStrategyNote.__tablename__,
+        AmazonDataSourceMapping.__tablename__,
         AmazonMonthlyTarget.__tablename__,
         AmazonWeeklyTarget.__tablename__,
         KeywordDashboardTerm.__tablename__,
@@ -2281,6 +2499,7 @@ def engine():
         _engine = create_engine(url, pool_pre_ping=True, pool_recycle=300)
         _session_factory = sessionmaker(bind=_engine, expire_on_commit=False)
         Base.metadata.create_all(_engine)
+        initialize_amazon_data_source_mappings(_engine)
         migrate_amazon_monthly_targets(_engine)
         migrate_shared_edit_metadata(_engine)
     return _engine
@@ -3171,6 +3390,7 @@ async def amazon_dashboard_periodic(
     sid_map: dict[str, Any],
     store_rows: list[dict[str, Any]] | None = None,
     display_currency: str = "original",
+    asin_mapping: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     periods = amazon_periods(start_date, end_date, comparison)
     if site is None or site == "" or site == []:
@@ -3194,7 +3414,19 @@ async def amazon_dashboard_periodic(
         raise ValueError(f"不支持的货币：{display_currency}")
     semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     performance_quality: dict[str, Any] = {}
-    cache_key = ("periodic-dashboard-v10-explicit-mcp-currency", comparison, start_date.isoformat(), end_date.isoformat(), tuple(selected_sites), requested_currency, tuple(sorted(selected_series)), tuple(sorted(selected_products)))
+    effective_asin_mapping = ASIN_MAPPING if asin_mapping is None else asin_mapping
+    mapping_fingerprint = amazon_data_source_mapping_fingerprint(effective_asin_mapping)
+    cache_key = (
+        "periodic-dashboard-v11-data-source-mapping",
+        comparison,
+        start_date.isoformat(),
+        end_date.isoformat(),
+        tuple(selected_sites),
+        requested_currency,
+        tuple(sorted(selected_series)),
+        tuple(sorted(selected_products)),
+        mapping_fingerprint,
+    )
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         # Sales-dashboard enrichment reallocates rows in-place after this call.
@@ -3218,7 +3450,7 @@ async def amazon_dashboard_periodic(
             if selected_products == set(AMAZON_PRODUCTS):
                 asin_filter = None
             else:
-                site_mapping = ASIN_MAPPING.get(site_code, {})
+                site_mapping = effective_asin_mapping.get(site_code, {})
                 asin_filter = [asin for asin, product_name in site_mapping.items() if product_name in selected_products]
             all_rows: list[dict[str, Any]] = []
             for account in accounts:
@@ -3291,6 +3523,7 @@ async def amazon_dashboard_periodic(
             product = amazon_product(
                 site_code,
                 raw.get("asin") or raw.get("ASIN") or raw.get("asins") or raw.get("ASINs") or raw,
+                effective_asin_mapping,
             )
             group = amazon_series(product)
             if not group or group not in selected_series or product not in selected_products:
@@ -3303,7 +3536,7 @@ async def amazon_dashboard_periodic(
                     f"产品表现同一分组返回混合币种，拒绝相加：{period_label} {site_name} {group} "
                     f"{item.get('currency')} / {row_currency}"
                 )
-            item["asins"].update(amazon_asins_for_product(site_code, product))
+            item["asins"].update(amazon_asins_for_product(site_code, product, effective_asin_mapping))
             source = raw.get("_source", "performance")
             if source not in AMAZON_SOURCE_FIELDS:
                 continue
@@ -5415,6 +5648,146 @@ def amazon_ads_chart_rows(
     return output
 
 
+@app.get("/api/amazon/data-source/mappings")
+def get_amazon_data_source_mappings(
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Return the complete editable site/product/ASIN matrix."""
+
+    require_business_access(x_sync_key, allow_public=True)
+    with session_factory()() as db:
+        rows = amazon_data_source_asin_rows(list(db.scalars(select(AmazonDataSourceMapping))))
+        conflicts = amazon_data_source_site_conflicts(rows)
+        return {
+            "rows": [amazon_data_source_row_payload(row) for row in rows],
+            "edit": latest_edit_metadata(rows),
+            "data_quality": {
+                "duplicate_site_asins": conflicts,
+                "consistent": not conflicts,
+                "message": (
+                    "存在同一站点内 ASIN 重复的行，请先修正后保存。"
+                    if conflicts else "各站点 ASIN 映射无重复。"
+                ),
+            },
+        }
+
+
+@app.post("/api/amazon/data-source/mappings")
+def save_amazon_data_source_mappings(
+    payload: dict[str, Any] = Body(...),
+    x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
+):
+    """Save dirty ASIN cells and prevent duplicate ASINs within a site."""
+
+    require_business_access(x_sync_key, allow_public=False)
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=422, detail="数据源保存行格式无效")
+    updates: dict[tuple[str, str], str | None] = {}
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="数据源保存行格式无效")
+        site_code = str(raw.get("site_code") or AMAZON_SITE_CODES.get(str(raw.get("site") or "")) or "").strip().upper()
+        if site_code not in AMAZON_SITE_CODES.values():
+            raise HTTPException(status_code=422, detail=f"数据源站点无效：{site_code or '空'}")
+        product = amazon_data_source_product_key(raw.get("product") or raw.get("product_key"))
+        if product not in AMAZON_PRODUCTS:
+            raise HTTPException(status_code=422, detail=f"数据源产品无效：{product or '空'}")
+        key = (site_code, product)
+        if key in updates:
+            raise HTTPException(status_code=422, detail="数据源保存行重复")
+        asin = str(raw.get("asin") or "").strip().upper()
+        if asin and not re.fullmatch(r"B[A-Z0-9]{9}", asin):
+            raise HTTPException(status_code=422, detail=f"ASIN 格式无效：{asin}")
+        updates[key] = asin or None
+
+    with session_factory()() as db:
+        rows = amazon_data_source_asin_rows(list(db.scalars(select(AmazonDataSourceMapping))))
+        expected_keys = {
+            (AMAZON_SITE_CODES[site_name], product)
+            for site_name in AMAZON_SITE_ORDER
+            for product in AMAZON_PRODUCTS
+        }
+        row_keys = {(row.site_code, row.product) for row in rows}
+        if row_keys != expected_keys:
+            missing = expected_keys - row_keys
+            raise HTTPException(status_code=503, detail=f"数据源映射不完整，缺少 {len(missing)} 行")
+
+        latest = max(rows, key=lambda item: item.updated_at or datetime.min, default=None)
+        ensure_edit_freshness(
+            latest,
+            payload.get("base_updated_at"),
+            force=bool(payload.get("force")),
+        )
+        now = utcnow()
+        editor = dashboard_request_editor()
+        changed = 0
+        pending_rows = [
+            row for row in rows
+            if (row.site_code, row.product) in updates
+            and updates[(row.site_code, row.product)] != (str(row.asin or "").strip().upper() or None)
+        ]
+        # Clear the touched cells before applying their final values. This makes
+        # a two-row ASIN swap possible while the database's per-site unique
+        # constraint remains enforced for the final saved state.
+        for row in pending_rows:
+            row.asin = None
+        if pending_rows:
+            db.flush()
+        for row in pending_rows:
+            next_asin = updates[(row.site_code, row.product)]
+            current_asin = str(row.asin or "").strip().upper() or None
+            row.asin = next_asin
+            row.model = amazon_data_source_model(row.product)
+            row.series = amazon_series(row.product) or row.series
+            row.updated_at = now
+            row.updated_by = editor
+            changed += 1
+
+        site_asin_products: dict[tuple[str, str], set[str]] = {}
+        for row in rows:
+            asin = str(row.asin or "").strip().upper()
+            if not asin:
+                continue
+            site_asin_products.setdefault((row.site_code, asin), set()).add(row.product)
+
+        site_conflicts = {
+            f"{site}/{asin}": sorted(products)
+            for (site, asin), products in site_asin_products.items()
+            if len(products) > 1
+        }
+        if site_conflicts:
+            detail = "；".join(f"{key} → {' / '.join(products)}" for key, products in list(site_conflicts.items())[:5])
+            raise HTTPException(status_code=422, detail=f"同一站点内 ASIN 重复，请修正后保存：{detail}")
+
+        if changed:
+            db.commit()
+            db.expire_all()
+            rows = amazon_data_source_asin_rows(list(db.scalars(select(AmazonDataSourceMapping))))
+            latest = max(rows, key=lambda item: item.updated_at or datetime.min, default=None)
+        conflicts = amazon_data_source_site_conflicts(rows)
+        result = {
+            "saved": changed,
+            "rows": [amazon_data_source_row_payload(row) for row in rows],
+            "edit": latest_edit_metadata(rows),
+            "data_quality": {
+                "duplicate_site_asins": conflicts,
+                "consistent": not conflicts,
+                "message": (
+                    "存在同一站点内 ASIN 重复的行，请先修正后保存。"
+                    if conflicts else "各站点 ASIN 映射无重复。"
+                ),
+            },
+        }
+
+    _amazon_cache.clear_namespaces(
+        "amazon-product-dashboard",
+        "amazon-ads-charts",
+        "amazon-sales-targets",
+    )
+    return result
+
+
 @app.get("/api/amazon/ads-charts")
 async def amazon_ads_charts(
     start_week: date | None = Query(default=None),
@@ -5477,6 +5850,7 @@ async def amazon_ads_charts(
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     if start <= fetch_end:
         try:
+            asin_mapping = amazon_data_source_mapping_snapshot()
             periodic = await amazon_dashboard_periodic(
                 "周",
                 start,
@@ -5487,6 +5861,7 @@ async def amazon_ads_charts(
                 sid_map,
                 store_rows,
                 "USD" if len(selected_sites) > 1 else "original",
+                asin_mapping,
             )
             data_quality = dict(periodic.get("data_quality") or {})
         except httpx.HTTPError as exc:
@@ -5685,6 +6060,7 @@ async def amazon_dashboard(
         store_rows = await lingxing_store_rows()
     if refresh:
         _amazon_cache.clear_current_namespace()
+    asin_mapping = amazon_data_source_mapping_snapshot()
     return await amazon_dashboard_periodic(
         comparison,
         start_date,
@@ -5695,6 +6071,7 @@ async def amazon_dashboard(
         sid_map,
         store_rows,
         requested_currency,
+        asin_mapping,
     )
 
 
@@ -5767,6 +6144,7 @@ async def amazon_sales_dashboard(
     actual_end = min(month_end, site_today) if month_start <= site_today else None
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
+    asin_mapping = amazon_data_source_mapping_snapshot()
     if month_start <= site_today:
         try:
             rows, data_quality = await amazon_sales_actual_rows(
@@ -5777,6 +6155,7 @@ async def amazon_sales_dashboard(
                 selected_series,
                 products,
                 refresh,
+                asin_mapping,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
@@ -5802,6 +6181,7 @@ async def amazon_sales_dashboard(
                     selected_series,
                     products,
                     refresh,
+                    asin_mapping,
                 )
             except httpx.HTTPError as exc:
                 raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
@@ -5921,6 +6301,7 @@ async def amazon_sales_weekly_dashboard(
 
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
+    asin_mapping = amazon_data_source_mapping_snapshot()
     try:
         rows, data_quality = await amazon_sales_actual_rows(
             week,
@@ -5930,6 +6311,7 @@ async def amazon_sales_weekly_dashboard(
             selected_series,
             products,
             refresh,
+            asin_mapping,
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
@@ -5953,6 +6335,7 @@ async def amazon_sales_weekly_dashboard(
                 selected_series,
                 products,
                 refresh,
+                asin_mapping,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc

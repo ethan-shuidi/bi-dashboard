@@ -49,6 +49,13 @@
       ]
     },
     {
+      "path": "/api/amazon/data-source/mappings",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
       "path": "/api/keyword-dashboard",
       "methods": [
         "GET"

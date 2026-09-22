@@ -6,6 +6,7 @@ import { loadDashboardRuntimeOnce } from "./dashboardRuntime"
 const AmazonDashboard = defineAsyncComponent(() => import("./AmazonDashboard.vue"))
 const AmazonSalesDashboard = defineAsyncComponent(() => import("./AmazonSalesDashboard.vue"))
 const KeywordDashboard = defineAsyncComponent(() => import("./KeywordDashboard.vue"))
+const AmazonDataSourceDashboard = defineAsyncComponent(() => import("./AmazonDataSourceDashboard.vue"))
 
 let legacyEChartsLoader
 function ensureLegacyECharts() {
@@ -46,6 +47,7 @@ const dashboardNavDefaults = [
   { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
   { key: "amazon-sales", label: "Amazon-销售看板", icon: "◎" },
   { key: "keyword", label: "Amazon-ABA排名", icon: "⌕" },
+  { key: "data-source", label: "数据源", icon: "▦" },
 ]
 const dashboardNavStorageKey = "ideadock.dashboard.navigation-order.v1"
 const dashboardNavItems = ref(normalizeDashboardNavOrder(readDashboardNavOrder()))
@@ -364,6 +366,10 @@ onBeforeUnmount(() => {
                 <circle cx="12" cy="12" r="8" />
                 <path d="M8.3 14.2l2.8-3.1 2 2.1 3-4" />
               </g>
+              <g v-else-if="item.key === 'data-source'" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 5h14v4H5zM5 13h14v6H5z" />
+                <path d="M8 7h.01M8 16h.01" />
+              </g>
               <g v-else fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <circle cx="10.5" cy="10.5" r="6.5" />
                 <path d="M15.4 15.4L20 20" />
@@ -376,6 +382,7 @@ onBeforeUnmount(() => {
       <AmazonDashboard v-if="activeDashboard === 'amazon' && apiBase" class="amazon-dashboard-frame" />
       <AmazonSalesDashboard v-else-if="activeDashboard === 'amazon-sales' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
       <KeywordDashboard v-else-if="activeDashboard === 'keyword' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
+      <AmazonDataSourceDashboard v-else-if="activeDashboard === 'data-source' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
 
       <div v-else class="content-shell">
       <section class="page-header">

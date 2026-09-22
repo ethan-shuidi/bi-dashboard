@@ -28,6 +28,7 @@ from app import (
     ASIN_MAPPING,
     AMAZON_SITE_CODES,
     AMAZON_SITE_ORDER,
+    AmazonDataSourceMapping,
     AmazonMonthlyTarget,
     AmazonWeeklyTarget,
     Base,
@@ -36,6 +37,11 @@ from app import (
     amazon_dashboard_selected_sites,
     amazon_dashboard_sites_or_all,
     amazon_periods,
+    amazon_asins_for_product,
+    amazon_data_source_default_asins,
+    amazon_data_source_mapping,
+    amazon_data_source_product_display,
+    amazon_data_source_series_display,
     amazon_product,
     product_performance_ad_breakdown,
     product_performance_ad_totals,
@@ -153,6 +159,181 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(dashboard_editor(encoded), "编辑者-abc")
         self.assertEqual(dashboard_editor("pytest"), "pytest")
         self.assertEqual(dashboard_editor("100%"), "100%")
+
+    def test_data_source_initialization_builds_the_complete_site_product_matrix(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        app_module.initialize_amazon_data_source_mappings(database)
+
+        with Session(database) as db:
+            rows = list(db.scalars(app_module.select(AmazonDataSourceMapping)))
+            self.assertEqual(len(rows), len(AMAZON_SITE_ORDER) * len(AMAZON_PRODUCTS))
+            by_key = {(row.site_code, row.product): row for row in rows}
+            for site_code, products in ASIN_MAPPING.items():
+                for asin, product in products.items():
+                    self.assertEqual(by_key[(site_code, product)].asin, asin)
+
+            # A deliberately cleared cloud value must not be restored by a
+            # later process restart; only genuinely missing catalog rows seed.
+            cleared = by_key[("US", "TN10-主链接-黑色")]
+            cleared.asin = None
+            db.commit()
+
+        app_module.initialize_amazon_data_source_mappings(database)
+        with Session(database) as db:
+            self.assertEqual(len(list(db.scalars(app_module.select(AmazonDataSourceMapping)))), 180)
+            cleared = db.scalar(app_module.select(AmazonDataSourceMapping).where(
+                AmazonDataSourceMapping.site_code == "US",
+                AmazonDataSourceMapping.product == "TN10-主链接-黑色",
+            ))
+            self.assertIsNone(cleared.asin)
+
+    def test_dynamic_data_source_mapping_drives_filter_and_product_grouping(self):
+        first_product = "TN10-主链接-黑色"
+        second_product = "TN10-主链接-银色"
+        asin = "B000000001"
+        mapping = {"US": {asin: first_product}}
+        self.assertEqual(amazon_product("US", asin, mapping), first_product)
+        self.assertEqual(amazon_asins_for_product("US", first_product, mapping), [asin])
+
+        captured_filters = []
+        original_cache = dict(_amazon_cache)
+        _amazon_cache.clear()
+
+        def fetch_with_mapping(next_mapping):
+            async def fake_fetch(*args):
+                captured_filters.append(args[6])
+                return [{"asin": asin, "volume": 1, "net_amount": 10}]
+
+            with patch("app.fetch_product_performance", new=fake_fetch):
+                return asyncio.run(amazon_dashboard_periodic(
+                    "日", date(2026, 9, 4), date(2026, 9, 4), "美国",
+                    set(AMAZON_SERIES), {first_product, second_product},
+                    {"US": {"sid": 1}}, asin_mapping=next_mapping,
+                ))
+
+        try:
+            first = fetch_with_mapping(mapping)
+            self.assertEqual(captured_filters[-1], [asin])
+            self.assertEqual([row["product"] for row in first["rows"]], [first_product])
+
+            remapped = {site: dict(products) for site, products in mapping.items()}
+            remapped["US"][asin] = second_product
+            second = fetch_with_mapping(remapped)
+            self.assertEqual(captured_filters[-1], [asin])
+            self.assertEqual([row["product"] for row in second["rows"]], [second_product])
+        finally:
+            _amazon_cache.clear()
+            _amazon_cache.update(original_cache)
+
+    def test_data_source_endpoint_saves_valid_rows_and_rejects_site_duplicates(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        app_module.initialize_amazon_data_source_mappings(database)
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+
+        with patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}), \
+             TestClient(app_module.app) as client:
+            initial = client.get("/api/amazon/data-source/mappings")
+            self.assertEqual(initial.status_code, 200)
+            body = initial.json()
+            self.assertEqual(len(body["rows"]), 180)
+            self.assertTrue(body["data_quality"]["consistent"])
+
+            base_version = body["edit"]["updated_at"]
+            saved = client.post("/api/amazon/data-source/mappings", json={
+                "items": [{
+                    "site_code": "MX",
+                    "product": "TN10-主-黑",
+                    "asin": "B000000001",
+                }],
+                "base_updated_at": base_version,
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
+            self.assertEqual(saved.status_code, 200)
+            saved_body = saved.json()
+            self.assertEqual(saved_body["saved"], 1)
+            self.assertEqual(
+                next(row["asin"] for row in saved_body["rows"] if row["site_code"] == "MX" and row["product"] == "TN10-主-黑"),
+                "B000000001",
+            )
+
+            next_version = saved_body["edit"]["updated_at"]
+            duplicate = client.post("/api/amazon/data-source/mappings", json={
+                "items": [
+                    {"site_code": "MX", "product": "TN10-主-银", "asin": "B000000001"},
+                ],
+                "base_updated_at": next_version,
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
+            self.assertEqual(duplicate.status_code, 422)
+            self.assertIn("同一站点内 ASIN 重复", duplicate.json()["detail"])
+
+            # The same ASIN in another site is intentionally allowed.
+            cross_site = client.post("/api/amazon/data-source/mappings", json={
+                "items": [
+                    {"site_code": "IE", "product": "TN20-主-黑", "asin": "B000000001"},
+                ],
+                "base_updated_at": next_version,
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
+            self.assertEqual(cross_site.status_code, 200)
+
+            invalid = client.post("/api/amazon/data-source/mappings", json={
+                "items": [{"site_code": "MX", "product": "TN10-主-橙", "asin": "BAD"}],
+                "base_updated_at": cross_site.json()["edit"]["updated_at"],
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
+            self.assertEqual(invalid.status_code, 422)
+            self.assertIn("ASIN 格式无效", invalid.json()["detail"])
+
+        with Session(database) as db:
+            mx = db.scalar(app_module.select(AmazonDataSourceMapping).where(
+                AmazonDataSourceMapping.site_code == "MX",
+                AmazonDataSourceMapping.product == "TN10-主链接-黑色",
+            ))
+            ie = db.scalar(app_module.select(AmazonDataSourceMapping).where(
+                AmazonDataSourceMapping.site_code == "IE",
+                AmazonDataSourceMapping.product == "TN20-主链接-黑色",
+            ))
+            self.assertEqual(mx.asin, "B000000001")
+            self.assertEqual(ie.asin, "B000000001")
+            self.assertEqual(mx.updated_by, "pytest")
+
+    def test_data_source_endpoint_supports_asin_swap_within_one_site(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        app_module.initialize_amazon_data_source_mappings(database)
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+
+        with patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             patch.dict(os.environ, {"SYNC_API_KEY": "test-key"}), \
+             TestClient(app_module.app) as client:
+            initial = client.get("/api/amazon/data-source/mappings").json()
+            by_key = {(row["site_code"], row["product_key"]): row for row in initial["rows"]}
+            black = by_key[("US", "TN10-主链接-黑色")]
+            silver = by_key[("US", "TN10-主链接-银色")]
+            self.assertNotEqual(black["asin"], silver["asin"])
+
+            response = client.post("/api/amazon/data-source/mappings", json={
+                "items": [
+                    {**black, "asin": silver["asin"]},
+                    {**silver, "asin": black["asin"]},
+                ],
+                "base_updated_at": initial["edit"]["updated_at"],
+            }, headers={"X-Sync-Key": "test-key", "X-Dashboard-Editor": "pytest"})
+            self.assertEqual(response.status_code, 200)
+            result = {(row["site_code"], row["product_key"]): row["asin"] for row in response.json()["rows"]}
+            self.assertEqual(result[("US", "TN10-主链接-黑色")], silver["asin"])
+            self.assertEqual(result[("US", "TN10-主链接-银色")], black["asin"])
 
     def test_lingxing_mcp_result_decodes_text_business_payload(self):
         payload = {
@@ -1202,7 +1383,10 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
         }
         periodic_mock = AsyncMock()
-        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=periodic_mock):
+        with patch.dict(os.environ, env), \
+             patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), \
+             patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+             patch("app.amazon_dashboard_periodic", new=periodic_mock):
             result = asyncio.run(amazon_ads_charts(
                 date(2099, 1, 4),
                 date(2099, 1, 4),
@@ -1819,7 +2003,10 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
         }
         periodic_mock = AsyncMock(return_value=periodic)
-        with patch.dict(os.environ, env), patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), patch("app.amazon_dashboard_periodic", new=periodic_mock):
+        with patch.dict(os.environ, env), \
+             patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), \
+             patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+             patch("app.amazon_dashboard_periodic", new=periodic_mock):
             result = asyncio.run(amazon_ads_charts(
                 date(2026, 9, 7),
                 date(2026, 9, 7),
