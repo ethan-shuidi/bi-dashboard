@@ -1,4 +1,5 @@
 import { ElMessageBox } from "element-plus"
+import { ensureDashboardRuntimeCurrent, isDashboardRuntimeStaleError } from "./dashboardRuntime.js"
 
 const editorStorageKey = "ideadock.dashboard.editor-id.v1"
 const anonymousEditorPrefix = "Editor"
@@ -90,6 +91,7 @@ function safeHeaders(headers, { preserveProtectedHeaders = false } = {}) {
 }
 
 const writeTokenStates = new Map()
+const dashboardFetchRetryDelayMilliseconds = 250
 
 function dashboardWriteTokenUrl(url) {
   return new URL("/api/dashboard/write-token", dashboardRequestUrl(url)).toString()
@@ -119,18 +121,31 @@ function dashboardRequestUrl(url) {
 }
 
 async function requestDashboardWriteToken(editor, targetUrl) {
-  const response = await fetch(dashboardWriteTokenUrl(targetUrl), {
-    cache: "no-store",
-    credentials: "omit",
-    mode: "cors",
-    redirect: "error",
-    headers: safeHeaders({ "X-Dashboard-Editor": editor }, { preserveProtectedHeaders: true }),
-  })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new DashboardApiError(dashboardApiErrorMessage(body, response.status), response.status, body)
+  const tokenUrl = dashboardWriteTokenUrl(targetUrl)
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let response
+    try {
+      response = await fetch(tokenUrl, {
+        cache: "no-store",
+        credentials: "omit",
+        mode: "cors",
+        redirect: "error",
+        headers: safeHeaders({ "X-Dashboard-Editor": editor }, { preserveProtectedHeaders: true }),
+      })
+    } catch (error) {
+      if (attempt === 0 && isRetryableDashboardFetchError(error)) {
+        await waitForDashboardFetchRetry()
+        continue
+      }
+      throw normalizeDashboardFetchError(error, tokenUrl, "write-token")
+    }
+    const body = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new DashboardApiError(dashboardApiErrorMessage(body, response.status), response.status, body)
+    }
+    return body
   }
-  return body
+  throw new DashboardApiError("看板写权限获取失败", 502)
 }
 
 function writeTokenState(tokenUrl) {
@@ -203,35 +218,86 @@ function dashboardHeaders(writeToken = null) {
   }, { preserveProtectedHeaders: true })
 }
 
+function isRetryableDashboardFetchError(error) {
+  return error instanceof TypeError
+}
+
+function waitForDashboardFetchRetry() {
+  return new Promise((resolve) => setTimeout(resolve, dashboardFetchRetryDelayMilliseconds))
+}
+
+function normalizeDashboardFetchError(error, requestUrl, phase) {
+  if (isDashboardRuntimeStaleError(error)) {
+    throw new DashboardApiError(error.message, 409, { detail: { code: "stale_runtime", message: error.message } })
+  }
+  if (error instanceof DashboardApiError) throw error
+
+  let hostname = ""
+  try {
+    hostname = new URL(requestUrl).hostname
+  } catch {
+    hostname = ""
+  }
+  const target = hostname ? `（${hostname}）` : ""
+  const action = phase === "write-token" ? "看板写权限服务" : "看板服务"
+  const message = error?.name === "AbortError"
+    ? "看板请求已取消，当前内容已保留。"
+    : `无法连接${action}${target}。当前内容已保留；请检查网络后重试；若持续失败，请完整刷新 IdeaDock 预览页后再保存。`
+  throw new DashboardApiError(message, 0, {
+    detail: {
+      code: "network_error",
+      message,
+      phase,
+    },
+  })
+}
+
+async function dashboardFetch(requestUrl, options, phase, attempts, trustedHeaders) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fetch(requestUrl, {
+        ...options,
+        cache: "no-store",
+        credentials: "omit",
+        mode: "cors",
+        redirect: "error",
+        headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...trustedHeaders }, { preserveProtectedHeaders: true }),
+      })
+    } catch (error) {
+      if (attempt + 1 < attempts && isRetryableDashboardFetchError(error) && options?.signal?.aborted !== true) {
+        await waitForDashboardFetchRetry()
+        continue
+      }
+      throw normalizeDashboardFetchError(error, requestUrl, phase)
+    }
+  }
+  throw new DashboardApiError(`无法连接${phase === "write-token" ? "看板写权限服务" : "看板服务"}`, 0)
+}
+
+async function ensureCurrentDashboardRuntimeSafely({ force = false } = {}) {
+  try {
+    await ensureDashboardRuntimeCurrent({ force })
+  } catch (error) {
+    throw normalizeDashboardFetchError(error, globalThis.location?.href || "", "runtime")
+  }
+}
+
 export async function fetchWithDashboardAuth(url, options = {}) {
   const requestUrl = dashboardRequestUrl(url)
   const method = String(options.method || "GET").toUpperCase()
   const isWriteMethod = method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
+  await ensureCurrentDashboardRuntimeSafely({ force: isWriteMethod })
   let writeToken = null
   let headers = dashboardHeaders()
   if (isWriteMethod) {
     writeToken = await ensureDashboardWriteToken(url)
     headers = dashboardHeaders(writeToken)
   }
-  let response = await fetch(requestUrl, {
-    ...options,
-    cache: "no-store",
-    credentials: "omit",
-    mode: "cors",
-    redirect: "error",
-    headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...headers }, { preserveProtectedHeaders: true }),
-  })
+  let response = await dashboardFetch(requestUrl, options, "request", isWriteMethod ? 1 : 2, headers)
   if (response.status === 401 && isWriteMethod && writeToken) {
     invalidateDashboardWriteToken(url)
     writeToken = await ensureDashboardWriteToken(url)
-    response = await fetch(requestUrl, {
-      ...options,
-      cache: "no-store",
-      credentials: "omit",
-      mode: "cors",
-      redirect: "error",
-      headers: safeHeaders({ ...safeHeaders(options.headers || {}), ...dashboardHeaders(writeToken) }, { preserveProtectedHeaders: true }),
-    })
+    response = await dashboardFetch(requestUrl, options, "request", 1, dashboardHeaders(writeToken))
   }
   return response
 }

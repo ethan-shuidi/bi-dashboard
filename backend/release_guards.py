@@ -31,6 +31,11 @@ def _check_frontend_write_auth(errors: list[str]) -> None:
         "headerEntries",
         "safeHttpHeaderName",
         "dashboardRequestUrl",
+        "dashboardFetchRetryDelayMilliseconds",
+        "isDashboardRuntimeStaleError",
+        "normalizeDashboardFetchError",
+        "network_error",
+        "stale_runtime",
         'cache: "no-store"',
         'credentials: "omit"',
         'mode: "cors"',
@@ -51,6 +56,16 @@ def _check_frontend_runtime(errors: list[str]) -> None:
         errors.append("运行配置加载器缺少后端健康状态校验")
     if "生产环境后端必须使用 HTTPS" not in runtime_source:
         errors.append("生产运行配置必须强制 HTTPS")
+    for fragment in (
+        "/api/kratos/idea-dock/previews/resolve",
+        "DashboardRuntimeStaleError",
+        "ensureDashboardRuntimeCurrent",
+        "runtimeFreshnessCheckedAt",
+    ):
+        if fragment not in runtime_source:
+            errors.append(f"运行配置加载器缺少发布保护片段：{fragment}")
+    if "isWriteMethod ? 1 : 2" not in _source("frontend/src/dashboardAuth.js"):
+        errors.append("保存请求不得在网络断开时自动重发")
 
     for relative_path in ("frontend/src/App.vue", "frontend/src/AmazonDashboard.vue"):
         source = _source(relative_path)
@@ -192,6 +207,9 @@ def _check_dist_if_present(errors: list[str]) -> None:
         errors.append("构建产物不允许携带长期同步密钥请求头")
     if re.search(r"VITE_[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)", all_javascript):
         errors.append("构建产物疑似包含前端构建凭据")
+    for fragment in ("/api/kratos/idea-dock/previews/resolve", "stale_runtime", "network_error"):
+        if fragment not in all_javascript:
+            errors.append(f"构建产物缺少保存链路保护片段：{fragment}")
 
 
 def run_all_checks() -> list[str]:

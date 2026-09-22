@@ -117,6 +117,111 @@ test("write requests refresh the short-lived token once after 401", async () => 
   }
 })
 
+test("write-token requests retry once after a transient network failure", async () => {
+  requests.length = 0
+  const originalFetch = globalThis.fetch
+  let tokenCalls = 0
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith("/api/dashboard/write-token")) {
+      tokenCalls += 1
+      if (tokenCalls === 1) throw new TypeError("Failed to fetch")
+    }
+    return originalFetch(url, init)
+  }
+  try {
+    const response = await fetchWithDashboardAuth("https://token-retry.example.test/api/amazon/ad-plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })
+    assert.equal(response.status, 200)
+    assert.equal(tokenCalls, 2)
+    assert.equal(requests.filter((request) => request.url.endsWith("/api/dashboard/write-token")).length, 1)
+    assert.equal(requests.filter((request) => !request.url.endsWith("/api/dashboard/write-token")).length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("write requests do not auto-retry and never expose raw Failed to fetch", async () => {
+  requests.length = 0
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith("/api/dashboard/write-token")) return originalFetch(url, init)
+    requests.push({ url: String(url), headers: { ...(init.headers || {}) } })
+    throw new TypeError("Failed to fetch")
+  }
+  try {
+    await assert.rejects(
+      fetchWithDashboardAuth("https://write-network-failure.example.test/api/amazon/ad-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }),
+      (error) => {
+        assert.ok(error instanceof DashboardApiError)
+        assert.equal(error.status, 0)
+        assert.equal(error.payload.detail.code, "network_error")
+        assert.equal(error.message.includes("Failed to fetch"), false)
+        assert.equal(error.message.includes("当前内容已保留"), true)
+        return true
+      },
+    )
+    assert.equal(requests.filter((request) => !request.url.endsWith("/api/dashboard/write-token")).length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("stale preview runtimes are blocked before a write is sent", async () => {
+  requests.length = 0
+  const originalFetch = globalThis.fetch
+  const previousLocation = globalThis.location
+  const previousParent = globalThis.window.parent
+  globalThis.location = {
+    href: "https://ideadock.example.test/api/kratos/idea-dock/preview-runtime/v_old/",
+    pathname: "/api/kratos/idea-dock/preview-runtime/v_old/",
+  }
+  globalThis.window.parent = {
+    location: {
+      href: "https://ideadock.example.test/idea-dock/#/preview/t_current",
+    },
+  }
+  globalThis.fetch = async (url, init = {}) => {
+    requests.push({ url: String(url), headers: { ...(init.headers || {}) } })
+    return {
+      ok: true,
+      json: async () => ({
+        code: 0,
+        data: {
+          runtime_id: "v_current",
+          iframe_url: "/api/kratos/idea-dock/preview-runtime/v_current/",
+        },
+      }),
+    }
+  }
+  try {
+    await assert.rejects(
+      fetchWithDashboardAuth("https://backend.example.test/api/amazon/ad-plan", {
+        method: "POST",
+        body: "{}",
+      }),
+      (error) => {
+        assert.ok(error instanceof DashboardApiError)
+        assert.equal(error.status, 409)
+        assert.equal(error.payload.detail.code, "stale_runtime")
+        assert.equal(error.message.includes("完整刷新页面"), true)
+        return true
+      },
+    )
+    assert.deepEqual(requests.map((request) => request.url), ["/api/kratos/idea-dock/previews/resolve"])
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.location = previousLocation
+    globalThis.window.parent = previousParent
+  }
+})
+
 test("unsafe dashboard request URLs are rejected before fetching", async () => {
   requests.length = 0
   await assert.rejects(
