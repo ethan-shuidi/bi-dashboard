@@ -304,6 +304,7 @@
 .column-config-panel-floating{position:fixed!important;top:auto;right:auto;bottom:auto;left:auto;z-index:2147483647!important;max-height:min(420px,calc(100vh - 24px));overflow:auto}
 .strategy-save-all-notes{min-height:34px;white-space:nowrap}
 .strategy-note-editor textarea{flex:1;min-width:0}
+.strategy-note-unsaved{flex:0 0 auto;padding:3px 5px;border-radius:999px;background:#fff1c8;color:#865c00;font-size:10px;font-weight:750;line-height:1}
 
 /* Amazon sales dashboard and draggable navigation ordering. */
 .dashboard-nav-item{cursor:grab}

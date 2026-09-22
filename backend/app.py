@@ -4370,7 +4370,10 @@ def save_strategy_notes_batch(
     items = payload.get("items")
     if not isinstance(items, list) or len(items) > 500:
         raise HTTPException(status_code=422, detail="策略备注批量参数无效")
+    if not items:
+        raise HTTPException(status_code=422, detail="策略备注批量保存内容不能为空")
     normalized = []
+    normalized_keys: set[tuple[str, str, str]] = set()
     for raw in items:
         if not isinstance(raw, dict):
             raise HTTPException(status_code=422, detail="策略备注批量参数无效")
@@ -4379,6 +4382,10 @@ def save_strategy_notes_batch(
         strategy = normalize_strategy(raw.get("strategy"))
         if site_code not in AMAZON_SITE_CODES.values() or series not in ("", *AMAZON_SERIES) or strategy not in AMAZON_STRATEGY_OPTIONS:
             raise HTTPException(status_code=422, detail="策略备注参数无效")
+        key = (site_code, series, strategy)
+        if key in normalized_keys:
+            raise HTTPException(status_code=422, detail="策略备注存在重复的策略/系列保存键")
+        normalized_keys.add(key)
         normalized.append((site_code, series, strategy, str(raw.get("note") or "")))
     with session_factory()() as db:
         force = bool(payload.get("force"))

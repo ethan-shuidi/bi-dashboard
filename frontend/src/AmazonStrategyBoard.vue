@@ -11,7 +11,7 @@ const DEFAULT_SERIES = ["TN10系列（主链接）汇总", "TN10系列（小链�
 const STRATEGIES = ["品类词", "品牌防御", "竞品词", "自动", "SB/SBV", "SD", "B2B", "bundle", "/"]
 const currencySymbols = { USD: "$", JPY: "¥", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", SEK: "kr", MXN: "MX$", PLN: "zł" }
 const rows = ref([]); const previousRows = ref([]); const stores = ref([]); const seriesOptions = ref([...DEFAULT_SERIES])
-const loading = ref(false); const error = ref(""); const saveError = ref(""); const saving = ref(""); const toast = ref(""); const expanded = ref(new Set()); const noteDrafts = ref({}); const campaignDrafts = ref({})
+const loading = ref(false); const error = ref(""); const saveError = ref(""); const saving = ref(""); const toast = ref(""); const expanded = ref(new Set()); const noteDrafts = ref({}); const noteCloudValues = ref({}); const campaignDrafts = ref({})
 const campaignEdit = ref({ updated_at: null, updated_by: null }); const noteEdit = ref({ updated_at: null, updated_by: null })
 const campaignBaseUpdatedAt = ref(null); const noteBaseUpdatedAt = ref(null)
 const strategySite = ref("美国"); const strategyStore = ref(""); const strategySeries = ref(""); const strategyWeekStart = ref("")
@@ -75,6 +75,10 @@ const previousSummaryMetrics = computed(() => aggregateStrategyMetrics(previousR
 const summaryCurrency = computed(() => new Set(rows.value.map((row) => row.currency).filter(Boolean)).size > 1 ? "MIXED" : rows.value[0]?.currency || "")
 const previousStrategyByKey = computed(() => new Map(previousRows.value.map((row) => [groupKey(row), row])))
 const previousCampaignByKey = computed(() => new Map(previousRows.value.flatMap((row) => row.campaigns || []).map((campaign) => [campaignKey(campaign), campaign])))
+function noteCloudValue(row) { return noteCloudValues.value[strategyNoteStorageKey(row)] ?? row.note ?? "" }
+function strategyNoteStorageKey(row) { return `${strategyWeekStart.value}:${row.site_code}:${row.series || ""}:${row.strategy}` }
+const changedNoteRows = computed(() => rows.value.filter((row) => Object.prototype.hasOwnProperty.call(noteDrafts.value, noteKey(row)) && noteDrafts.value[noteKey(row)] !== noteCloudValue(row)))
+const changedNoteCount = computed(() => changedNoteRows.value.length)
 function previousWeekStart() { const date = new Date(); date.setHours(0, 0, 0, 0); date.setDate(date.getDate() - ((date.getDay() + 6) % 7) - 7); return formatLocalDate(date) }
 function monday(value) { const date = new Date(`${value}T00:00:00`); if (Number.isNaN(date.getTime())) return previousWeekStart(); date.setDate(date.getDate() - ((date.getDay() + 6) % 7)); return formatLocalDate(date) }
 function compare(left, right, direction) { const a = Number(left); const b = Number(right); if (Number.isNaN(a) && Number.isNaN(b)) return 0; if (Number.isNaN(a)) return 1; if (Number.isNaN(b)) return -1; return direction === "asc" ? a - b : b - a }
@@ -200,20 +204,61 @@ function showSaveError(message) {
   showToast("保存未执行，请查看弹窗提示")
 }
 function noteValue(row) { return noteDrafts.value[noteKey(row)] ?? row.note ?? "" }
+function isNoteDirty(row) { return noteDrafts.value[noteKey(row)] !== undefined && noteDrafts.value[noteKey(row)] !== noteCloudValue(row) }
+function clearNoteSaveError() { if (saveError.value) saveError.value = "" }
+function resetNoteDraftsToCloud(targetRows = rows.value) {
+  const nextDrafts = { ...noteDrafts.value }
+  targetRows.forEach((row) => { nextDrafts[noteKey(row)] = noteCloudValue(row) })
+  noteDrafts.value = nextDrafts
+}
+function strategyNotePayload(row) {
+  return { week_start: strategyWeekStart.value, site_code: row.site_code, series: row.series || "", strategy: row.strategy, note: noteValue(row) }
+}
 async function saveAllNotes({ force = false } = {}) {
-  const items = rows.value.map((row) => ({ week_start: strategyWeekStart.value, site_code: row.site_code, series: row.series || "", strategy: row.strategy, note: noteValue(row) }))
-  if (!items.length) { showToast("当前筛选范围没有策略"); return }
+  const sourceRows = changedNoteRows.value
+  const itemsByKey = new Map()
+  for (const row of sourceRows) {
+    const item = strategyNotePayload(row)
+    const key = `${item.week_start}:${item.site_code}:${item.series}:${item.strategy}`
+    const previous = itemsByKey.get(key)
+    if (previous && previous.note !== item.note) {
+      showSaveError("当前筛选结果中存在重复的策略/系列保存键，且优化方向不一致。为避免覆盖，请刷新后重新填写。")
+      return
+    }
+    itemsByKey.set(key, item)
+  }
+  const items = [...itemsByKey.values()]
+  if (!rows.value.length) { showToast("当前筛选范围没有策略"); return }
+  if (!items.length) { showToast("没有需要保存的优化方向"); return }
   saving.value = "notes"; saveError.value = ""
   try {
     const data = await apiWithDashboardAuth(`${props.apiBase}/api/amazon/strategy-board/notes/batch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ week_start: strategyWeekStart.value, items, base_updated_at: noteBaseUpdatedAt.value, force }) })
-    rows.value.forEach((row) => { row.note = noteValue(row) })
-    noteEdit.value = { updated_at: data.updated_at || null, updated_by: data.updated_by || null }
-    noteBaseUpdatedAt.value = data.updated_at || noteBaseUpdatedAt.value
-    showToast(`已保存 ${data.saved || items.length} 条优化方向`)
+    const verified = await fetchStrategyBoard(strategyWeekStart.value)
+    const remoteNotes = new Map((verified.strategies || []).map((row) => [strategyNoteStorageKey(row), row.note || ""]))
+    const mismatched = items.filter((item) => {
+      const key = `${item.week_start}:${item.site_code}:${item.series}:${item.strategy}`
+      return remoteNotes.get(key) !== item.note
+    })
+    if (mismatched.length) {
+      saveError.value = `云端回读校验失败：${mismatched.length} 条优化方向与刚提交内容不一致。本地草稿已保留，请点击刷新查看云端内容后重试。`
+      showToast("保存后回读校验失败，请查看弹窗提示")
+      return
+    }
+    rows.value.forEach((row) => {
+      const key = strategyNoteStorageKey(row)
+      const savedItem = itemsByKey.get(key)
+      if (savedItem) row.note = savedItem.note
+    })
+    const nextCloudValues = { ...noteCloudValues.value }
+    items.forEach((item) => { nextCloudValues[`${item.week_start}:${item.site_code}:${item.series}:${item.strategy}`] = item.note })
+    noteCloudValues.value = nextCloudValues
+    noteEdit.value = verified.edit_versions?.notes || { updated_at: data.updated_at || null, updated_by: data.updated_by || null }
+    noteBaseUpdatedAt.value = noteEdit.value.updated_at || data.updated_at || noteBaseUpdatedAt.value
+    showToast(`已保存并回读确认 ${data.saved || items.length} 条优化方向`)
   } catch (exception) {
     const action = await chooseEditConflictAction(exception)
     if (action === "overwrite") return saveAllNotes({ force: true })
-    if (action === "reload") await load()
+    if (action === "reload") { resetNoteDraftsToCloud(); await load() }
     if (action === "cancel") showToast("已保留本地草稿，未覆盖云端内容")
     if (action === "not-conflict") saveError.value = exception.message || "优化方向保存失败"
   } finally { saving.value = "" }
@@ -285,12 +330,19 @@ async function load() {
     noteEdit.value = data.edit_versions?.notes || { updated_at: null, updated_by: null }
     campaignBaseUpdatedAt.value = campaignEdit.value.updated_at || null
     noteBaseUpdatedAt.value = noteEdit.value.updated_at || null
-    const nextDrafts = {}; const nextCampaignDrafts = {}
+    const nextDrafts = { ...noteDrafts.value }; const nextCloudValues = { ...noteCloudValues.value }; const nextCampaignDrafts = {}
     rows.value.forEach((row) => {
-      nextDrafts[noteKey(row)] = row.note || ""
+      const key = strategyNoteStorageKey(row)
+      const cloudNote = row.note || ""
+      const draftKey = noteKey(row)
+      const hadCloudValue = Object.prototype.hasOwnProperty.call(nextCloudValues, key)
+      const existingDraft = nextDrafts[draftKey]
+      const hasUnsavedDraft = hadCloudValue && existingDraft !== undefined && existingDraft !== nextCloudValues[key]
+      nextDrafts[draftKey] = hasUnsavedDraft ? existingDraft : cloudNote
+      nextCloudValues[key] = cloudNote
       ;(row.campaigns || []).forEach((campaign) => { nextCampaignDrafts[campaignKey(campaign)] = { strategy: campaign.strategy || row.strategy || "/", series: campaign.series || row.series || "" } })
     })
-    noteDrafts.value = nextDrafts; campaignDrafts.value = nextCampaignDrafts
+    noteDrafts.value = nextDrafts; noteCloudValues.value = nextCloudValues; campaignDrafts.value = nextCampaignDrafts
   } catch (e) {
     if (requestSeq === strategyRequestSeq) error.value = e.message || "广告策略看板加载失败"
   } finally {
@@ -315,7 +367,13 @@ onMounted(async () => {
   await nextTick()
   await loadStores()
 })
-onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", updateConfigPosition, true); window.removeEventListener("resize", updateConfigPosition); if (toastTimer) window.clearTimeout(toastTimer) })
+function warnUnsavedNotesBeforeUnload(event) {
+  if (!changedNoteCount.value) return
+  event.preventDefault()
+  event.returnValue = ""
+}
+onMounted(() => window.addEventListener("beforeunload", warnUnsavedNotesBeforeUnload))
+onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", updateConfigPosition, true); window.removeEventListener("resize", updateConfigPosition); window.removeEventListener("beforeunload", warnUnsavedNotesBeforeUnload); if (toastTimer) window.clearTimeout(toastTimer) })
 </script>
 
 <template>
@@ -325,11 +383,11 @@ onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", 
       <span>广告策略分类：{{ formatDashboardEditMetadata(campaignEdit) }}</span>
       <span>优化方向：{{ formatDashboardEditMetadata(noteEdit) }}</span>
     </div>
-    <div class="strategy-filter-bar"><label class="week-filter"><span>周 <b class="week-filter-code">{{ strategyWeekRangeLabel }}</b></span><div class="week-picker-control"><WeekPicker v-model="strategyWeekStart" @change="onWeekChange"/></div></label><label><span>站点</span><el-select v-model="strategySite" @change="onStrategySiteChange"><el-option v-for="item in orderedSites" :key="item" :label="item" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>店铺（可不选）</span><el-select v-model="strategyStore" clearable placeholder="全部店铺"><el-option v-for="item in availableStores" :key="item.sid" :label="`${item.name}（${item.sid}）`" :value="String(item.sid)" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>系列</span><el-select v-model="strategySeries" clearable placeholder="全部系列"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><button class="campaign-batch-save-button" type="button" :disabled="loading || saving === 'campaigns' || !campaignCount" @click="saveAllCampaigns()">{{ saving === "campaigns" ? "保存中" : "保存所有广告策略分类" }}</button></div>
+    <div class="strategy-filter-bar"><label class="week-filter"><span>周 <b class="week-filter-code">{{ strategyWeekRangeLabel }}</b></span><div class="week-picker-control"><WeekPicker v-model="strategyWeekStart" @change="onWeekChange"/></div></label><label><span>站点</span><el-select v-model="strategySite" @change="onStrategySiteChange"><el-option v-for="item in orderedSites" :key="item" :label="item" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>店铺（可不选）</span><el-select v-model="strategyStore" clearable placeholder="全部店铺"><el-option v-for="item in availableStores" :key="item.sid" :label="`${item.name}（${item.sid}）`" :value="String(item.sid)" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><label><span>系列</span><el-select v-model="strategySeries" clearable placeholder="全部系列"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item" /></el-select><small class="filter-meta-spacer" aria-hidden="true"></small></label><button class="campaign-batch-save-button" type="button" title="仅保存广告活动的策略/系列分类，不保存优化方向" :disabled="loading || saving === 'campaigns' || !campaignCount" @click="saveAllCampaigns()">{{ saving === "campaigns" ? "保存中" : "保存所有广告策略分类" }}</button></div>
     <Teleport to="body"><div v-if="configOpen" class="strategy-config-panel strategy-config-panel-floating" role="dialog" aria-label="广告策略列配置" :style="{ top: `${configPosition.top}px`, left: `${configPosition.left}px` }"><button v-for="column in columns" :key="column.key" type="button" @click="toggleColumn(column)"><span>{{ column.label }}</span><span>{{ visible[column.key] ? "◉" : "○" }}</span></button></div></Teleport>
     <DashboardState v-if="error" role="alert" state="error" title="广告策略看板加载失败" :message="error" />
     <DashboardState v-else-if="loading" state="loading" title="正在同步广告后台数据" message="正在读取广告活动、分类和优化方向，请稍候。" />
-    <DashboardState v-else-if="!groups.length" state="empty" title="暂无广告活动数据" message="当前筛选范围内没有广告活动，可调整周、站点、店铺或系列后重试。" /><div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined" @wheel="handleTableWheel"><table class="strategy-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><colgroup><col :style="{ width: `${nameColumnWidth}px` }"><col v-for="column in visibleColumns" :key="column.key" :style="{ width: `${widths[column.key]}px` }"><col :style="{ width: `${noteColumnWidth}px` }"></colgroup><thead><tr><th class="strategy-name-column">策略 / 系列<i class="strategy-resize-handle" title="拖动调整策略 / 系列列宽" @pointerdown="startNameResize"></i></th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column"><div class="strategy-note-header"><span>优化方向</span><button class="strategy-note-save strategy-save-all-notes" type="button" :disabled="loading || saving === 'notes' || !groups.length" @click="saveAllNotes()">{{ saving === "notes" ? "保存中" : "保存所有优化方向" }}</button></div><i class="strategy-resize-handle" title="拖动调整优化方向列宽" @pointerdown="startNoteResize"></i></th></tr></thead><tbody><template v-for="row in pagedGroups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ groupMeta(row) }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(row.metrics?.[column.key], column, row.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', rowComparison(row, column)?.status]">{{ rowComparison(row, column)?.text }}</span></div></td><td class="strategy-note-cell"><div class="strategy-note-editor"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…" @input="resizeNote"></textarea></div></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}`" :class="['strategy-campaign-row', { invalid: classificationError(campaignDraftFor(row, campaign).strategy, campaignDraftFor(row, campaign).series) }]"><td class="strategy-name-column campaign-assignment-cell"><div class="campaign-selectors"><el-select :model-value="campaignDraftFor(row, campaign).strategy" size="small" @change="setCampaignDraft(campaign, 'strategy', $event)"><el-option v-for="option in STRATEGIES" :key="option" :label="option" :value="option" /></el-select><el-select :model-value="campaignDraftFor(row, campaign).series" size="small" clearable placeholder="系列" @change="setCampaignDraft(campaign, 'series', $event)"><el-option v-for="option in seriesOptions" :key="option" :label="displaySeries(option)" :value="option" /></el-select></div><button type="button" class="campaign-name" :title="`Campaign ID：${campaign.campaign_id}，点击复制`" @click="copyCampaignId(campaign)">{{ campaign.campaign_name || `未命名广告活动 · ${campaign.campaign_id}` }}</button><small class="campaign-meta">{{ campaign.store_name || (campaign.store_sid ? `店铺 ${campaign.store_sid}` : "店铺信息缺失") }} · {{ campaign.ad_type || "广告活动" }} · ID {{ campaign.campaign_id }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(campaign[column.key], column, campaign.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', campaignComparison(campaign, column)?.status]">{{ campaignComparison(campaign, column)?.text }}</span></div></td><td></td></tr></template></template></tbody>
+    <DashboardState v-else-if="!groups.length" state="empty" title="暂无广告活动数据" message="当前筛选范围内没有广告活动，可调整周、站点、店铺或系列后重试。" /><div v-else class="strategy-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined" @wheel="handleTableWheel"><table class="strategy-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><colgroup><col :style="{ width: `${nameColumnWidth}px` }"><col v-for="column in visibleColumns" :key="column.key" :style="{ width: `${widths[column.key]}px` }"><col :style="{ width: `${noteColumnWidth}px` }"></colgroup><thead><tr><th class="strategy-name-column">策略 / 系列<i class="strategy-resize-handle" title="拖动调整策略 / 系列列宽" @pointerdown="startNameResize"></i></th><th v-for="column in visibleColumns" :key="column.key" draggable="true" @dragstart="startDrag(column)" @dragover.prevent @drop="dropColumn(column)"><span class="strategy-column-drag-label">{{ column.label }}</span><button type="button" class="strategy-sort-button" :class="{ active: sort.key === column.key }" @click.stop="cycleSort(column)">{{ sort.key === column.key && sort.direction === "asc" ? "↑" : "↓" }}</button><i class="strategy-resize-handle" @pointerdown="startResize($event, column)"></i></th><th class="strategy-note-column"><div class="strategy-note-header"><span>优化方向</span><button class="strategy-note-save strategy-save-all-notes" type="button" title="保存当前筛选下已修改的优化方向，并在保存后回读云端确认" :disabled="loading || saving === 'notes' || !groups.length" @click="saveAllNotes()">{{ saving === "notes" ? "保存中" : `保存所有优化方向${changedNoteCount ? `（${changedNoteCount}）` : ""}` }}</button></div><i class="strategy-resize-handle" title="拖动调整优化方向列宽" @pointerdown="startNoteResize"></i></th></tr></thead><tbody><template v-for="row in pagedGroups" :key="groupKey(row)"><tr class="strategy-group-row"><td class="strategy-name-column"><button type="button" class="strategy-expand-button" @click="toggle(row)">{{ expanded.has(groupKey(row)) ? "−" : "+" }}</button><strong>{{ row.strategy }}</strong><small>{{ groupMeta(row) }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(row.metrics?.[column.key], column, row.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', rowComparison(row, column)?.status]">{{ rowComparison(row, column)?.text }}</span></div></td><td class="strategy-note-cell"><div class="strategy-note-editor"><textarea v-model="noteDrafts[noteKey(row)]" rows="1" placeholder="填写优化方向…" @input="resizeNote($event); clearNoteSaveError()"></textarea><span v-if="isNoteDirty(row)" class="strategy-note-unsaved" title="这条优化方向还未保存">未保存</span></div></td></tr><template v-if="expanded.has(groupKey(row))"><tr v-for="campaign in row.campaigns" :key="`${campaign.site_code}:${campaign.store_sid}:${campaign.campaign_id}`" :class="['strategy-campaign-row', { invalid: classificationError(campaignDraftFor(row, campaign).strategy, campaignDraftFor(row, campaign).series) }]"><td class="strategy-name-column campaign-assignment-cell"><div class="campaign-selectors"><el-select :model-value="campaignDraftFor(row, campaign).strategy" size="small" @change="setCampaignDraft(campaign, 'strategy', $event)"><el-option v-for="option in STRATEGIES" :key="option" :label="option" :value="option" /></el-select><el-select :model-value="campaignDraftFor(row, campaign).series" size="small" clearable placeholder="系列" @change="setCampaignDraft(campaign, 'series', $event)"><el-option v-for="option in seriesOptions" :key="option" :label="displaySeries(option)" :value="option" /></el-select></div><button type="button" class="campaign-name" :title="`Campaign ID：${campaign.campaign_id}，点击复制`" @click="copyCampaignId(campaign)">{{ campaign.campaign_name || `未命名广告活动 · ${campaign.campaign_id}` }}</button><small class="campaign-meta">{{ campaign.store_name || (campaign.store_sid ? `店铺 ${campaign.store_sid}` : "店铺信息缺失") }} · {{ campaign.ad_type || "广告活动" }} · ID {{ campaign.campaign_id }}</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(campaign[column.key], column, campaign.currency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', campaignComparison(campaign, column)?.status]">{{ campaignComparison(campaign, column)?.text }}</span></div></td><td></td></tr></template></template></tbody>
       <tfoot><tr class="strategy-summary-row"><td class="strategy-name-column strategy-summary-label"><strong>汇总</strong><small>当前筛选范围</small></td><td v-for="column in visibleColumns" :key="column.key"><div class="metric-cell-stack"><span>{{ display(summaryMetrics[column.key], column, summaryCurrency) }}</span><span v-if="showComparison" :class="['period-comparison-delta', summaryComparison(column)?.status]">{{ summaryComparison(column)?.text }}</span></div></td><td></td></tr></tfoot>
     </table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
     <div v-if="groups.length" class="strategy-pagination" role="navigation" aria-label="广告策略看板分页">
@@ -348,7 +406,7 @@ onBeforeUnmount(() => { resizeCleanup?.(); window.removeEventListener("scroll", 
       <div v-if="saveError" class="strategy-save-error-popover" role="alertdialog" aria-modal="false" aria-label="保存失败提示">
         <header><strong>任务保存未完成</strong><button type="button" @click="saveError = ''">×</button></header>
         <p>{{ saveError }}</p>
-        <small>表格内容已保留；请补齐红色提示行后再保存。</small>
+        <small>表格内容已保留；请按提示处理后重试。</small>
       </div>
     </Teleport>
   </section></el-config-provider>
