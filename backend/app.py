@@ -1528,8 +1528,16 @@ def amazon_sales_validate_money_reconciliation(
         basis = max(abs(campaign_value), abs(product_value))
         warning_tolerance = max(50.0, 0.1 * basis)
         block_tolerance = max(100.0, 0.5 * basis)
+        # LingXing product performance is purchase-date based. A model can
+        # receive campaign clicks and spend in a week without a purchase, in
+        # which case the product endpoint may omit that model entirely and the
+        # dashboard's placeholder rows report zero. Campaign inventory remains
+        # authoritative for spend, so keep this source available and surface the
+        # zero-product anomaly as a warning instead of failing the whole board.
+        purchase_side_missing = campaign_value > 0 and product_value == 0
         status = (
-            "failure" if difference > block_tolerance
+            "warning" if purchase_side_missing and difference > warning_tolerance
+            else "failure" if difference > block_tolerance
             else "warning" if difference > warning_tolerance
             else "pass"
         )
@@ -1542,6 +1550,7 @@ def amazon_sales_validate_money_reconciliation(
             "difference": difference,
             "warning_tolerance": warning_tolerance,
             "block_tolerance": block_tolerance,
+            "purchase_side_missing": purchase_side_missing,
             "status": status,
             "passed": passed,
         })
