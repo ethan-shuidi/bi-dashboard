@@ -425,5 +425,5 @@
 .strategy-table thead th{position:sticky!important;top:0!important;box-shadow:0 2px 0 rgba(31,88,181,.12)}
 
 /* Global typography rule: keep every dashboard text node at regular weight. */
-:root{--el-font-weight-primary:400}
+:root{--el-font-weight-primary:400!important}
 *,*::before,*::after{font-weight:400!important}
