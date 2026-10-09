@@ -207,7 +207,7 @@ function renderProductChart(init) {
     tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, backgroundColor: "rgba(15, 35, 68, .94)", borderWidth: 0, textStyle: { color: "#fff", fontSize: 13 }, formatter: (items) => `${items[0].name}<br/>销量：${number(items[0].value)} 件` },
     xAxis: { type: "value", minInterval: 1, splitLine: { lineStyle: { color: "#e8eef6", type: "dashed" } }, axisLabel: { color: "#64748b", fontSize: 12 } },
     yAxis: { type: "category", data: rows.map((row) => `${row.sku}${row.color ? ` · ${row.color}` : ""}`), axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: "#334e73", fontSize: 13, width: 180, overflow: "truncate" } },
-    series: [{ type: "bar", data: rows.map((row) => row.units), barMaxWidth: 22, itemStyle: { color: "#3b82f6", borderRadius: [0, 6, 6, 0] }, label: { show: true, position: "right", color: "#173c6b", fontSize: 13, fontWeight: 700, formatter: ({ value }) => `${number(value)} 件` } }],
+    series: [{ type: "bar", data: rows.map((row) => row.units), barMaxWidth: 22, itemStyle: { color: "#3b82f6", borderRadius: [0, 6, 6, 0] }, label: { show: true, position: "right", color: "#173c6b", fontSize: 13, fontWeight: 400, formatter: ({ value }) => `${number(value)} 件` } }],
   }, true)
 }
 
