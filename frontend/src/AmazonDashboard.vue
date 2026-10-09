@@ -52,6 +52,13 @@ const currencyOptions = [
 ]
 const expanded = ref(new Set())
 const summaryOnly = ref(false)
+const siteSummaryOnly = ref(false)
+watch(summaryOnly, (value) => {
+  if (value && siteSummaryOnly.value) siteSummaryOnly.value = false
+})
+watch(siteSummaryOnly, (value) => {
+  if (value && summaryOnly.value) summaryOnly.value = false
+})
 const quickDatePreset = ref("previous-week")
 const quickDateOptions = [
   { key: "today", label: "今日" },
@@ -429,7 +436,8 @@ function selectOnlySite(value) {
   handleSiteChange()
 }
 
-const showPeriodTotals = computed(() => summaryOnly.value || (selectedSeries.value.length !== 1 && (site.value.length <= 1 || currency.value !== "original")))
+const showSiteSummary = computed(() => siteSummaryOnly.value && !summaryOnly.value)
+const showPeriodTotals = computed(() => summaryOnly.value || (!siteSummaryOnly.value && selectedSeries.value.length !== 1 && (site.value.length <= 1 || currency.value !== "original")))
 
 function rowHasMetricData(metrics) {
   return dataColumns.value.some((column) => {
@@ -454,16 +462,21 @@ const displayRows = computed(() => {
   }
   const previousDetailByKey = new Map()
   const previousSeriesByKey = new Map()
+  const normalizeSite = (item) => item.site || (site.value.length === 1 ? site.value[0] : "")
+  const previousSiteByKey = new Map()
   for (const [periodIndex, details] of previousDetailsByIndex) {
+    const previousSiteDetails = new Map()
     for (const item of details) {
-      const previousSite = item.site || (site.value.length === 1 ? site.value[0] : "")
+      const previousSite = normalizeSite(item)
       previousDetailByKey.set(`${periodIndex}|${previousSite}|${item.series}|${item.product}`, item)
+      if (!previousSiteDetails.has(previousSite)) previousSiteDetails.set(previousSite, [])
+      previousSiteDetails.get(previousSite).push(item)
     }
-    for (const previousSite of new Set(details.map((item) => item.site || (site.value.length === 1 ? site.value[0] : "")))) {
-      const siteDetails = details.filter((item) => (item.site || (site.value.length === 1 ? site.value[0] : "")) === previousSite)
+    for (const [previousSite, siteDetails] of previousSiteDetails) {
       for (const seriesName of new Set(siteDetails.map((item) => item.series))) {
         previousSeriesByKey.set(`${periodIndex}|${previousSite}|${seriesName}`, siteDetails.filter((item) => item.series === seriesName))
       }
+      previousSiteByKey.set(`${periodIndex}|${previousSite}`, siteDetails)
     }
   }
   const grouped = new Map()
@@ -487,8 +500,25 @@ const displayRows = computed(() => {
     const siteMap = grouped.get(period) || new Map()
     const periodRows = []
     const periodDetails = []
+    const siteSummaryRows = []
     for (const siteName of visibleSites) {
       const seriesMap = siteMap.get(siteName) || new Map()
+      if (showSiteSummary.value) {
+        const siteDetails = [...seriesMap.values()].flat()
+        if (!siteDetails.length) continue
+        const periodIndex = periodIndexByLabel.get(period)
+        const previousSiteRows = previousSiteByKey.get(`${periodIndex}|${siteName}`) || []
+        siteSummaryRows.push({
+          type: "site-total",
+          key: `${period}|site|${siteName}`,
+          period,
+          site: siteName,
+          series: "站点汇总",
+          metrics: aggregate(siteDetails),
+          previousMetrics: showComparison.value ? aggregate(previousSiteRows) : null,
+        })
+        continue
+      }
       const seriesItems = visibleSeries.map((series, index) => ({
         series,
         index,
@@ -524,6 +554,16 @@ const displayRows = computed(() => {
         })
       }
     }
+    if (showSiteSummary.value && sortState.value.direction !== "reset") {
+      siteSummaryRows.sort((left, right) => compareSortable(
+        left.metrics[sortState.value.key],
+        right.metrics[sortState.value.key],
+        sortState.value.direction,
+        visibleSites.indexOf(left.site),
+        visibleSites.indexOf(right.site),
+      ))
+    }
+    if (siteSummaryRows.length) periodRows.push(...siteSummaryRows)
     if (showPeriodTotals.value) {
       const periodIndex = periodIndexByLabel.get(period)
       const previousPeriodRows = previousDetailsByIndex.get(periodIndex) || []
@@ -531,7 +571,11 @@ const displayRows = computed(() => {
     }
     result.push(...periodRows.filter((row) => rowHasMetricData(row.metrics)))
   }
-  const summaryRows = summaryOnly.value ? result.filter((row) => row.type === "period-total") : result
+  const summaryRows = summaryOnly.value
+    ? result.filter((row) => row.type === "period-total")
+    : siteSummaryOnly.value
+      ? result.filter((row) => row.type === "site-total")
+      : result
   const displayedPeriods = new Set()
   for (const row of summaryRows) {
     row.periodFirst = !displayedPeriods.has(row.period)
@@ -932,6 +976,7 @@ onBeforeUnmount(() => {
       <label><span>系列（多选）</span><el-select v-model="selectedSeries" multiple collapse-tags collapse-tags-tooltip placeholder="全部系列" @change="load"><el-option v-for="item in seriesOptions" :key="item" :label="displaySeries(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displaySeries(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlySeries(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label><span>产品（多选）</span><el-select v-model="selectedProducts" multiple collapse-tags collapse-tags-tooltip placeholder="全部产品" @change="load"><el-option v-for="item in productOptions" :key="item" :label="displayProduct(item)" :value="item"><template #default><span class="amazon-filter-option-label">{{ displayProduct(item) }}</span><button type="button" class="amazon-only-filter-button" @mousedown.stop.prevent @click.stop.prevent="selectOnlyProduct(item)">仅筛选此项</button></template></el-option></el-select></label>
       <label class="amazon-summary-only-filter"><span>查看方式</span><span class="amazon-checkbox-control"><input v-model="summaryOnly" type="checkbox" />仅查看汇总</span></label>
+      <label class="amazon-summary-only-filter"><span>汇总方式</span><span class="amazon-checkbox-control"><input v-model="siteSummaryOnly" type="checkbox" />按站点汇总</span></label>
     </section>
      <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><label class="comparison-toggle" title="对比上一同长度区间"><input v-model="showComparison" type="checkbox" @change="load"><span>查看环比</span></label><button ref="columnConfigButton" class="column-config-button" type="button" @click="toggleColumnConfig" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><Teleport to="body"><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel column-config-panel-floating" role="dialog" aria-label="列配置" :style="{ top: `${columnConfigPosition.top}px`, left: `${columnConfigPosition.left}px` }"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></Teleport></div></div>
       <DashboardState v-if="error" state="error" title="系列与产品汇总加载失败" :message="error" />

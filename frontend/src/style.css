@@ -107,6 +107,7 @@
 .amazon-table td.series-cell{vertical-align:middle!important;text-align:center!important}.series-content{height:42px;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;line-height:1}.series-content>span:last-child{line-height:1.35}
 
 .amazon-table tr.period-total td{background:#e3edfb!important;color:#123f7a;font-weight:800;border-top:1px solid #c3d6ee}.amazon-table tr.period-total td.period-cell,.amazon-table tr.period-total td.series-cell{background:#e3edfb!important}
+.amazon-table tr.site-total td{background:#e8f2ff!important;color:#123f7a;font-weight:800;border-top:1px solid #c6d9f0}.amazon-table tr.site-total td.period-cell,.amazon-table tr.site-total td.series-cell{background:#e8f2ff!important}
 
 /* Final width overrides (must remain after the base table rules). */
 .amazon-table th:nth-child(2),.amazon-table td:nth-child(2),.amazon-table td.series-cell{width:165px!important;min-width:165px!important;max-width:165px!important}
@@ -193,6 +194,7 @@
 .amazon-table td.period-cell,.amazon-table td.site-cell,.amazon-table td.series-cell{z-index:52!important;background:#eef5ff!important}
 .amazon-table tr.detail td.period-cell,.amazon-table tr.detail td.site-cell,.amazon-table tr.detail td.series-cell{background:#fff!important}
 .amazon-table tr.period-total td.period-cell,.amazon-table tr.period-total td.site-cell,.amazon-table tr.period-total td.series-cell{background:#e3edfb!important}
+.amazon-table tr.site-total td.period-cell,.amazon-table tr.site-total td.site-cell,.amazon-table tr.site-total td.series-cell{background:#e8f2ff!important}
 
 /* Ad metrics expose the product-performance split without changing the
    displayed total. The popover is available on hover, keyboard focus, and
