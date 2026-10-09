@@ -332,44 +332,12 @@ function isAllowedDate(value, field) {
   const d = toDate(value)
   const today = todayDate()
   if (!d || !today || d > today) return false
-  if (comparison.value === "日") return true
-  if (comparison.value === "周") {
-    const other = toDate(field === "start" ? endDate.value : startDate.value)
-    return field === "start" ? !other || d <= other : !other || d >= other
-  }
-  return field === "start" ? d.getDate() === 1 : d.getTime() === monthEnd(d).getTime()
+  const other = toDate(field === "start" ? endDate.value : startDate.value)
+  return field === "start" ? !other || d <= other : !other || d >= other
 }
 
 function dateDisabled(date, field) {
   return !isAllowedDate(date, field)
-}
-
-function nearestStart(value) {
-  const today = todayDate()
-  let d = toDate(value) || today
-  if (d > today) d = today
-  if (comparison.value === "日") return d
-  if (comparison.value === "周") {
-    d = new Date(d)
-    d.setDate(d.getDate() - ((d.getDay() + 6) % 7))
-    return d
-  }
-  return new Date(d.getFullYear(), d.getMonth(), 1)
-}
-
-function nearestEnd(value) {
-  const today = todayDate()
-  let d = toDate(value) || today
-  if (d > today) d = today
-  if (comparison.value === "日") return d
-  if (comparison.value === "周") {
-    d = new Date(d)
-    d.setDate(d.getDate() - ((d.getDay() + 0) % 7))
-    return d
-  }
-  let end = monthEnd(d)
-  if (end > today) end = monthEnd(new Date(d.getFullYear(), d.getMonth() - 1, 1))
-  return end
 }
 
 function normalizeDateRange() {
@@ -378,15 +346,8 @@ function normalizeDateRange() {
   const today = todayDate()
   if (start > today) start = today
   if (end > today) end = today
-  if (comparison.value === "日") {
-    // Keep arbitrary dates for the daily view while clamping to the site date.
-  } else if (comparison.value === "周") {
-    // Weekly filters intentionally accept any dates; the backend clips the
-    // first and last natural weeks to the selected range.
-  } else {
-    start = nearestStart(start)
-    end = nearestEnd(end)
-  }
+  // Daily, weekly, and monthly filters all keep manually selected boundaries.
+  // The backend clips the first and last natural periods to this range.
   if (start > end) {
     end = start
   }
