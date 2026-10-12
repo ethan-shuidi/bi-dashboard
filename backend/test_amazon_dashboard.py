@@ -635,8 +635,8 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertTrue(result["typed_clicks_present"])
 
-    def test_mcp_product_failure_fails_closed_and_never_uses_openapi(self):
-        fallback = AsyncMock(return_value={"data": []})
+    def test_mcp_rate_limit_falls_back_to_openapi_with_degraded_quality(self):
+        fallback = AsyncMock(return_value={"data": {"list": [{"asin": "B0TEST0001", "volume": 1, "net_amount": 10, "spend": 2}]}})
         quality = {}
 
         async def call():
@@ -650,7 +650,34 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
              patch("app.lingxing_mcp_key", return_value="test-key"), \
              patch("app.fetch_mcp_product_performance", new=AsyncMock(side_effect=error)), \
              patch("app.lingxing_post", new=fallback):
-            with self.assertRaisesRegex(RuntimeError, "认证请求过于频繁"):
+            rows = asyncio.run(call())
+
+        fallback.assert_awaited_once()
+        self.assertEqual(len(rows), 1)
+        result = _performance_data_quality(quality)
+        self.assertEqual(result["source"], "openapi_fallback")
+        self.assertFalse(result["mcp_ok"])
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["degraded_reason"], "mcp_rate_limited")
+        self.assertIn("OpenAPI 降级数据", result["notice"])
+
+    def test_mcp_non_rate_limit_product_failure_fails_closed(self):
+        fallback = AsyncMock(return_value={"data": {"list": [{"asin": "B0TEST0001", "volume": 1}]}})
+        quality = {}
+
+        async def call():
+            return await fetch_product_performance(
+                101, date(2026, 9, 4), date(2026, 9, 4), "日",
+                AsyncMock(), asyncio.Semaphore(1), None, "USD", quality,
+            )
+
+        error = RuntimeError("LingXing MCP returned invalid business JSON")
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+             patch("app.lingxing_mcp_key", return_value="test-key"), \
+             patch("app.fetch_mcp_product_performance", new=AsyncMock(side_effect=error)), \
+             patch("app.lingxing_post", new=fallback):
+            with self.assertRaisesRegex(RuntimeError, "invalid business JSON"):
                 asyncio.run(call())
 
         fallback.assert_not_called()
@@ -658,8 +685,9 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(result["source"], "mcp")
         self.assertFalse(result["mcp_ok"])
         self.assertFalse(result["complete"])
+        self.assertFalse(result["degraded"])
 
-    def test_amazon_dashboard_maps_product_rate_limit_to_429(self):
+    def test_amazon_dashboard_returns_degraded_rows_on_product_rate_limit(self):
         env = {
             "LINGXING_APP_ID": "test-id",
             "LINGXING_APP_SECRET": "test-secret",
@@ -667,7 +695,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             "LINGXING_MCP_KEY": "test-key",
         }
         error = RuntimeError("LingXing MCP request failed: 认证请求过于频繁，请稍后重试")
-        fallback = AsyncMock()
+        fallback = AsyncMock(return_value={"data": {"list": [{"asin": next(iter(ASIN_MAPPING["US"])), "volume": 1, "net_amount": 10, "spend": 2}]}})
         with patch.dict(os.environ, env), \
              patch("app.lingxing_mcp_key", return_value="test-key"), \
              patch("app.fetch_mcp_product_performance", new=AsyncMock(side_effect=error)), \
@@ -684,9 +712,13 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(response.status_code, 429)
-        self.assertIn("产品表现接口限流", response.json()["detail"])
-        fallback.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["rows"])
+        self.assertTrue(payload["data_quality"]["degraded"])
+        self.assertEqual(payload["data_quality"]["degraded_reason"], "mcp_rate_limited")
+        self.assertIn("OpenAPI 降级数据", payload["data_quality"]["notice"])
+        fallback.assert_awaited()
 
     def test_campaign_name_reads_nested_campaign_objects(self):
         self.assertEqual(

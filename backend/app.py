@@ -3065,13 +3065,19 @@ async def fetch_product_performance(
                 _record_performance_quality(quality, "mcp", True, None, rows)
             return rows
         except (RuntimeError, httpx.HTTPError) as exc:
-            # Product metrics feed the product summary and sales actuals. The
-            # OpenAPI endpoint has a different metric contract, so once MCP is
-            # configured an upstream failure must fail closed instead of
-            # presenting plausible-looking numbers from another source.
+            # Product metrics feed the product summary and sales actuals. Only
+            # an explicit MCP rate limit may fall back to OpenAPI, and that
+            # response must be labeled degraded. All other failures remain
+            # fail-closed so a contract error can never masquerade as complete
+            # MCP data.
+            rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
             if quality is not None:
                 _record_performance_quality(quality, "mcp", False, str(exc))
-            raise
+                if rate_limited:
+                    quality["degraded"] = True
+                    quality["degraded_reason"] = "mcp_rate_limited"
+            if not rate_limited:
+                raise
     # LingXing limits this endpoint to a maximum 92-day date range.  The
     # dashboard allows a wider range for quick presets such as "去年", so split
     # longer requests into bounded chunks and merge the returned rows.  Chunk
@@ -3231,10 +3237,19 @@ def _performance_data_quality(quality: dict[str, Any]) -> dict[str, Any]:
     errors = [str(error) for error in quality.get("errors", [])]
     typed_present = raw_rows > 0 and raw_rows == typed_rows
     mcp_ok = bool(quality.get("mcp_ok", False))
+    source = "openapi_fallback" if "openapi_fallback" in sources else ("mcp" if sources else "unknown")
+    degraded = bool(quality.get("degraded")) or (source == "openapi_fallback" and not mcp_ok)
+    degraded_reason = str(quality.get("degraded_reason") or ("openapi_fallback" if degraded else "")) or None
     if raw_rows > 0 and not typed_present:
         errors.append("产品表现缺少完整 SP/SB/SBV/SD 分类字段")
+    notice = None
+    if degraded:
+        if degraded_reason == "mcp_rate_limited":
+            notice = "领星产品表现接口限流，当前展示 OpenAPI 降级数据；部分指标口径可能不同，SP/SB/SBV/SD 明细可能缺失。"
+        else:
+            notice = "当前展示 OpenAPI 降级数据；部分指标口径可能不同，SP/SB/SBV/SD 明细可能缺失。"
     return {
-        "source": "openapi_fallback" if "openapi_fallback" in sources else ("mcp" if sources else "unknown"),
+        "source": source,
         "mcp_ok": mcp_ok,
         "raw_rows": raw_rows,
         "typed_rows": typed_rows,
@@ -3242,6 +3257,9 @@ def _performance_data_quality(quality: dict[str, Any]) -> dict[str, Any]:
         "typed_metrics_present": typed_present,
         "complete": mcp_ok and not errors and (raw_rows == 0 or typed_present),
         "errors": errors,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+        "notice": notice,
     }
 
 

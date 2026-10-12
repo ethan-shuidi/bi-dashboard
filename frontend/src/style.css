@@ -423,6 +423,11 @@
 
 .product-asin-tooltip-floating{position:fixed!important;top:auto;right:auto;bottom:auto;left:auto;z-index:2147483200!important;min-width:max-content;padding:7px 10px;border:1px solid #d5e2f1;border-radius:7px;background:#fff;color:#31577f;font-size:12px;font-weight:700;line-height:1;box-shadow:0 12px 28px rgba(27,66,112,.18);pointer-events:none}
 .strategy-table thead th{position:sticky!important;top:0!important;box-shadow:0 2px 0 rgba(31,88,181,.12)}
+/* Product-summary degraded data notice: visible without blocking reading. */
+.amazon-data-quality-notice{display:flex;align-items:center;gap:10px;margin:0 20px;padding:10px 12px;border:1px solid #f0c5cd;border-radius:10px;background:#fff4f6;color:#b52e45;font-size:12px;line-height:1.5}
+.amazon-data-quality-notice span{flex:0 0 auto;color:#a1263d}
+.amazon-data-quality-notice p{margin:0;min-width:0}
+
 
 /* Global typography rule: keep every dashboard text node at regular weight. */
 :root{--el-font-weight-primary:400!important}

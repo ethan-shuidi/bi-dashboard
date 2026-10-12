@@ -30,6 +30,8 @@ const rows = ref([])
 const periods = ref([])
 const previousRows = ref([])
 const previousPeriods = ref([])
+const currentDataQuality = ref(null)
+const previousDataQuality = ref(null)
 const showComparison = ref(false)
 const loading = ref(true)
 const error = ref("")
@@ -893,6 +895,8 @@ async function load(forceRefresh = false) {
     periods.value = data.periods || []
     previousRows.value = showComparison.value ? (previousData?.rows || []) : []
     previousPeriods.value = showComparison.value ? (previousData?.periods || []) : []
+    currentDataQuality.value = data.data_quality || null
+    previousDataQuality.value = showComparison.value ? (previousData?.data_quality || null) : null
     expanded.value = new Set()
   } catch (e) {
     if (requestSeq !== dashboardRequestSeq) return
@@ -901,6 +905,22 @@ async function load(forceRefresh = false) {
     if (requestSeq === dashboardRequestSeq) loading.value = false
   }
 }
+
+const isDegradedQuality = (quality) => Boolean(
+  quality?.degraded || (
+    quality?.source === "openapi_fallback" &&
+    quality?.complete === false
+  )
+)
+
+const dataQualityNotice = computed(() => {
+  const degradedScopes = []
+  if (isDegradedQuality(currentDataQuality.value)) degradedScopes.push("当前周期")
+  if (showComparison.value && isDegradedQuality(previousDataQuality.value)) degradedScopes.push("环比上一周期")
+  if (!degradedScopes.length) return ""
+  const notice = currentDataQuality.value?.notice || previousDataQuality.value?.notice
+  return `${degradedScopes.join("、")}：${notice || "当前展示 OpenAPI 降级数据；部分指标口径可能不同，SP/SB/SBV/SD 明细可能缺失。"}`
+})
 
 async function handleSiteChange() {
   if (!site.value.length && sites.value.length) site.value = [sites.value[0]]
@@ -983,6 +1003,15 @@ onBeforeUnmount(() => {
       </div>
     </section>
      <section class="amazon-table-panel"><div class="amazon-panel-head"><div><span class="section-label">产品经营数据</span><h2>系列与产品汇总</h2></div><div class="amazon-panel-actions"><small>全部系列 · 全部产品 · {{ selectedSiteLabel }} · {{ currencyLabel }} · {{ comparison }}汇总</small><label class="comparison-toggle" title="对比上一同长度区间"><input v-model="showComparison" type="checkbox" @change="load"><span>查看环比</span></label><button ref="columnConfigButton" class="column-config-button" type="button" @click="toggleColumnConfig" :aria-expanded="columnConfigOpen" aria-controls="amazon-column-config"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><circle cx="8" cy="5" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="19" r="2"/></svg><span>列配置</span></button><button class="table-refresh-button" type="button" @click="refreshData" :disabled="loading" aria-label="刷新数据" title="重新抓取数据"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-4M4 5v5h5M4 13a8 8 0 0 0 14.9 4M20 19v-5h-5"/></svg><span>刷新</span></button><Teleport to="body"><div v-if="columnConfigOpen" id="amazon-column-config" class="column-config-panel column-config-panel-floating" role="dialog" aria-label="列配置" :style="{ top: `${columnConfigPosition.top}px`, left: `${columnConfigPosition.left}px` }"><div class="column-config-title"><strong>列配置</strong><span>可隐藏或显示数据列</span></div><div class="column-config-list"><button v-for="column in dataColumns" :key="column.key" type="button" class="column-config-item" @click="toggleColumn(column)"><span>{{ column.label }}</span><svg viewBox="0 0 24 24" :class="{ 'is-hidden': !column.visible }" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6-9.5 6-9.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/><path v-if="!column.visible" d="m4 4 16 16"/></svg></button></div></div></Teleport></div></div>
+      <div
+        v-if="!error && !loading && dataQualityNotice"
+        class="amazon-data-quality-notice"
+        role="status"
+        aria-live="polite"
+      >
+        <span>数据降级提示</span>
+        <p>{{ dataQualityNotice }}</p>
+      </div>
       <DashboardState v-if="error" state="error" title="系列与产品汇总加载失败" :message="error" />
         <DashboardState v-else-if="loading" state="loading" title="正在从领星同步数据" message="正在读取产品表现、广告指标和环比数据，请稍候。" />
         <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-name-button', { copied: copiedProductKey === row.key }]" @mouseenter="showProductTooltip(row, $event)" @mouseleave="hideProductTooltip" @focus="showProductTooltip(row, $event)" @blur="hideProductTooltip" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><div class="metric-cell-stack"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template><span v-if="showComparison" :class="['period-comparison-delta', periodComparison(row, column)?.status]">{{ periodComparison(row, column)?.text }}</span></div></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
