@@ -651,14 +651,6 @@ onBeforeUnmount(() => {
           />
         </el-select>
       </label>
-      <label class="row-gap-control" aria-label="表格行距">
-        <span>行距</span>
-        <input v-model.number="rowGap" type="range" min="4" max="18" step="1">
-        <small>{{ rowGap }}px</small>
-      </label>
-      <div class="column-width-control">
-        <button type="button" @click="resetColumnWidths">恢复默认列宽</button>
-      </div>
     </section>
 
     <DashboardState v-if="error" state="error" title="ABA 数据加载或保存失败" :message="error" />
@@ -667,8 +659,24 @@ onBeforeUnmount(() => {
     <DashboardState v-if="loading && !tableRows.length" state="loading" title="西柚 ABA" message="正在获取西柚 ABA 数据…" />
 
     <section class="keyword-table-panel" aria-label="搜索词周度数据">
+      <header class="keyword-table-toolbar">
+        <div>
+          <span>宽表视图</span>
+          <strong>ABA 周度数据</strong>
+          <small>分类与关键词固定在左侧；右侧按周展示排名与搜索量。</small>
+        </div>
+        <div class="keyword-table-toolbar-actions">
+          <span :class="['keyword-dirty-badge', { dirty }]">{{ dirty ? "有未保存修改" : "表格与云端一致" }}</span>
+          <label class="row-gap-control compact" aria-label="表格行距">
+            <span>行距</span>
+            <input v-model.number="rowGap" type="range" min="4" max="18" step="1">
+            <small>{{ rowGap }}px</small>
+          </label>
+          <button class="column-width-control" type="button" @click="resetColumnWidths">恢复默认列宽</button>
+        </div>
+      </header>
       <div class="keyword-table-wrap">
-        <table :style="{ width: `${tableMinWidth}px`, minWidth: `${tableMinWidth}px`, '--keyword-row-gap': `${rowGap}px` }">
+        <table :style="{ width: `${tableMinWidth}px`, minWidth: `${tableMinWidth}px`, '--keyword-row-gap': `${rowGap}px`, '--keyword-category-width': `${columnWidth('category')}px` }">
           <colgroup>
             <col :style="{ width: `${columnWidth('category')}px` }">
             <col :style="{ width: `${columnWidth('keyword')}px` }">
@@ -722,9 +730,9 @@ onBeforeUnmount(() => {
                 ></i>
               </th>
               <th
-                v-for="week in displayWeeks"
+                v-for="(week, weekIndex) in displayWeeks"
                 :key="week.start"
-                :class="['week-group', { single: visibleMetricCount === 1 }]"
+                :class="['week-group', { single: visibleMetricCount === 1, alt: weekIndex % 2 === 1 }]"
                 :colspan="visibleMetricCount"
               >
                 <strong>{{ week.label || `W${String(isoWeek(week.start)).padStart(2, "0")}` }}</strong>
@@ -876,4 +884,37 @@ onBeforeUnmount(() => {
 .keyword-empty{padding:24px;border-radius:10px;background:#f8fbff;color:#71819a;font-size:13px;text-align:center}
 @media (max-width:1100px){.keyword-filters{grid-template-columns:1fr 1fr}.keyword-head{align-items:flex-start}.keyword-head-actions{flex-wrap:wrap}}
 @media (max-width:720px){.keyword-filters{grid-template-columns:1fr}.keyword-table-panel{margin-inline:-22px;border-radius:0}}
+
+/* Wide-table readability: keep identity columns visible while scanning weekly data. */
+.keyword-table-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:15px 18px;border-bottom:1px solid #e5edf7;background:#fbfdff}
+.keyword-table-toolbar>div:first-child{display:grid;min-width:220px;gap:3px}
+.keyword-table-toolbar span{color:#5f7188;font-size:12px}
+.keyword-table-toolbar strong{color:#132f5b;font-size:16px}
+.keyword-table-toolbar small{color:#7a8a9d;font-size:12px}
+.keyword-table-toolbar-actions{display:flex;flex:1;align-items:center;justify-content:flex-end;gap:10px;min-width:0}
+.keyword-dirty-badge{flex:0 0 auto;height:30px;display:inline-flex;align-items:center;padding:0 10px;border:1px solid #cbe2d7;border-radius:999px;background:#f2fbf6;color:#16845b;font-size:12px;white-space:nowrap}
+.keyword-dirty-badge.dirty{border-color:#f0c983;background:#fff8e8;color:#966208}
+.row-gap-control.compact{display:flex;align-items:center;gap:7px;min-width:168px;height:34px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff}
+.row-gap-control.compact span{white-space:nowrap}
+.row-gap-control.compact input{width:72px;height:18px;margin:0}
+.row-gap-control.compact small{width:34px;color:#526b88;text-align:right}
+.column-width-control{height:34px;display:inline-flex;align-items:center;padding:0 11px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font-size:12px;cursor:pointer;white-space:nowrap}
+.column-width-control:hover{background:#f2f8ff}
+.keyword-table-wrap{max-height:clamp(430px,calc(100vh - 390px),760px);min-height:320px}
+.keyword-table-wrap::-webkit-scrollbar{width:10px;height:10px}
+.keyword-table-wrap::-webkit-scrollbar-thumb{border-radius:999px;background:#c7d7e9}
+thead th.category{position:sticky;left:0;z-index:8;box-shadow:1px 0 0 #dce7f3}
+thead th.keyword{position:sticky;left:var(--keyword-category-width,150px);z-index:8;box-shadow:1px 0 0 #dce7f3}
+tbody td.category-cell{position:sticky;left:0;z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
+tbody th[scope=row]{position:sticky;left:var(--keyword-category-width,150px);z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
+tbody tr:hover td.category-cell,tbody tr:hover th[scope=row]{background:#f8fbff}
+thead th.trend,td.trend{border-left:2px solid #d7e4f2}
+thead th.trend{background:#eaf3ff}
+td.trend{background:#fbfdff}
+thead th.week-group{border-left:1px solid #cddcf0;background:#e7f0fb}
+thead th.week-group.alt{background:#edf5fd}
+thead th.metric-head{border-left:1px solid #dce8f5}
+td.metric{border-left:1px solid #edf3fa}
+.table-footer{bottom:0;z-index:5;border-top:1px solid #e5edf7;background:#fbfdff}
+@media(max-width:900px){.keyword-table-toolbar{align-items:start;flex-direction:column}.keyword-table-toolbar-actions{justify-content:flex-start;flex-wrap:wrap}.row-gap-control.compact{width:100%}}
 </style>

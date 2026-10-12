@@ -427,3 +427,20 @@
 /* Global typography rule: keep every dashboard text node at regular weight. */
 :root{--el-font-weight-primary:400!important}
 *,*::before,*::after{font-weight:400!important}
+
+/* Amazon advertising filters: separate selection data from view mode. */
+.amazon-filter-group{display:flex;align-items:end;gap:10px;min-width:0;padding:12px;border:1px solid #dbe7f4;border-radius:12px;background:#fff}
+.amazon-filter-group.amazon-filter-primary{flex:1 1 100%;flex-wrap:wrap}
+.amazon-filter-group.amazon-filter-view{flex:1 1 auto;background:#f8fbff}
+.amazon-filter-group label{width:178px;min-width:178px;flex:0 0 178px}
+.amazon-filter-group .amazon-summary-only-filter{width:auto;min-width:178px}
+.amazon-filter-group .el-select,.amazon-filter-group .el-date-editor{width:100%}
+@media(max-width:1500px){.amazon-filter-view{flex-basis:100%}}
+@media(max-width:760px){.amazon-filter-group,.amazon-filter-group label{width:100%;min-width:100%;flex-basis:100%}}
+
+/* Runtime placeholder shown while IdeaDock configuration is being resolved. */
+.runtime-placeholder-shell{min-height:calc(100vh - 148px);display:grid;place-items:center}
+.runtime-placeholder{width:min(560px,100%);padding:34px;border:1px solid var(--line);border-radius:18px;background:#fff;text-align:center;box-shadow:var(--shadow-sm)}
+.runtime-placeholder span{color:#5f7188;font-size:12px;letter-spacing:.08em}
+.runtime-placeholder h1{margin:8px 0 0;color:#102a56;font-size:24px}
+.runtime-placeholder p{margin:8px 0 0;color:#687b92;font-size:13px;line-height:1.6}

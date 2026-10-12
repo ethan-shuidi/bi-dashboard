@@ -42,6 +42,7 @@ const dashboard = ref(null)
 const period = ref("30")
 const store = ref("")
 const activeDashboard = ref("amazon")
+const activeDashboardLabel = computed(() => dashboardNavItems.value.find((item) => item.key === activeDashboard.value)?.label || "Amazon-数据看板")
 const sidebarCollapsed = ref(true)
 const dashboardNavDefaults = [
   { key: "amazon", label: "Amazon-广告数据", icon: "▦" },
@@ -304,12 +305,13 @@ watch(period, (value) => {
   if (value !== "custom") loadDashboard({ autoSync: false })
 })
 watch(store, () => loadDashboard({ autoSync: false }))
-watch(activeDashboard, (value) => {
-  if (value === "commerce" && !status.value) loadDashboard({ autoSync: false })
+watch(activeDashboard, () => {
+  document.title = `${activeDashboardLabel.value} · Amazon-数据看板`
 })
 watch(dashboard, renderCharts, { flush: "post" })
 
 onMounted(async () => {
+  document.title = `${activeDashboardLabel.value} · Amazon-数据看板`
   resizeObserver = new ResizeObserver(() => {
     salesChart?.resize()
     productChart?.resize()
@@ -323,6 +325,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  document.title = "Amazon-数据看板"
   resizeObserver?.disconnect()
   salesChart?.dispose()
   productChart?.dispose()
@@ -334,7 +337,7 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <div class="brand-copy"><strong>Commerce OS</strong><span>数据分析</span></div>
+        <div class="brand-copy"><strong>Amazon-数据看板</strong><span>运营数据统一入口</span></div>
       </div>
     </header>
 
@@ -384,7 +387,7 @@ onBeforeUnmount(() => {
       <KeywordDashboard v-else-if="activeDashboard === 'keyword' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
       <AmazonDataSourceDashboard v-else-if="activeDashboard === 'data-source' && apiBase" class="amazon-dashboard-frame" :api-base="apiBase" />
 
-      <div v-else class="content-shell">
+      <div v-else-if="false" class="content-shell">
       <section class="page-header">
         <div>
           <div class="breadcrumb"><span>数据中心</span><i>/</i><strong>Shopify 经营概览</strong></div>
@@ -471,6 +474,14 @@ onBeforeUnmount(() => {
 
         <footer><div><span class="live-dot"></span>{{ dashboard.last_sync.message }}</div><span>{{ dashboard.timezone_note }}</span></footer>
       </template>
+      </div>
+
+      <div v-else class="runtime-placeholder-shell">
+        <div class="runtime-placeholder">
+          <span>Amazon 数据</span>
+          <h1>看板正在准备中</h1>
+          <p>正在读取 IdeaDock 运行配置。配置完成后会自动进入对应看板。</p>
+        </div>
       </div>
     </div>
   </main>
