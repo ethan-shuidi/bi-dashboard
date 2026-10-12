@@ -217,6 +217,7 @@ _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
 _lingxing_mcp_request_last_call = 0.0
 _lingxing_mcp_rate_limited_until = 0.0
+_amazon_ads_chart_jobs: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
@@ -241,6 +242,11 @@ class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
         return (namespace, tuple(key))
 
     def get(self, key: Any, default: Any = None) -> Any:
+        return super().get(self.storage_key(tuple(key)), default)
+
+    def get_stale(self, key: Any, default: Any = None) -> Any:
+        """Read an expired entry without renewing it or launching upstream work."""
+
         return super().get(self.storage_key(tuple(key)), default)
 
     def __getitem__(self, key: Any) -> Any:
@@ -338,6 +344,8 @@ KEYWORD_FETCH_WEEK_CHUNK = 5
 KEYWORD_UNAVAILABLE_WEEK_TTL_SECONDS = 6 * 60 * 60
 KEYWORD_DASHBOARD_FETCH_LOCK_NAME = "bi_dashboard_keyword_fetch"
 AMAZON_CACHE_TTL_SECONDS = 600
+AMAZON_ADS_CHART_BACKGROUND_REQUEST_THRESHOLD = 12
+AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
 LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS = float(
@@ -3427,6 +3435,29 @@ def product_performance_ad_totals(raw: dict[str, Any]) -> dict[str, float]:
     return totals
 
 
+def amazon_dashboard_periodic_cache_key(
+    comparison: str,
+    start_date: date,
+    end_date: date,
+    selected_sites: list[str],
+    requested_currency: str,
+    selected_series: set[str],
+    selected_products: set[str],
+    mapping_fingerprint: tuple[tuple[str, str, str], ...],
+) -> tuple[Any, ...]:
+    return (
+        "periodic-dashboard-v11-data-source-mapping",
+        comparison,
+        start_date.isoformat(),
+        end_date.isoformat(),
+        tuple(selected_sites),
+        requested_currency,
+        tuple(sorted(selected_series)),
+        tuple(sorted(selected_products)),
+        mapping_fingerprint,
+    )
+
+
 async def amazon_dashboard_periodic(
     comparison: str,
     start_date: date,
@@ -3438,6 +3469,7 @@ async def amazon_dashboard_periodic(
     store_rows: list[dict[str, Any]] | None = None,
     display_currency: str = "original",
     asin_mapping: dict[str, dict[str, str]] | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     periods = amazon_periods(start_date, end_date, comparison)
     if site is None or site == "" or site == []:
@@ -3463,19 +3495,18 @@ async def amazon_dashboard_periodic(
     performance_quality: dict[str, Any] = {}
     effective_asin_mapping = ASIN_MAPPING if asin_mapping is None else asin_mapping
     mapping_fingerprint = amazon_data_source_mapping_fingerprint(effective_asin_mapping)
-    cache_key = (
-        "periodic-dashboard-v11-data-source-mapping",
+    cache_key = amazon_dashboard_periodic_cache_key(
         comparison,
-        start_date.isoformat(),
-        end_date.isoformat(),
-        tuple(selected_sites),
+        start_date,
+        end_date,
+        selected_sites,
         requested_currency,
-        tuple(sorted(selected_series)),
-        tuple(sorted(selected_products)),
+        selected_series,
+        selected_products,
         mapping_fingerprint,
     )
     cached = _amazon_cache.get(cache_key)
-    if cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
+    if not force_refresh and cached and time.monotonic() - cached[0] < AMAZON_CACHE_TTL_SECONDS:
         # Sales-dashboard enrichment reallocates rows in-place after this call.
         # Return a private object so those edits cannot pollute the cached raw
         # periodic response for another viewer or filter invocation.
@@ -5945,6 +5976,96 @@ def save_amazon_data_source_mappings(
     return result
 
 
+def amazon_ads_charts_payload(
+    start: date,
+    end: date,
+    site: str,
+    selected_sites: list[str],
+    model: str,
+    periodic: dict[str, Any],
+    *,
+    fetch_status: str = "ready",
+    notice: str = "",
+) -> dict[str, Any]:
+    rows = amazon_ads_chart_rows(periodic, start, end)
+    sessions_present = any(row.get("sessions") is not None for row in rows)
+    page_views_present = any(row.get("page_views") is not None for row in rows)
+    data_quality = dict(periodic.get("data_quality") or {})
+    if notice:
+        data_quality["notice"] = notice
+    return {
+        "period": {"start": start.isoformat(), "end": (end + timedelta(days=6)).isoformat()},
+        "site": site,
+        "selected_sites": selected_sites,
+        "model": model,
+        "currency": "USD" if len(selected_sites) > 1 else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD"),
+        "currency_mode": "USD" if len(selected_sites) > 1 else "original",
+        "rows": rows,
+        "field_availability": {
+            "sessions_field": "Sessions-Total",
+            "sessions_present": sessions_present,
+            "page_views_field": "PV-Total",
+            "page_views_present": page_views_present,
+        },
+        "fetch_status": fetch_status,
+        "data_quality": data_quality,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _amazon_ads_chart_refresh_invalidate(cache_key: tuple[Any, ...]) -> dict[str, Any] | None:
+    """Drop raw ads-chart upstream entries while retaining its last good rollup."""
+
+    namespace = _amazon_cache_scope.get()
+    stale = _amazon_cache.get_stale(cache_key)
+    stale_payload = copy.deepcopy(stale[1]) if stale else None
+    stale_timestamp = stale[0] if stale else 0.0
+    for stored_key in list(_amazon_cache.keys()):
+        if stored_key[0] != namespace:
+            continue
+        raw_key = stored_key[1]
+        if raw_key[0] == "product-performance-v3" or raw_key == cache_key:
+            del _amazon_cache[stored_key]
+    if stale_payload is not None:
+        # Keep the old timestamp so a failed refresh cannot masquerade as fresh.
+        _amazon_cache[cache_key] = (stale_timestamp, stale_payload)
+    return stale_payload
+
+
+async def _amazon_ads_chart_job(
+    state: dict[str, Any],
+    start: date,
+    fetch_end: date,
+    selected_sites: list[str],
+    selected_series: set[str],
+    products: set[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]],
+    display_currency: str,
+    asin_mapping: dict[str, dict[str, str]],
+    force_refresh: bool,
+) -> None:
+    try:
+        state["result"] = await amazon_dashboard_periodic(
+            "周",
+            start,
+            fetch_end,
+            selected_sites,
+            selected_series,
+            products,
+            sid_map,
+            store_rows,
+            display_currency,
+            asin_mapping,
+            force_refresh=force_refresh,
+        )
+    except BaseException as exc:
+        state["error"] = str(exc)
+        state["error_type"] = type(exc).__name__
+    finally:
+        state["finished_at"] = time.monotonic()
+
+
 @app.get("/api/amazon/ads-charts")
 async def amazon_ads_charts(
     start_week: date | None = Query(default=None),
@@ -5979,6 +6100,7 @@ async def amazon_ads_charts(
     products, selected_series = amazon_sales_scope(model)
     if not products or not selected_series:
         raise HTTPException(status_code=422, detail="广告图表型号暂无产品映射")
+    asin_mapping = amazon_data_source_mapping_snapshot()
     try:
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
     except json.JSONDecodeError as exc:
@@ -5992,22 +6114,51 @@ async def amazon_ads_charts(
     store_rows = []
     if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
         store_rows = await lingxing_store_rows()
-    if refresh:
-        _amazon_cache.clear_current_namespace()
-
     site_today = min(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
         for site_name in selected_sites
     )
     fetch_end = min(end + timedelta(days=6), site_today)
-    # Future-only ranges should render empty weeks instead of raising because
-    # the upstream periodic payload was never requested.
-    periodic: dict[str, Any] = {"rows": []}
-    rows: list[dict[str, Any]] = []
-    data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
-    if start <= fetch_end:
+    display_currency = "USD" if len(selected_sites) > 1 else "original"
+    periods = amazon_periods(start, fetch_end, "周") if start <= fetch_end else []
+    estimated_requests = sum(
+        len(amazon_sid_accounts(site_name, sid_map, store_rows))
+        for site_name in selected_sites
+    ) * len(periods)
+
+    cache_key = amazon_dashboard_periodic_cache_key(
+        "周",
+        start,
+        fetch_end,
+        selected_sites,
+        display_currency.upper(),
+        selected_series,
+        set(products),
+        amazon_data_source_mapping_fingerprint(asin_mapping),
+    )
+    job_key = (_amazon_cache_scope.get(), *cache_key)
+
+    # Future-only ranges have no upstream period to request. Rendering explicit
+    # empty weeks here prevents the background branch below from constructing a
+    # reversed date range and issuing needless LingXing calls.
+    if start > fetch_end:
+        return amazon_ads_charts_payload(
+            start,
+            end,
+            site,
+            selected_sites,
+            model,
+            {"rows": [], "data_quality": {"source": "not_requested", "complete": True, "errors": []}},
+        )
+
+    # Small requests remain synchronous and preserve the endpoint's existing
+    # behavior. Multi-site weekly ranges can require more than one hundred
+    # serialized MCP calls; returning a preparation status keeps the platform
+    # gateway from timing out while LingXing continues in the background.
+    if estimated_requests <= AMAZON_ADS_CHART_BACKGROUND_REQUEST_THRESHOLD and start <= fetch_end:
+        if refresh:
+            _amazon_ads_chart_refresh_invalidate(cache_key)
         try:
-            asin_mapping = amazon_data_source_mapping_snapshot()
             periodic = await amazon_dashboard_periodic(
                 "周",
                 start,
@@ -6017,35 +6168,104 @@ async def amazon_ads_charts(
                 products,
                 sid_map,
                 store_rows,
-                "USD" if len(selected_sites) > 1 else "original",
+                display_currency,
                 asin_mapping,
+                force_refresh=refresh,
             )
-            data_quality = dict(periodic.get("data_quality") or {})
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
         except RuntimeError as exc:
-                raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+            raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
+        return amazon_ads_charts_payload(start, end, site, selected_sites, model, periodic)
 
-    rows = amazon_ads_chart_rows(periodic, start, end)
-    sessions_present = any(row.get("sessions") is not None for row in rows)
-    page_views_present = any(row.get("page_views") is not None for row in rows)
-    return {
-        "period": {"start": start.isoformat(), "end": (end + timedelta(days=6)).isoformat()},
-        "site": site,
-        "selected_sites": selected_sites,
-        "model": model,
-        "currency": "USD" if len(selected_sites) > 1 else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD"),
-        "currency_mode": "USD" if len(selected_sites) > 1 else "original",
-        "rows": rows,
-        "field_availability": {
-            "sessions_field": "Sessions-Total",
-            "sessions_present": sessions_present,
-            "page_views_field": "PV-Total",
-            "page_views_present": page_views_present,
-        },
-        "data_quality": data_quality,
-        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    cached = _amazon_cache.get(cache_key)
+    cached_age = time.monotonic() - cached[0] if cached else None
+    if cached and cached_age is not None and cached_age < AMAZON_CACHE_TTL_SECONDS and not refresh:
+        return amazon_ads_charts_payload(
+            start, end, site, selected_sites, model, copy.deepcopy(cached[1])
+        )
+    stale_payload = copy.deepcopy(cached[1]) if cached else None
+    if refresh:
+        stale_payload = _amazon_ads_chart_refresh_invalidate(cache_key)
+
+    state = _amazon_ads_chart_jobs.get(job_key)
+    now = time.monotonic()
+    if state:
+        task: asyncio.Task[None] | None = state.get("task")
+        if task and not task.done():
+            return amazon_ads_charts_payload(
+                start,
+                end,
+                site,
+                selected_sites,
+                model,
+                stale_payload or {"rows": []},
+                fetch_status="refreshing" if stale_payload else "preparing",
+                notice=(
+                    "正在后台刷新领星产品表现数据，当前展示最近一次可用数据。"
+                    if stale_payload
+                    else "正在后台抓取领星产品表现数据，完成后会自动展示。"
+                ),
+            )
+        finished_at = float(state.get("finished_at") or 0.0)
+        if not refresh and finished_at and now - finished_at <= AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS:
+            if state.get("error"):
+                if stale_payload is not None:
+                    return amazon_ads_charts_payload(
+                        start,
+                        end,
+                        site,
+                        selected_sites,
+                        model,
+                        stale_payload,
+                        fetch_status="degraded",
+                        notice=(
+                            "后台刷新领星产品表现数据失败，当前展示最近一次可用数据；"
+                            f"原因：{state['error']}"
+                        ),
+                    )
+                raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{state['error']}")
+            result = state.get("result")
+            if result is not None:
+                return amazon_ads_charts_payload(
+                    start, end, site, selected_sites, model, copy.deepcopy(result)
+                )
+
+    state = {
+        "started_at": now,
+        "finished_at": 0.0,
+        "result": None,
+        "error": "",
     }
+    task = asyncio.create_task(_amazon_ads_chart_job(
+        state,
+        start,
+        fetch_end,
+        selected_sites,
+        selected_series,
+        products,
+        sid_map,
+        store_rows,
+        display_currency,
+        asin_mapping,
+        refresh,
+    ))
+    state["task"] = task
+    _amazon_ads_chart_jobs[job_key] = state
+    return amazon_ads_charts_payload(
+        start,
+        end,
+        site,
+        selected_sites,
+        model,
+        stale_payload or {"rows": []},
+        fetch_status="refreshing" if stale_payload else "preparing",
+        notice=(
+            "已开始后台刷新领星产品表现数据，当前展示最近一次可用数据。"
+            if stale_payload
+            else "广告周度图表需要抓取较多站点与周份数据，已在后台执行，请稍候。"
+        ),
+    )
 
 
 @app.get("/api/amazon/ad-plan")

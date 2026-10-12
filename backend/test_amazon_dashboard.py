@@ -84,6 +84,7 @@ from app import (
     _lingxing_mcp_result,
     _lingxing_mcp_metadata_cache,
     _amazon_cache,
+    _amazon_ads_chart_jobs,
     _performance_data_quality,
     _record_performance_quality,
     _reset_lingxing_mcp_metadata_cache,
@@ -155,9 +156,11 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def setUp(self):
         reset_mcp_test_state()
         _amazon_cache.clear()
+        _amazon_ads_chart_jobs.clear()
 
     def tearDown(self):
         reset_mcp_test_state()
+        _amazon_ads_chart_jobs.clear()
 
     def test_dashboard_editor_header_is_decoded_after_safe_transport(self):
         encoded = "%E7%BC%96%E8%BE%91%E8%80%85-abc"
@@ -1618,6 +1621,124 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertTrue(result["data_quality"]["complete"])
         for key in ("net_sales", "ad_sales", "ad_cost", "clicks", "sessions", "page_views"):
             self.assertIsNone(result["rows"][0][key])
+
+    def test_ads_charts_large_request_returns_immediately_and_polls_job_result(self):
+        periodic = {
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+            "rows": [{
+                "period": "2026-09-07~2026-09-13",
+                "period_start": "2026-09-07",
+                "period_end": "2026-09-13",
+                "currency": "USD",
+                "net_sales": 100,
+                "ad_sales": 25,
+                "ad_cost": 5,
+                "clicks": 20,
+                "ad_orders": 1,
+                "sessions": 30,
+                "page_views": 40,
+            }],
+        }
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({
+                site_code: {"sid": 101} for site_code in AMAZON_SITE_CODES
+            }),
+        }
+        periodic_mock = AsyncMock(return_value=periodic)
+
+        async def scenario():
+            with patch.dict(os.environ, env), \
+                 patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), \
+                 patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                 patch("app.amazon_dashboard_periodic", new=periodic_mock):
+                first = await amazon_ads_charts(
+                    date(2026, 9, 7),
+                    date(2026, 10, 5),
+                    "全部站点",
+                    "TN10",
+                    False,
+                )
+                state = next(iter(_amazon_ads_chart_jobs.values()))
+                await state["task"]
+                second = await amazon_ads_charts(
+                    date(2026, 9, 7),
+                    date(2026, 10, 5),
+                    "全部站点",
+                    "TN10",
+                    False,
+                )
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        self.assertEqual(first["fetch_status"], "preparing")
+        self.assertTrue(first["data_quality"]["notice"])
+        self.assertEqual(periodic_mock.await_count, 1)
+        self.assertEqual(second["fetch_status"], "ready")
+        self.assertEqual(second["rows"][0]["net_sales"], 100)
+
+    def test_ads_charts_refresh_failure_keeps_last_good_rollup(self):
+        periodic_mock = AsyncMock(side_effect=RuntimeError("认证请求过于频繁"))
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({
+                site_code: {"sid": 101} for site_code in AMAZON_SITE_CODES
+            }),
+        }
+        old_payload = {
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+            "rows": [{
+                "period_start": "2026-09-07",
+                "period_end": "2026-09-13",
+                "currency": "USD",
+                "net_sales": 88,
+            }],
+        }
+
+        async def scenario():
+            with patch.dict(os.environ, env), \
+                 patch("app.lingxing_store_rows", new=AsyncMock(return_value=[])), \
+                 patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                patch("app.amazon_dashboard_periodic", new=periodic_mock):
+                await amazon_ads_charts(
+                    date(2026, 9, 7),
+                    date(2026, 9, 7),
+                    "全部站点",
+                    "TN10",
+                    False,
+                )
+                job_key = next(iter(_amazon_ads_chart_jobs))
+                preparing_state = _amazon_ads_chart_jobs.pop(job_key)
+                preparing_state["task"].cancel()
+                await asyncio.gather(preparing_state["task"], return_exceptions=True)
+                _amazon_cache[job_key[1:]] = (time.monotonic() - 999999, old_payload)
+                result = await amazon_ads_charts(
+                    date(2026, 9, 7),
+                    date(2026, 9, 7),
+                    "全部站点",
+                    "TN10",
+                    True,
+                )
+                state = next(iter(_amazon_ads_chart_jobs.values()))
+                await state["task"]
+                fallback = await amazon_ads_charts(
+                    date(2026, 9, 7),
+                    date(2026, 9, 7),
+                    "全部站点",
+                    "TN10",
+                    False,
+                )
+            return result, fallback
+
+        result, fallback = asyncio.run(scenario())
+        self.assertEqual(result["fetch_status"], "refreshing")
+        self.assertEqual(result["rows"][0]["net_sales"], 88)
+        self.assertIn("最近一次可用数据", result["data_quality"]["notice"])
+        self.assertEqual(fallback["fetch_status"], "degraded")
+        self.assertEqual(fallback["rows"][0]["net_sales"], 88)
+        self.assertIn("认证请求过于频繁", fallback["data_quality"]["notice"])
 
     def test_sales_money_reconciliation_fails_on_material_source_gap(self):
         rows = [{"site": "美国", "series": AMAZON_SERIES[0], "currency": "USD", "ad_cost": 387034.42}]

@@ -23,6 +23,8 @@ const quickRange = ref(5)
 const loading = ref(false)
 const error = ref("")
 const data = ref(null)
+const backgroundStatus = ref("")
+const dataQualityNotice = ref("")
 const salesChartElement = ref(null)
 const conversionChartElement = ref(null)
 const trafficChartElement = ref(null)
@@ -31,6 +33,7 @@ let conversionChart
 let trafficChart
 let resizeObserver
 let chartRequestSeq = 0
+let chartPollTimer
 let eChartsLoader
 
 function ensureECharts() {
@@ -89,6 +92,9 @@ const rows = ref([])
 const currency = ref("USD")
 const fieldAvailability = ref(null)
 const weekLabels = computed(() => rows.value.map((row) => row.week_label || `W${String(isoWeek(row.period_start)).padStart(2, "0")}`))
+const hasChartData = computed(() => rows.value.some((row) => [
+  "net_sales", "ad_sales", "ad_cost", "clicks", "ad_orders", "sessions", "page_views",
+].some((key) => row[key] !== null && row[key] !== undefined)))
 
 const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value || 0))
 const money = (value) => `${currency.value} ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(Number(value || 0))}`
@@ -138,9 +144,11 @@ function syncQuickRange() {
 
 async function load({ refresh = false } = {}) {
   if (!props.apiBase) return
+  clearPollTimer()
   const requestSeq = ++chartRequestSeq
   loading.value = true
   error.value = ""
+  backgroundStatus.value = ""
   try {
     const query = new URLSearchParams({ start_week: startWeek.value, end_week: endWeek.value, site: site.value, model: model.value })
     if (refresh) query.set("refresh", "true")
@@ -152,13 +160,28 @@ async function load({ refresh = false } = {}) {
     rows.value = body.rows || []
     currency.value = body.currency || "USD"
     fieldAvailability.value = body.field_availability || null
+    backgroundStatus.value = body.fetch_status === "preparing" || body.fetch_status === "refreshing"
+      ? body.data_quality?.notice || "领星产品表现数据正在后台同步。"
+      : ""
+    dataQualityNotice.value = body.fetch_status === "degraded" || body.data_quality?.complete === false
+      ? body.data_quality?.notice || body.data_quality?.errors?.join("；") || "当前领星产品表现数据不完整，请稍后刷新。"
+      : ""
     await nextTick()
     await renderCharts()
+    if (backgroundStatus.value) {
+      if (chartPollTimer) clearTimeout(chartPollTimer)
+      chartPollTimer = setTimeout(() => {
+        chartPollTimer = null
+        void load()
+      }, 3000)
+    }
   } catch (e) {
     if (requestSeq !== chartRequestSeq) return
     error.value = e.message || "广告图表加载失败"
     rows.value = []
     fieldAvailability.value = null
+    backgroundStatus.value = ""
+    dataQualityNotice.value = ""
     await nextTick()
     await renderCharts()
   } finally {
@@ -186,6 +209,13 @@ function baseOption(ariaText) {
       axisTick: { show: false },
       axisLabel: { color: "#67788f", fontSize: 10, hideOverlap: true },
     },
+  }
+}
+
+function clearPollTimer() {
+  if (chartPollTimer) {
+    clearTimeout(chartPollTimer)
+    chartPollTimer = null
   }
 }
 
@@ -289,6 +319,7 @@ watch(endWeek, (value) => {
 watch(() => [props.apiBase, startWeek.value, endWeek.value, site.value, model.value], () => load())
 
 onBeforeUnmount(() => {
+  clearPollTimer()
   resizeObserver?.disconnect()
   salesChart?.dispose()
   conversionChart?.dispose()
@@ -314,8 +345,11 @@ onBeforeUnmount(() => {
       <label><span>型号</span><el-select v-model="model"><el-option v-for="item in modelOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></label>
     </div>
     <DashboardState v-if="error" class="ads-chart-state" state="error" title="广告周度图表加载失败" :message="error" />
+    <DashboardState v-else-if="backgroundStatus && !hasChartData" class="ads-chart-state" state="loading" title="正在同步领星产品表现数据" :message="backgroundStatus" />
+    <DashboardState v-else-if="dataQualityNotice && !hasChartData" class="ads-chart-state" state="warning" title="广告周度图表数据不完整" :message="dataQualityNotice" />
     <DashboardState v-else-if="loading && !rows.length" class="ads-chart-state" state="loading" title="正在同步领星产品表现数据" message="正在读取产品表现与广告指标，请稍候。" />
     <DashboardState v-else-if="!rows.length" class="ads-chart-state" state="empty" title="当前周度范围暂无数据" message="可调整开始周、结束周、站点或型号后重新加载。" />
+    <div v-else-if="backgroundStatus || dataQualityNotice" class="ads-chart-background" role="status">{{ [backgroundStatus, dataQualityNotice].filter(Boolean).join(" ") }}</div>
     <div v-else class="ads-chart-grid">
       <article>
         <header><span class="ads-chart-icon money" aria-hidden="true"><svg viewBox="0 0 24 24" role="presentation"><path d="M12 3.75a1 1 0 0 1 .97.757L13.45 7h2.3a1 1 0 1 1 0 2h-1.85l-.65 3h1.75a1 1 0 1 1 0 2h-2.18l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L10.88 14H8.7l-.48 2.24a1 1 0 0 1-1.955-.21 1 1 0 0 1 0-.21L6.28 14H5a1 1 0 1 1 0-2h1.68l.65-3H5.75a1 1 0 1 1 0-2h2.05l.48-2.24a1 1 0 0 1 1.955.42L10.12 7h2.18l.35-1.49A1 1 0 0 1 12 3.75ZM9.78 9l-.65 3h2.18l.65-3H9.78Z"/></svg></span><div><strong>销售看板</strong><small>销售额 · 广告销售额 · 费比</small></div></header>
@@ -339,6 +373,7 @@ onBeforeUnmount(() => {
 .ads-chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.ads-chart-head span{color:#73849a;font-size:12px;font-weight:750}.ads-chart-head h2{margin:3px 0 0;color:#132f5b;font-size:18px}.ads-chart-head p{margin:5px 0 0;color:#73849a;font-size:12px}.ads-chart-head button{height:36px;padding:0 14px;border:0;border-radius:9px;background:#1e57c8;color:#fff;font:inherit;font-size:13px;font-weight:700;cursor:pointer}.ads-chart-head button:disabled{opacity:.65;cursor:not-allowed}
 .ads-chart-filters{display:grid;grid-template-columns:repeat(5,minmax(136px,1fr));gap:12px;margin-top:16px;padding:14px;border:0;border-radius:12px;background:#f7fbff}.ads-chart-filters label{display:grid;gap:6px;min-width:0}.ads-chart-filters span{color:#5f7188;font-size:12px;font-weight:750}
 .ads-chart-state{margin-top:16px}
+.ads-chart-background{margin-top:14px;padding:9px 12px;border:1px solid #bfd8ff;border-radius:10px;background:#eff6ff;color:#1d4ed8;font-size:12px}
 .ads-chart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:16px}.ads-chart-grid article{position:relative;min-width:0;padding:14px;border:1px solid #e5edf7;border-radius:14px;background:#fff}.ads-chart-grid header{display:flex;align-items:center;gap:10px;margin-bottom:8px}.ads-chart-grid header div{display:grid;min-width:0}.ads-chart-grid strong{color:#173d70;font-size:14px}.ads-chart-grid small{overflow:hidden;color:#75869c;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ads-chart-icon{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:10px}.ads-chart-icon svg{width:18px;height:18px;fill:currentColor}.ads-chart-icon.money{color:#1d4ed8;background:#e8f1ff}.ads-chart-icon.click{color:#b45309;background:#fff4df}.ads-chart-icon.traffic{color:#7c3aed;background:#f2ecff}.ads-chart-canvas{width:100%;height:310px}.ads-chart-missing{position:absolute;right:14px;bottom:14px;left:14px;margin:0;padding:7px 10px;border-radius:8px;background:rgba(255,247,235,.94);color:#a05a00;font-size:11px;text-align:center}
 @media (max-width:1500px){.ads-chart-grid{grid-template-columns:1fr}.ads-chart-filters{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:720px){.ads-chart-filters{grid-template-columns:1fr}}
