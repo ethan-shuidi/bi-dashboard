@@ -341,18 +341,18 @@ AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
 LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS = float(
-    os.environ.get("LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", "1.1")
+    os.environ.get("LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", "3")
 )
 LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS = tuple(
     float(value)
     for value in os.environ.get(
         "LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS",
-        "0.5,1,2,4",
+        "3,8,15",
     ).split(",")
     if value.strip()
 )
 LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS = float(
-    os.environ.get("LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", "20")
+    os.environ.get("LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", "65")
 )
 AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
@@ -3892,14 +3892,16 @@ async def lingxing_mcp_metadata(
     client: httpx.AsyncClient,
     force_refresh: bool = False,
 ) -> LingXingMCPMetadata:
-    """Resolve a tool from the live catalog, with a verified version fallback.
+    """Resolve a tool version without spending rate-limited discovery calls.
 
     LingXing's catalog responses have changed shape at least once: ``help`` and
     ``search`` can describe a tool without returning the three version fields
     required by ``action``.  Prefer fresh catalog values whenever they exist,
-    but keep the last production-verified tuple as a fallback instead of
-    silently dropping the authoritative MCP data source.
+    and keep the last production-verified tuple for normal calls.  Discovery
+    itself consumes authenticated MCP requests, so run it only when a tool has
+    no verified version or when an action explicitly reports a catalog update.
     """
+    global _lingxing_mcp_catalog_version
 
     async with _lingxing_mcp_metadata_lock:
         cached = _lingxing_mcp_metadata_cache.get(tool_id)
@@ -3907,6 +3909,18 @@ async def lingxing_mcp_metadata(
             return cached[1]
         if force_refresh:
             _lingxing_mcp_metadata_cache.clear()
+
+        known_version = LINGXING_MCP_KNOWN_VERSIONS.get(tool_id)
+        if known_version is not None and not force_refresh:
+            metadata = LingXingMCPMetadata(
+                tool_id=tool_id,
+                catalog_version=known_version[0],
+                schema_version=known_version[1],
+                tool_version_id=known_version[2],
+            )
+            _lingxing_mcp_catalog_version = metadata.catalog_version
+            _lingxing_mcp_metadata_cache[tool_id] = (time.monotonic(), metadata)
+            return metadata
 
         help_result: Any = None
         search_result: Any = None
@@ -3974,7 +3988,6 @@ async def lingxing_mcp_metadata(
                 tool_version_id=known_version[2],
             )
 
-        global _lingxing_mcp_catalog_version
         catalog_text = metadata.catalog_version
         if _lingxing_mcp_catalog_version and _lingxing_mcp_catalog_version != catalog_text:
             _lingxing_mcp_metadata_cache.clear()

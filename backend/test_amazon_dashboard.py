@@ -375,7 +375,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             }]},
         })
         client = AsyncMock()
-        client.post.side_effect = [*mcp_metadata_responses("query_product_performance_asin_lists"), action_response]
+        client.post.side_effect = [action_response]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
             reset_mcp_test_state()
             rows = asyncio.run(fetch_mcp_product_performance(14292, date(2026, 9, 7), date(2026, 9, 13), client))
@@ -385,7 +385,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sbv"]["clicks"], 100)
         self.assertEqual(product_performance_ad_breakdown(rows[0])["sd"]["clicks"], 470)
         self.assertTrue(product_performance_typed_clicks_present(rows[0]))
-        self.assertEqual(client.post.call_count, 3)
+        self.assertEqual(client.post.call_count, 1)
 
     def test_mcp_product_performance_explicitly_requests_currency(self):
         captured: list[dict] = []
@@ -418,9 +418,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         })
         client = AsyncMock()
         client.post.side_effect = [
-            *mcp_metadata_responses("ad_auth_shops"),
             shops_response,
-            *mcp_metadata_responses("ad_campaign_report"),
             campaign_response,
         ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
@@ -432,14 +430,13 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(result.expected, 1)
         self.assertEqual(result.pages, 1)
         self.assertTrue(result.complete)
-        self.assertEqual(client.post.call_count, 6)
+        self.assertEqual(client.post.call_count, 2)
 
     def test_mcp_catalog_update_refreshes_metadata_and_retries_once(self):
         error_response = mcp_response({"success": False, "msg": "Catalog已更新，请重新查询工具版本"})
         success_response = mcp_response({"success": True, "data": {"value": 42}})
         client = AsyncMock()
         client.post.side_effect = [
-            *mcp_metadata_responses("ad_campaign_report", "20260914"),
             error_response,
             *mcp_metadata_responses("ad_campaign_report", "20260915"),
             success_response,
@@ -449,15 +446,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             result = asyncio.run(lingxing_mcp_call("ad_campaign_report", {"page": 1}, client))
             reset_mcp_test_state()
         self.assertEqual(result, {"value": 42})
-        self.assertEqual(client.post.call_count, 6)
+        self.assertEqual(client.post.call_count, 4)
         retry_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
         self.assertEqual(retry_arguments["catalogVersion"], "20260915")
 
-    def test_mcp_version_fallback_survives_catalog_without_version_fields(self):
+    def test_mcp_known_metadata_avoids_discovery_requests(self):
         action_response = mcp_response({"success": True, "data": {"value": 42}})
         client = AsyncMock()
         client.post.side_effect = [
-            *mcp_metadata_responses_without_versions("ad_auth_shops"),
             action_response,
         ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
@@ -465,7 +461,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             result = asyncio.run(lingxing_mcp_call("ad_auth_shops", {}, client))
             reset_mcp_test_state()
         self.assertEqual(result, {"value": 42})
-        self.assertEqual(client.post.call_count, 3)
+        self.assertEqual(client.post.call_count, 1)
         action_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
         self.assertEqual(action_arguments["catalogVersion"], "lingxing-mcp-20260915-v1")
         self.assertEqual(action_arguments["schemaVersion"], "ad_auth_shops-v1-c500-20260907")
@@ -514,9 +510,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             batches.append(mcp_response({"success": True, "data": {"recordsFiltered": 208, "data": rows}}))
         client = AsyncMock()
         client.post.side_effect = [
-            *mcp_metadata_responses("ad_auth_shops"),
             shops_response,
-            *mcp_metadata_responses("ad_campaign_report"),
             *batches,
         ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
@@ -539,9 +533,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         ]
         client = AsyncMock()
         client.post.side_effect = [
-            *mcp_metadata_responses("ad_auth_shops"),
             shops_response,
-            *mcp_metadata_responses("ad_campaign_report"),
             *batches,
         ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
@@ -557,7 +549,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def test_mcp_campaign_profile_missing_is_explicitly_incomplete(self):
         shops_response = mcp_response({"success": True, "data": [{"sid": 99999, "profile_id": "other"}]})
         client = AsyncMock()
-        client.post.side_effect = [*mcp_metadata_responses("ad_auth_shops"), shops_response]
+        client.post.side_effect = [shops_response]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
             _reset_lingxing_mcp_metadata_cache()
             result = asyncio.run(fetch_mcp_campaign_report(14292, date(2026, 9, 7), date(2026, 9, 13), client))
