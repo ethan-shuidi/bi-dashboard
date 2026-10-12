@@ -85,6 +85,7 @@ from app import (
     _lingxing_mcp_metadata_cache,
     _amazon_cache,
     _amazon_ads_chart_jobs,
+    PriorityAsyncLock,
     _performance_data_quality,
     _record_performance_quality,
     _reset_lingxing_mcp_metadata_cache,
@@ -167,6 +168,35 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(dashboard_editor(encoded), "编辑者-abc")
         self.assertEqual(dashboard_editor("pytest"), "pytest")
         self.assertEqual(dashboard_editor("100%"), "100%")
+
+    def test_priority_lock_lets_foreground_overtake_queued_background_calls(self):
+        lock = PriorityAsyncLock()
+        order: list[str] = []
+
+        async def acquire(name: str, priority: int, delay: float = 0):
+            async with lock.scoped(priority=priority):
+                if delay:
+                    await asyncio.sleep(delay)
+                order.append(name)
+
+        async def scenario():
+            foreground_first = asyncio.create_task(acquire("foreground-first", 0, 0.04))
+            await asyncio.sleep(0.01)
+            background_one = asyncio.create_task(acquire("background-one", 1))
+            background_two = asyncio.create_task(acquire("background-two", 1))
+            foreground_second = asyncio.create_task(acquire("foreground-second", 0))
+            await asyncio.gather(
+                foreground_first,
+                background_one,
+                background_two,
+                foreground_second,
+            )
+
+        asyncio.run(scenario())
+        self.assertEqual(
+            order,
+            ["foreground-first", "foreground-second", "background-one", "background-two"],
+        )
 
     def test_data_source_initialization_builds_the_complete_site_product_matrix(self):
         database = create_engine(

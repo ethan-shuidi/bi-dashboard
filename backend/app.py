@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import heapq
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import hmac
 import math
 import time
 import threading
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
@@ -186,7 +187,67 @@ _engine = None
 _session_factory = None
 _lingxing_token: dict[str, Any] = {}
 _lingxing_token_lock = asyncio.Lock()
-_lingxing_performance_lock = asyncio.Lock()
+
+
+class PriorityAsyncLock:
+    """An asyncio lock that resolves contention by caller priority.
+
+    Ordinary asyncio locks are FIFO.  A long background fetch could therefore
+    queue dozens of upstream calls while a foreground dashboard waited behind
+    it.  This lock keeps normal calls FIFO among themselves, but lets every
+    foreground call overtake queued background calls between network requests.
+    It never preempts a request that is already executing.
+    """
+
+    def __init__(self) -> None:
+        self._locked = False
+        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
+        self._sequence = 0
+
+    async def acquire(self, priority: int = 0) -> None:
+        if not self._locked and not self._waiters:
+            self._locked = True
+            return
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        self._sequence += 1
+        entry = (priority, self._sequence, future)
+        heapq.heappush(self._waiters, entry)
+        try:
+            await future
+        except BaseException:
+            if not future.done() or future.cancelled():
+                for index, current in enumerate(self._waiters):
+                    if current[2] is future:
+                        del self._waiters[index]
+                        break
+            raise
+
+    def release(self) -> None:
+        if not self._locked:
+            raise RuntimeError("priority lock is not acquired")
+        while self._waiters:
+            _, _, future = heapq.heappop(self._waiters)
+            if not future.cancelled():
+                future.set_result(None)
+                return
+        self._locked = False
+
+    @asynccontextmanager
+    async def scoped(self, priority: int = 0):
+        await self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+
+_lingxing_performance_lock = PriorityAsyncLock()
+_amazon_background_fetch: ContextVar[bool] = ContextVar(
+    "amazon_background_fetch",
+    default=False,
+)
 _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
@@ -218,6 +279,7 @@ _lingxing_mcp_catalog_version = ""
 _lingxing_mcp_request_last_call = 0.0
 _lingxing_mcp_rate_limited_until = 0.0
 _amazon_ads_chart_jobs: dict[tuple[Any, ...], dict[str, Any]] = {}
+_amazon_ads_chart_job_gate = asyncio.Semaphore(1)
 
 
 class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
@@ -3141,7 +3203,8 @@ async def fetch_product_performance(
                     # Serialize product-performance calls across periods so a
                     # week/month query cannot self-rate-limit its own requests.
                     global _lingxing_performance_last_call
-                    async with _lingxing_performance_lock:
+                    background = _amazon_background_fetch.get()
+                    async with _lingxing_performance_lock.scoped(priority=1 if background else 0):
                         # LingXing documents a one-request token bucket for
                         # this endpoint when querying a single shop. Keep a
                         # small spacing between period requests so later
@@ -6045,24 +6108,27 @@ async def _amazon_ads_chart_job(
     asin_mapping: dict[str, dict[str, str]],
     force_refresh: bool,
 ) -> None:
+    background_token = _amazon_background_fetch.set(True)
     try:
-        state["result"] = await amazon_dashboard_periodic(
-            "周",
-            start,
-            fetch_end,
-            selected_sites,
-            selected_series,
-            products,
-            sid_map,
-            store_rows,
-            display_currency,
-            asin_mapping,
-            force_refresh=force_refresh,
-        )
+        async with _amazon_ads_chart_job_gate:
+            state["result"] = await amazon_dashboard_periodic(
+                "周",
+                start,
+                fetch_end,
+                selected_sites,
+                selected_series,
+                products,
+                sid_map,
+                store_rows,
+                display_currency,
+                asin_mapping,
+                force_refresh=force_refresh,
+            )
     except BaseException as exc:
         state["error"] = str(exc)
         state["error_type"] = type(exc).__name__
     finally:
+        _amazon_background_fetch.reset(background_token)
         state["finished_at"] = time.monotonic()
 
 
