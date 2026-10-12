@@ -604,14 +604,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertFalse(quality["cacheable"])
         self.assertIn("no recognizable ad type", quality["errors"][0])
 
-    def test_strategy_board_fails_closed_and_never_uses_sp_fallback(self):
+    def test_strategy_board_fails_closed_for_non_rate_limit_errors(self):
         incomplete = CampaignReportResult(
             rows=[{"campaign_id": "sp-only", "sponsored_type": "SP"}],
             expected=None,
             pages=0,
             profile_found=False,
             complete=False,
-            error="LingXing MCP request failed: 认证请求过于频繁，请稍后重试",
+            error="LingXing MCP profile_id not found for sid 14292",
         )
         fallback = AsyncMock()
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
@@ -623,6 +623,64 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                     ["美国"], {"US": {"sid": 14292}}, [],
                 ))
         fallback.assert_not_called()
+
+    def test_strategy_board_rate_limit_uses_uncached_openapi_partial_fallback(self):
+        incomplete = CampaignReportResult(
+            rows=[],
+            expected=None,
+            pages=0,
+            profile_found=True,
+            complete=False,
+            error="LingXing MCP request failed: 认证请求过于频繁，请稍后重试",
+        )
+        detail_rows = [{
+            "campaign_id": "openapi-sp", "campaign_name": "OpenAPI SP",
+            "ads_type": "SP", "clicks": 10, "spends": 2.0,
+            "sales": 8.0, "orders": 1, "sales_volume_quantity": 2,
+        }]
+        metadata_rows = [{
+            "campaign_id": "openapi-sp", "campaign_name": "OpenAPI SP",
+            "ads_type": "SP",
+        }]
+        fallback = AsyncMock(side_effect=[detail_rows, metadata_rows])
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[
+            app_module.AmazonCampaignAssignment.__table__,
+            app_module.AmazonCampaignStrategy.__table__,
+            app_module.AmazonStrategyNote.__table__,
+        ])
+        factory = sessionmaker(bind=database, expire_on_commit=False)
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+             patch.object(app_module, "_engine", database), \
+             patch.object(app_module, "_session_factory", factory), \
+             patch("app.fetch_mcp_campaign_report", new=AsyncMock(return_value=incomplete)), \
+             patch("app.fetch_ad_reports_range", new=fallback):
+            result = asyncio.run(amazon_strategy_board_payload(
+                date(2026, 10, 5), date(2026, 10, 11),
+                ["美国"], {"US": {"sid": 14292}}, [],
+            ))
+
+        self.assertEqual(fallback.await_count, 2)
+        quality = result["data_quality"]
+        self.assertTrue(quality["degraded"])
+        self.assertTrue(quality["partial"])
+        self.assertEqual(quality["degraded_reason"], "mcp_rate_limited")
+        self.assertFalse(quality["complete"])
+        self.assertFalse(quality["campaign_inventory_complete"])
+        self.assertFalse(quality["cacheable"])
+        self.assertEqual(quality["source"], "openapi_fallback")
+        self.assertEqual(quality["type_counts"]["SP"], 1)
+        self.assertEqual(quality["type_counts"]["SB"], 0)
+        self.assertIn("SB/SBV/SD", quality["notice"])
+        campaigns = [campaign for group in result["strategies"] for campaign in group["campaigns"]]
+        self.assertEqual(len(campaigns), 1)
+        self.assertEqual(campaigns[0]["campaign_name"], "OpenAPI SP")
+        self.assertEqual(campaigns[0]["clicks"], 10)
+        self.assertFalse(_amazon_cache)
 
     def test_openapi_product_fallback_is_never_marked_complete(self):
         quality = {

@@ -3870,6 +3870,10 @@ def _is_lingxing_mcp_rate_limit_error(error: BaseException) -> bool:
     )
 
 
+def _is_lingxing_mcp_rate_limit_message(message: Any) -> bool:
+    return _is_lingxing_mcp_rate_limit_error(RuntimeError(str(message)))
+
+
 async def lingxing_mcp_raw(
     operation: str,
     arguments: dict[str, Any],
@@ -4374,10 +4378,12 @@ async def amazon_strategy_board_payload(
         # endpoint-level edits pollute the next viewer's raw periodic cache.
         return copy.deepcopy(cached[1])
 
+    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     async with httpx.AsyncClient(timeout=45) as client:
         async def fetch_site(site_name: str):
             site_code = strategy_site_code(site_name)
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
+            native_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
             rows: list[dict[str, Any]] = []
             account_quality: list[dict[str, Any]] = []
             for account in accounts:
@@ -4396,11 +4402,64 @@ async def amazon_strategy_board_payload(
                     if mcp_result and mcp_result.error:
                         errors.append(mcp_result.error)
 
-                # The strategy board is an activity inventory. LingXing's
-                # OpenAPI SP-detail endpoint cannot restore SB/SBV/SD campaigns,
-                # so an incomplete MCP result must fail closed instead of being
-                # padded with a misleading partial fallback.
-                account_rows = list(mcp_result.rows) if mcp_result and mcp_result.complete else []
+                mcp_rate_limited = any(
+                    _is_lingxing_mcp_rate_limit_message(error) for error in errors
+                )
+                fallback_rows: list[dict[str, Any]] = []
+                metadata_rows: list[dict[str, Any]] = []
+                fallback_used = False
+                if mcp_result is not None and mcp_result.complete:
+                    account_rows = list(mcp_result.rows)
+                elif mcp_rate_limited:
+                    # Rate limiting is the only condition where a partial
+                    # inventory may be shown. The OpenAPI source is useful for
+                    # keeping SP campaigns readable, but it can never restore a
+                    # complete SB/SBV/SD inventory and must stay explicitly
+                    # degraded and uncached.
+                    try:
+                        fallback_rows = await fetch_ad_reports_range(
+                            int(account["sid"]), start_date, end_date, client, semaphore
+                        )
+                        metadata_rows = await fetch_ad_reports_range(
+                            int(account["sid"]), start_date, end_date, client, semaphore,
+                            show_detail=0,
+                        )
+                        fallback_used = True
+                    except (RuntimeError, httpx.HTTPError) as exc:
+                        errors.append(str(exc))
+                    metadata_by_id: dict[str, dict[str, Any]] = {}
+                    for metadata in metadata_rows:
+                        metadata_id = ad_report_campaign_id(metadata)
+                        if metadata_id and (strategy_campaign_name(metadata) or ad_report_type(metadata)):
+                            metadata_by_id.setdefault(metadata_id, metadata)
+
+                    combined_by_campaign: dict[str, dict[str, Any]] = {}
+                    source_rows = list(mcp_result.rows if mcp_result else []) + fallback_rows
+                    for row in source_rows:
+                        campaign_key = ad_report_campaign_id(row) or strategy_campaign_name(row)
+                        if not campaign_key:
+                            continue
+                        metadata = metadata_by_id.get(ad_report_campaign_id(row))
+                        merged = dict(metadata or {})
+                        merged.update({
+                            key: value for key, value in row.items()
+                            if value not in (None, "", [], {})
+                        })
+                        previous = combined_by_campaign.get(campaign_key)
+                        if previous is not None:
+                            previous_currency = ad_report_currency(previous, native_currency)
+                            row_currency = ad_report_currency(row, native_currency)
+                            if previous_currency != row_currency:
+                                raise RuntimeError(
+                                    f"广告活动同一分组返回混合币种，拒绝相加：{site_name} "
+                                    f"{strategy_campaign_name(row) or campaign_key} "
+                                    f"{previous_currency} / {row_currency}"
+                                )
+                        if previous is None or (mcp_result and row in mcp_result.rows):
+                            combined_by_campaign[campaign_key] = merged
+                    account_rows = list(combined_by_campaign.values())
+                else:
+                    account_rows = []
                 for row in account_rows:
                     row["_store_sid"] = str(row.get("_store_sid") or account_sid)
                     row["_store_name"] = str(ad_report_store_name(row) or account.get("name") or account.get("account_name") or "未命名店铺")
@@ -4417,6 +4476,8 @@ async def amazon_strategy_board_payload(
                     "campaign_expected": mcp_result.expected if mcp_result else None,
                     "profile_found": bool(mcp_result and mcp_result.profile_found),
                     "complete": bool(mcp_result and mcp_result.complete),
+                    "rate_limited": mcp_rate_limited,
+                    "fallback_used": fallback_used,
                     "errors": errors,
                 })
             store_lookup = {str(item.get("sid")): item for item in (store_rows or []) if item.get("sid") is not None}
@@ -4433,12 +4494,27 @@ async def amazon_strategy_board_payload(
         fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
 
     data_quality = _strategy_campaign_data_quality(fetched)
+    rate_limited_accounts = sum(bool(quality.get("rate_limited")) for _, _, _, qualities in fetched for quality in qualities)
+    fallback_accounts = sum(bool(quality.get("fallback_used")) for _, _, _, qualities in fetched for quality in qualities)
+    degraded = fallback_accounts > 0 or rate_limited_accounts > 0
+    if degraded:
+        data_quality.update({
+            "degraded": True,
+            "degraded_reason": "mcp_rate_limited",
+            "partial": True,
+            "notice": "领星广告接口限流，当前仅展示 OpenAPI 降级数据；SB/SBV/SD 广告活动可能缺失，汇总不可作为完整口径。",
+        })
     if not data_quality.get("campaign_inventory_complete"):
-        detail = "; ".join(str(error) for error in data_quality.get("errors", []))
-        raise RuntimeError(
-            "领星 MCP 广告活动清单不完整，已阻止不可信降级数据展示"
-            + (f"：{detail[:500]}" if detail else "")
-        )
+        if data_quality.get("degraded"):
+            # Do not cache a partial inventory. The next request should retry
+            # the authoritative MCP source after its cooldown.
+            pass
+        else:
+            detail = "; ".join(str(error) for error in data_quality.get("errors", []))
+            raise RuntimeError(
+                "领星 MCP 广告活动清单不完整，已阻止不可信降级数据展示"
+                + (f"：{detail[:500]}" if detail else "")
+            )
 
     assignments: dict[tuple[str, str, str], dict[str, str]] = {}
     assignment_metadata: dict[tuple[str, str, str], dict[str, str | None]] = {}
