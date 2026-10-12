@@ -191,7 +191,9 @@ _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
+_lingxing_mcp_request_lock = asyncio.Lock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
+_lingxing_mcp_shop_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
 _keyword_unavailable_weeks_lock = threading.RLock()
 _keyword_unavailable_weeks: dict[tuple[str, date], datetime] = {}
@@ -213,6 +215,8 @@ _amazon_cache_scope: ContextVar[str] = ContextVar(
 )
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
+_lingxing_mcp_request_last_call = 0.0
+_lingxing_mcp_rate_limited_until = 0.0
 
 
 class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
@@ -336,6 +340,20 @@ KEYWORD_DASHBOARD_FETCH_LOCK_NAME = "bi_dashboard_keyword_fetch"
 AMAZON_CACHE_TTL_SECONDS = 600
 LINGXING_STORE_CACHE_TTL_SECONDS = 900
 LINGXING_MCP_METADATA_TTL_SECONDS = 3600
+LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS = float(
+    os.environ.get("LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", "1.1")
+)
+LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS = tuple(
+    float(value)
+    for value in os.environ.get(
+        "LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS",
+        "0.5,1,2,4",
+    ).split(",")
+    if value.strip()
+)
+LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS = float(
+    os.environ.get("LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", "20")
+)
 AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
     "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
@@ -3675,9 +3693,11 @@ def lingxing_mcp_key() -> str:
 def _reset_lingxing_mcp_metadata_cache() -> None:
     """Clear dynamically resolved MCP metadata; used by tests and refreshes."""
 
-    global _lingxing_mcp_catalog_version
+    global _lingxing_mcp_catalog_version, _lingxing_mcp_request_last_call, _lingxing_mcp_rate_limited_until
     _lingxing_mcp_metadata_cache.clear()
     _lingxing_mcp_catalog_version = ""
+    _lingxing_mcp_request_last_call = 0.0
+    _lingxing_mcp_rate_limited_until = 0.0
 
 
 def _normalized_key(key: Any) -> str:
@@ -3808,6 +3828,18 @@ def _lingxing_mcp_result(payload: dict[str, Any]) -> Any:
     return nested if nested is not None else business
 
 
+def _is_lingxing_mcp_rate_limit_error(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code == 429
+    message = str(error).lower()
+    return (
+        "认证请求过于频繁" in message
+        or "too frequent" in message
+        or "rate limit" in message
+        or "status: 429" in message
+    )
+
+
 async def lingxing_mcp_raw(
     operation: str,
     arguments: dict[str, Any],
@@ -3815,6 +3847,7 @@ async def lingxing_mcp_raw(
 ) -> Any:
     """Call a low-level LingXing MCP operation without hard-coded versions."""
 
+    global _lingxing_mcp_request_last_call, _lingxing_mcp_rate_limited_until
     key = lingxing_mcp_key()
     if not key:
         raise RuntimeError("LINGXING_MCP_KEY missing")
@@ -3824,13 +3857,34 @@ async def lingxing_mcp_raw(
         "method": "tools/call",
         "params": {"name": operation, "arguments": arguments},
     }
-    response = await client.post(
-        LINGXING_MCP_URL,
-        json=payload,
-        headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
-    )
-    response.raise_for_status()
-    return _lingxing_mcp_result(_lingxing_mcp_json_body(response))
+    async with _lingxing_mcp_request_lock:
+        now = time.monotonic()
+        if now < _lingxing_mcp_rate_limited_until:
+            raise RuntimeError("LingXing MCP request failed: 认证请求过于频繁，冷却中请稍后重试")
+        for attempt in range(len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1):
+            wait_for = _lingxing_mcp_request_last_call + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - time.monotonic()
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            try:
+                response = await client.post(
+                    LINGXING_MCP_URL,
+                    json=payload,
+                    headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
+                )
+                _lingxing_mcp_request_last_call = time.monotonic()
+                response.raise_for_status()
+                result = _lingxing_mcp_result(_lingxing_mcp_json_body(response))
+                _lingxing_mcp_rate_limited_until = 0.0
+                return result
+            except (RuntimeError, httpx.HTTPStatusError) as exc:
+                rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
+                if not rate_limited or attempt >= len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                    if rate_limited:
+                        _lingxing_mcp_rate_limited_until = (
+                            time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
+                        )
+                    raise
+                await asyncio.sleep(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt])
 
 
 async def lingxing_mcp_metadata(
@@ -4016,14 +4070,18 @@ async def lingxing_mcp_shop_rows(client: httpx.AsyncClient) -> list[dict[str, An
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
         return list(cached[1])
-    data = await lingxing_mcp_call(
-        LINGXING_MCP_SHOPS_TOOL,
-        {},
-        client,
-    )
-    rows = data if isinstance(data, list) else []
-    _amazon_cache[cache_key] = (time.monotonic(), rows)
-    return rows
+    async with _lingxing_mcp_shop_lock:
+        cached = _amazon_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < LINGXING_STORE_CACHE_TTL_SECONDS:
+            return list(cached[1])
+        data = await lingxing_mcp_call(
+            LINGXING_MCP_SHOPS_TOOL,
+            {},
+            client,
+        )
+        rows = data if isinstance(data, list) else []
+        _amazon_cache[cache_key] = (time.monotonic(), rows)
+        return rows
 
 
 @dataclass
@@ -4273,12 +4331,10 @@ async def amazon_strategy_board_payload(
         # endpoint-level edits pollute the next viewer's raw periodic cache.
         return copy.deepcopy(cached[1])
 
-    semaphore = asyncio.Semaphore(AMAZON_UPSTREAM_CONCURRENCY)
     async with httpx.AsyncClient(timeout=45) as client:
         async def fetch_site(site_name: str):
             site_code = strategy_site_code(site_name)
             accounts = amazon_sid_accounts(site_name, sid_map, store_rows)
-            native_currency = AMAZON_CURRENCY_CODES.get(site_name, "USD")
             rows: list[dict[str, Any]] = []
             account_quality: list[dict[str, Any]] = []
             for account in accounts:
@@ -4297,45 +4353,11 @@ async def amazon_strategy_board_payload(
                     if mcp_result and mcp_result.error:
                         errors.append(mcp_result.error)
 
-                # OpenAPI is only an explicit degraded source. Its SP-detail
-                # endpoint can enrich names/types and preserve visible rows,
-                # but it can never turn an incomplete MCP inventory into a
-                # complete SB/SBV/SD campaign list.
-                fallback_rows: list[dict[str, Any]] = []
-                metadata_rows: list[dict[str, Any]] = []
-                if mcp_result is None or not mcp_result.complete:
-                    try:
-                        fallback_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore)
-                        metadata_rows = await fetch_ad_reports_range(int(account["sid"]), start_date, end_date, client, semaphore, show_detail=0)
-                    except (RuntimeError, httpx.HTTPError) as exc:
-                        errors.append(str(exc))
-                metadata_by_id: dict[str, dict[str, Any]] = {}
-                for metadata in metadata_rows:
-                    metadata_id = ad_report_campaign_id(metadata)
-                    if metadata_id and (ad_report_campaign_name(metadata) or ad_report_type(metadata)):
-                        metadata_by_id.setdefault(metadata_id, metadata)
-
-                combined_by_campaign: dict[str, dict[str, Any]] = {}
-                source_rows = list(mcp_result.rows if mcp_result else []) + fallback_rows
-                for row in source_rows:
-                    campaign_key = ad_report_campaign_id(row) or ad_report_campaign_name(row)
-                    if not campaign_key:
-                        continue
-                    metadata = metadata_by_id.get(ad_report_campaign_id(row))
-                    merged = dict(metadata or {})
-                    merged.update({key: value for key, value in row.items() if value not in (None, "", [], {})})
-                    previous = combined_by_campaign.get(campaign_key)
-                    if previous is not None:
-                        previous_currency = ad_report_currency(previous, native_currency)
-                        row_report_currency = ad_report_currency(row, native_currency)
-                        if previous_currency != row_report_currency:
-                            raise RuntimeError(
-                                f"广告活动同一分组返回混合币种，拒绝相加：{site_name} "
-                                f"{ad_report_campaign_name(row) or campaign_key} {previous_currency} / {row_report_currency}"
-                            )
-                    if previous is None or (mcp_result and row in mcp_result.rows):
-                        combined_by_campaign[campaign_key] = merged
-                account_rows = list(combined_by_campaign.values())
+                # The strategy board is an activity inventory. LingXing's
+                # OpenAPI SP-detail endpoint cannot restore SB/SBV/SD campaigns,
+                # so an incomplete MCP result must fail closed instead of being
+                # padded with a misleading partial fallback.
+                account_rows = list(mcp_result.rows) if mcp_result and mcp_result.complete else []
                 for row in account_rows:
                     row["_store_sid"] = str(row.get("_store_sid") or account_sid)
                     row["_store_name"] = str(ad_report_store_name(row) or account.get("name") or account.get("account_name") or "未命名店铺")
@@ -4366,6 +4388,14 @@ async def amazon_strategy_board_payload(
             return site_name, site_code, rows, account_quality
 
         fetched = await asyncio.gather(*(fetch_site(site_name) for site_name in selected_sites))
+
+    data_quality = _strategy_campaign_data_quality(fetched)
+    if not data_quality.get("campaign_inventory_complete"):
+        detail = "; ".join(str(error) for error in data_quality.get("errors", []))
+        raise RuntimeError(
+            "领星 MCP 广告活动清单不完整，已阻止不可信降级数据展示"
+            + (f"：{detail[:500]}" if detail else "")
+        )
 
     assignments: dict[tuple[str, str, str], dict[str, str]] = {}
     assignment_metadata: dict[tuple[str, str, str], dict[str, str | None]] = {}
@@ -4450,7 +4480,6 @@ async def amazon_strategy_board_payload(
             if value:
                 unassigned_campaign_spend[key] = unassigned_campaign_spend.get(key, 0.0) + value
     output = amazon_strategy_board_groups(aggregate, assignments, notes, selected_sites, series_filter, week_scope)
-    data_quality = _strategy_campaign_data_quality(fetched)
     data_quality["unassigned_campaign_spend"] = {
         f"{site}|{currency}": value
         for (site, currency), value in unassigned_campaign_spend.items()

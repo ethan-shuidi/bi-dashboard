@@ -91,7 +91,11 @@ from app import (
     fetch_mcp_product_performance,
     fetch_product_performance,
     fetch_mcp_campaign_report,
+    CampaignReportResult,
+    amazon_strategy_board_payload,
     lingxing_mcp_call,
+    lingxing_mcp_raw,
+    lingxing_mcp_shop_rows,
     product_performance_typed_clicks_present,
     validate_strategy_series,
 )
@@ -467,6 +471,37 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(action_arguments["schemaVersion"], "ad_auth_shops-v1-c500-20260907")
         self.assertEqual(action_arguments["toolVersionId"], 199)
 
+    def test_mcp_rate_limit_retries_then_enters_cooldown(self):
+        rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
+        client = AsyncMock()
+        client.post.side_effect = [rate_limited, rate_limited]
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+             patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
+             patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS", (0.0,)), \
+             patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", 20.0):
+            with self.assertRaisesRegex(RuntimeError, "认证请求过于频繁"):
+                asyncio.run(lingxing_mcp_raw("action", {}, client))
+            self.assertGreater(
+                app_module._lingxing_mcp_rate_limited_until,
+                time.monotonic(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "冷却中"):
+                asyncio.run(lingxing_mcp_raw("action", {}, client))
+        self.assertEqual(client.post.call_count, 2)
+
+    def test_mcp_shop_catalog_concurrent_calls_are_deduplicated(self):
+        call = AsyncMock(return_value=[{"sid": 14292, "profile_id": "profile-1"}])
+
+        async def fetch_all():
+            return await asyncio.gather(*(
+                lingxing_mcp_shop_rows(AsyncMock()) for _ in range(5)
+            ))
+
+        with patch("app.lingxing_mcp_call", new=call):
+            rows_groups = asyncio.run(fetch_all())
+        self.assertEqual(rows_groups, [[{"sid": 14292, "profile_id": "profile-1"}]] * 5)
+        self.assertEqual(call.await_count, 1)
+
     def test_mcp_campaign_report_paginates_to_records_filtered(self):
         shops_response = mcp_response({"success": True, "data": [{"sid": 14292, "profile_id": "profile-1"}]})
         batches = []
@@ -575,6 +610,26 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertFalse(quality["campaign_inventory_complete"])
         self.assertFalse(quality["cacheable"])
         self.assertIn("no recognizable ad type", quality["errors"][0])
+
+    def test_strategy_board_fails_closed_and_never_uses_sp_fallback(self):
+        incomplete = CampaignReportResult(
+            rows=[{"campaign_id": "sp-only", "sponsored_type": "SP"}],
+            expected=None,
+            pages=0,
+            profile_found=False,
+            complete=False,
+            error="LingXing MCP request failed: 认证请求过于频繁，请稍后重试",
+        )
+        fallback = AsyncMock()
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+             patch("app.fetch_mcp_campaign_report", new=AsyncMock(return_value=incomplete)), \
+             patch("app.fetch_ad_reports_range", new=fallback):
+            with self.assertRaisesRegex(RuntimeError, "广告活动清单不完整"):
+                asyncio.run(amazon_strategy_board_payload(
+                    date(2026, 10, 5), date(2026, 10, 11),
+                    ["美国"], {"US": {"sid": 14292}}, [],
+                ))
+        fallback.assert_not_called()
 
     def test_openapi_product_fallback_is_never_marked_complete(self):
         quality = {
