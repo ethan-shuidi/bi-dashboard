@@ -276,8 +276,7 @@ _amazon_cache_scope: ContextVar[str] = ContextVar(
 )
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
-_lingxing_mcp_request_last_call = 0.0
-_lingxing_mcp_rate_limited_until = 0.0
+_lingxing_mcp_key_states: dict[str, dict[str, float]] = {}
 _amazon_ads_chart_jobs: dict[tuple[Any, ...], dict[str, Any]] = {}
 _amazon_ads_chart_job_gate = asyncio.Semaphore(1)
 
@@ -3121,7 +3120,7 @@ async def fetch_product_performance(
     # mapped for this site; avoid issuing an unfiltered request in that case.
     if asin_list == []:
         return []
-    if lingxing_mcp_key():
+    if lingxing_mcp_keys():
         try:
             rows = await fetch_mcp_product_performance(sid, start_date, end_date, client, asin_list, currency_code)
             # LingXing defaults its product-performance currency to CNY. The
@@ -3814,14 +3813,27 @@ def lingxing_mcp_key() -> str:
     return os.environ.get("LINGXING_MCP_KEY", "").strip()
 
 
+def lingxing_mcp_keys() -> list[str]:
+    """Return configured MCP keys without exposing them in caller state."""
+
+    values = [
+        lingxing_mcp_key(),
+        os.environ.get("LINGXING_API_KEY2", "").strip(),
+    ]
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _lingxing_mcp_state_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def _reset_lingxing_mcp_metadata_cache() -> None:
     """Clear dynamically resolved MCP metadata; used by tests and refreshes."""
 
-    global _lingxing_mcp_catalog_version, _lingxing_mcp_request_last_call, _lingxing_mcp_rate_limited_until
+    global _lingxing_mcp_catalog_version
     _lingxing_mcp_metadata_cache.clear()
     _lingxing_mcp_catalog_version = ""
-    _lingxing_mcp_request_last_call = 0.0
-    _lingxing_mcp_rate_limited_until = 0.0
+    _lingxing_mcp_key_states.clear()
 
 
 def _normalized_key(key: Any) -> str:
@@ -3975,10 +3987,13 @@ async def lingxing_mcp_raw(
 ) -> Any:
     """Call a low-level LingXing MCP operation without hard-coded versions."""
 
-    global _lingxing_mcp_request_last_call, _lingxing_mcp_rate_limited_until
-    key = lingxing_mcp_key()
-    if not key:
+    configured_keys = lingxing_mcp_keys()
+    if not configured_keys:
         raise RuntimeError("LINGXING_MCP_KEY missing")
+    keys = [
+        (_lingxing_mcp_state_key(key), key)
+        for key in configured_keys
+    ]
     payload = {
         "jsonrpc": "2.0",
         "id": f"bi-dashboard-{time.time_ns()}",
@@ -3986,11 +4001,22 @@ async def lingxing_mcp_raw(
         "params": {"name": operation, "arguments": arguments},
     }
     async with _lingxing_mcp_request_lock:
-        now = time.monotonic()
-        if now < _lingxing_mcp_rate_limited_until:
-            raise RuntimeError("LingXing MCP request failed: 认证请求过于频繁，冷却中请稍后重试")
-        for attempt in range(len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1):
-            wait_for = _lingxing_mcp_request_last_call + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - time.monotonic()
+        attempt = 0
+        exhausted_keys: set[str] = set()
+        while True:
+            now = time.monotonic()
+            available = [
+                (state["last_call"], index, digest, key)
+                for index, (digest, key) in enumerate(keys)
+                if now >= (state := _lingxing_mcp_key_states.setdefault(
+                    digest, {"last_call": 0.0, "cooldown_until": 0.0}
+                ))["cooldown_until"]
+            ]
+            if not available:
+                raise RuntimeError("LingXing MCP request failed: 认证请求过于频繁，冷却中请稍后重试")
+            _, _, digest, key = min(available)
+            state = _lingxing_mcp_key_states[digest]
+            wait_for = state["last_call"] + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - time.monotonic()
             if wait_for > 0:
                 await asyncio.sleep(wait_for)
             try:
@@ -3999,20 +4025,32 @@ async def lingxing_mcp_raw(
                     json=payload,
                     headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
                 )
-                _lingxing_mcp_request_last_call = time.monotonic()
+                state["last_call"] = time.monotonic()
                 response.raise_for_status()
                 result = _lingxing_mcp_result(_lingxing_mcp_json_body(response))
-                _lingxing_mcp_rate_limited_until = 0.0
+                state["cooldown_until"] = 0.0
                 return result
             except (RuntimeError, httpx.HTTPStatusError) as exc:
                 rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
-                if not rate_limited or attempt >= len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS):
-                    if rate_limited:
-                        _lingxing_mcp_rate_limited_until = (
-                            time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
-                        )
+                state["last_call"] = time.monotonic()
+                if not rate_limited:
                     raise
-                await asyncio.sleep(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt])
+                state["cooldown_until"] = time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
+                # With one key, preserve the historical retry schedule. With a
+                # pool, try each non-cooling key once before cooling the pool;
+                # this avoids amplifying requests when LingXing is globally busy.
+                if len(keys) == 1 and attempt < len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                    await asyncio.sleep(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt])
+                    attempt += 1
+                    # Earlier retries must not permanently block the final retry.
+                    state["cooldown_until"] = 0.0
+                    continue
+                exhausted_keys.add(digest)
+                if len(exhausted_keys) == len(keys):
+                    raise
+                # A pool request has not finished until every key has either
+                # succeeded or entered its own cooldown.
+                continue
 
 
 async def lingxing_mcp_metadata(
@@ -4486,7 +4524,7 @@ async def amazon_strategy_board_payload(
                     continue
                 errors: list[str] = []
                 mcp_result: CampaignReportResult | None = None
-                if lingxing_mcp_key():
+                if lingxing_mcp_keys():
                     try:
                         mcp_result = await fetch_mcp_campaign_report(
                             int(account["sid"]), start_date, end_date, client

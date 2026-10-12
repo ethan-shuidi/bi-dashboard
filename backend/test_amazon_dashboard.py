@@ -505,18 +505,60 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
         client = AsyncMock()
         client.post.side_effect = [rate_limited, rate_limited]
-        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key", "LINGXING_API_KEY2": ""}), \
              patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
              patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS", (0.0,)), \
              patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", 20.0):
             with self.assertRaisesRegex(RuntimeError, "认证请求过于频繁"):
                 asyncio.run(lingxing_mcp_raw("action", {}, client))
+            self.assertEqual(len(app_module._lingxing_mcp_key_states), 1)
             self.assertGreater(
-                app_module._lingxing_mcp_rate_limited_until,
+                next(iter(app_module._lingxing_mcp_key_states.values()))["cooldown_until"],
                 time.monotonic(),
             )
             with self.assertRaisesRegex(RuntimeError, "冷却中"):
                 asyncio.run(lingxing_mcp_raw("action", {}, client))
+        self.assertEqual(client.post.call_count, 2)
+
+    def test_mcp_secondary_key_takes_over_when_primary_is_rate_limited(self):
+        rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [rate_limited, success, success]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
+             patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", 20.0):
+            try:
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+            finally:
+                reset_mcp_test_state()
+        used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
+        self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key", "secondary-test-key"])
+
+    def test_mcp_pool_cooldowns_are_independent(self):
+        rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
+        client = AsyncMock()
+        client.post.side_effect = [rate_limited, rate_limited]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
+             patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", 20.0):
+            try:
+                with self.assertRaisesRegex(RuntimeError, "认证请求过于频繁"):
+                    asyncio.run(lingxing_mcp_raw("action", {}, client))
+                self.assertEqual(len(app_module._lingxing_mcp_key_states), 2)
+                self.assertTrue(all(
+                    state["cooldown_until"] > time.monotonic()
+                    for state in app_module._lingxing_mcp_key_states.values()
+                ))
+                with self.assertRaisesRegex(RuntimeError, "冷却中"):
+                    asyncio.run(lingxing_mcp_raw("action", {}, client))
+            finally:
+                reset_mcp_test_state()
         self.assertEqual(client.post.call_count, 2)
 
     def test_mcp_shop_catalog_concurrent_calls_are_deduplicated(self):
