@@ -85,6 +85,7 @@ from app import (
     _lingxing_mcp_metadata_cache,
     _amazon_cache,
     _performance_data_quality,
+    _record_performance_quality,
     _reset_lingxing_mcp_metadata_cache,
     _strategy_campaign_data_quality,
     ad_report_type,
@@ -633,6 +634,59 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertFalse(result["mcp_ok"])
         self.assertFalse(result["complete"])
         self.assertTrue(result["typed_clicks_present"])
+
+    def test_mcp_product_failure_fails_closed_and_never_uses_openapi(self):
+        fallback = AsyncMock(return_value={"data": []})
+        quality = {}
+
+        async def call():
+            return await fetch_product_performance(
+                101, date(2026, 9, 4), date(2026, 9, 4), "日",
+                AsyncMock(), asyncio.Semaphore(1), None, "USD", quality,
+            )
+
+        error = RuntimeError("LingXing MCP request failed: 认证请求过于频繁，请稍后重试")
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+             patch("app.lingxing_mcp_key", return_value="test-key"), \
+             patch("app.fetch_mcp_product_performance", new=AsyncMock(side_effect=error)), \
+             patch("app.lingxing_post", new=fallback):
+            with self.assertRaisesRegex(RuntimeError, "认证请求过于频繁"):
+                asyncio.run(call())
+
+        fallback.assert_not_called()
+        result = _performance_data_quality(quality)
+        self.assertEqual(result["source"], "mcp")
+        self.assertFalse(result["mcp_ok"])
+        self.assertFalse(result["complete"])
+
+    def test_amazon_dashboard_maps_product_rate_limit_to_429(self):
+        env = {
+            "LINGXING_APP_ID": "test-id",
+            "LINGXING_APP_SECRET": "test-secret",
+            "LINGXING_SIDS_JSON": json.dumps({"US": {"sid": 101}}),
+            "LINGXING_MCP_KEY": "test-key",
+        }
+        error = RuntimeError("LingXing MCP request failed: 认证请求过于频繁，请稍后重试")
+        fallback = AsyncMock()
+        with patch.dict(os.environ, env), \
+             patch("app.lingxing_mcp_key", return_value="test-key"), \
+             patch("app.fetch_mcp_product_performance", new=AsyncMock(side_effect=error)), \
+             patch("app.lingxing_post", new=fallback), \
+             patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+             TestClient(app_module.app) as client:
+            response = client.get(
+                "/api/amazon/dashboard",
+                params={
+                    "comparison": "日",
+                    "start_date": "2026-09-04",
+                    "end_date": "2026-09-04",
+                    "site": "美国",
+                },
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("产品表现接口限流", response.json()["detail"])
+        fallback.assert_not_called()
 
     def test_campaign_name_reads_nested_campaign_objects(self):
         self.assertEqual(
@@ -1400,7 +1454,11 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         _amazon_cache.clear()
         try:
             async def fetch():
-                with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)):
+                async def fake_product_performance(*args):
+                    _record_performance_quality(args[8], "mcp", True, None, performance)
+                    return performance
+
+                with patch("app.fetch_product_performance", new=fake_product_performance):
                     return await amazon_dashboard_periodic(
                         "日", date(2026, 9, 4), date(2026, 9, 4), "美国",
                         {series}, {product}, {"US": {"sid": 1}},
@@ -1422,6 +1480,30 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         finally:
             _amazon_cache.clear()
             _amazon_cache.update(original_cache)
+
+    def test_degraded_product_performance_is_not_cached(self):
+        asin = next(iter(ASIN_MAPPING["US"]))
+        performance = [{"asin": asin, "volume": 1, "net_amount": 10, "spend": 2}]
+
+        async def fake_product_performance(*args):
+            _record_performance_quality(
+                args[8],
+                "openapi_fallback",
+                False,
+                "LingXing MCP request failed: 认证请求过于频繁，请稍后重试",
+                performance,
+            )
+            return performance
+
+        before = set(_amazon_cache.keys())
+        with patch("app.fetch_product_performance", new=fake_product_performance):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日", date(2026, 9, 4), date(2026, 9, 4), "美国",
+                set(AMAZON_SERIES), set(AMAZON_PRODUCTS), {"US": {"sid": 1}},
+            ))
+
+        self.assertFalse(result["data_quality"]["complete"])
+        self.assertEqual(set(_amazon_cache.keys()), before)
 
     def test_ads_charts_future_weeks_return_empty_without_upstream_request(self):
         env = {

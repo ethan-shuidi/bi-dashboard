@@ -3065,11 +3065,13 @@ async def fetch_product_performance(
                 _record_performance_quality(quality, "mcp", True, None, rows)
             return rows
         except (RuntimeError, httpx.HTTPError) as exc:
-            # The OpenAPI endpoint is only an explicit degraded mode. It does
-            # not expose the same typed click dimensions, so never present its
-            # result as a complete MCP dataset.
+            # Product metrics feed the product summary and sales actuals. The
+            # OpenAPI endpoint has a different metric contract, so once MCP is
+            # configured an upstream failure must fail closed instead of
+            # presenting plausible-looking numbers from another source.
             if quality is not None:
-                _record_performance_quality(quality, "openapi_fallback", False, str(exc))
+                _record_performance_quality(quality, "mcp", False, str(exc))
+            raise
     # LingXing limits this endpoint to a maximum 92-day date range.  The
     # dashboard allows a wider range for quick presets such as "去年", so split
     # longer requests into bounded chunks and merge the returned rows.  Chunk
@@ -3664,6 +3666,7 @@ async def amazon_dashboard_periodic(
         if requested_currency == "native"
         else requested_currency if requested_currency != "original" else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD")
     )
+    data_quality = _performance_data_quality(performance_quality)
     response = {
         "period": {"comparison": comparison, "start": start_date.isoformat(), "end": end_date.isoformat()},
         "currency": output_currency,
@@ -3672,7 +3675,7 @@ async def amazon_dashboard_periodic(
         "filters": {"site": selected_sites, "series": list(selected_series), "products": list(selected_products)},
         "periods": [{"label": label, "start": p_start.isoformat(), "end": p_end.isoformat()} for label, p_start, p_end in periods],
         "rows": rows,
-        "data_quality": _performance_data_quality(performance_quality),
+        "data_quality": data_quality,
         "mapping": {
             "key": "site+asin",
             "sites": list(AMAZON_SITE_CODES),
@@ -3682,7 +3685,16 @@ async def amazon_dashboard_periodic(
             "net_sales_field": "net_amount",
         },
     }
-    _amazon_cache[cache_key] = (time.monotonic(), copy.deepcopy(response))
+    # A degraded OpenAPI or partial MCP response must not occupy the normal
+    # 10-minute cache slot. Otherwise one upstream rate limit can keep serving
+    # wrong product metrics after LingXing has recovered.
+    if (
+        data_quality.get("source") == "mcp"
+        and data_quality.get("mcp_ok")
+        and data_quality.get("complete")
+        and not data_quality.get("errors")
+    ):
+        _amazon_cache[cache_key] = (time.monotonic(), copy.deepcopy(response))
     return response
 
 
@@ -6112,18 +6124,29 @@ async def amazon_dashboard(
     if refresh:
         _amazon_cache.clear_current_namespace()
     asin_mapping = amazon_data_source_mapping_snapshot()
-    return await amazon_dashboard_periodic(
-        comparison,
-        start_date,
-        end_date,
-        selected_sites,
-        selected_series,
-        selected_products,
-        sid_map,
-        store_rows,
-        requested_currency,
-        asin_mapping,
-    )
+    try:
+        return await amazon_dashboard_periodic(
+            comparison,
+            start_date,
+            end_date,
+            selected_sites,
+            selected_series,
+            selected_products,
+            sid_map,
+            store_rows,
+            requested_currency,
+            asin_mapping,
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"产品表现请求失败：HTTP {exc.response.status_code}") from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        if _is_lingxing_mcp_rate_limit_error(exc):
+            raise HTTPException(status_code=429, detail="领星产品表现接口限流，请稍后重试") from exc
+        raise HTTPException(status_code=502, detail=f"产品汇总数据获取失败：{message}") from exc
+    except Exception as exc:
+        print(f"amazon-dashboard error: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"产品汇总数据获取失败：{type(exc).__name__}") from exc
 
 
 @app.get("/api/amazon/sales-dashboard")
