@@ -449,3 +449,11 @@
 .runtime-placeholder span{color:#5f7188;font-size:12px;letter-spacing:.08em}
 .runtime-placeholder h1{margin:8px 0 0;color:#102a56;font-size:24px}
 .runtime-placeholder p{margin:8px 0 0;color:#687b92;font-size:13px;line-height:1.6}
+
+
+/* Keep dashboard navigation fixed while document-wide ABA table scrolls horizontally. */
+.workspace{--dashboard-sidebar-sticky-width:232px}
+.workspace.sidebar-collapsed{--dashboard-sidebar-sticky-width:72px}
+.dashboard-sidebar{left:0}
+@media(max-width:1100px){.workspace{--dashboard-sidebar-sticky-width:195px}}
+@media(max-width:760px){.workspace{--dashboard-sidebar-sticky-width:63px}.dashboard-sidebar{top:64px;height:calc(100vh - 64px)}}

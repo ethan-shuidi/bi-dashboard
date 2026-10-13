@@ -346,7 +346,7 @@ onBeforeUnmount(() => {
       <span>{{ runtimeError }}</span>
     </section>
 
-    <div class="workspace">
+    <div :class="['workspace', { 'sidebar-collapsed': sidebarCollapsed }]">
       <aside :class="['dashboard-sidebar', { collapsed: sidebarCollapsed }]" aria-label="看板导航">
         <div class="dashboard-sidebar-head"><span class="dashboard-sidebar-label">看板导航</span><button class="sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开看板导航' : '收起看板导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" @click="sidebarCollapsed = !sidebarCollapsed"><span aria-hidden="true">{{ sidebarCollapsed ? '›' : '‹' }}</span></button></div>
         <button
