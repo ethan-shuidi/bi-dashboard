@@ -29,6 +29,7 @@ from app import (
     AMAZON_SITE_CODES,
     AMAZON_SITE_ORDER,
     AmazonDataSourceMapping,
+    AmazonAdsChartWeeklyHistory,
     AmazonMonthlyTarget,
     AmazonWeeklyTarget,
     Base,
@@ -68,6 +69,7 @@ from app import (
     amazon_sales_validate_money_reconciliation,
     amazon_usd_exchange_rates,
     amazon_week_label,
+    amazon_ads_chart_history_cache_key,
     amazon_ads_chart_rows,
     amazon_ads_charts,
     dashboard_editor,
@@ -1670,6 +1672,141 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertFalse(result["data_quality"]["complete"])
         self.assertEqual(set(_amazon_cache.keys()), before)
 
+    def test_ads_chart_history_is_frozen_until_explicit_refresh(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[AmazonAdsChartWeeklyHistory.__table__])
+        history_db = sessionmaker(bind=database, expire_on_commit=False)
+        calls: list[date] = []
+
+        async def fake_product_performance(*args):
+            calls.append(args[1])
+            _record_performance_quality(args[8], "mcp", True, None, [])
+            return []
+
+        def call(force_refresh=False, history_cutoff=date(2026, 10, 1)):
+            return amazon_dashboard_periodic(
+                "周",
+                date(2026, 9, 14),
+                date(2026, 9, 20),
+                "美国",
+                set(AMAZON_SERIES),
+                set(AMAZON_PRODUCTS),
+                {"US": {"sid": 101}},
+                force_refresh=force_refresh,
+                history_cutoff=history_cutoff,
+            )
+
+        with patch("app.fetch_product_performance", new=fake_product_performance), \
+             patch("app.session_factory", new=lambda: history_db):
+            first = asyncio.run(call())
+            with history_db() as db:
+                first_fetched_at = db.get(AmazonAdsChartWeeklyHistory, 1).fetched_at
+
+            # Force the range-level cache to expire. The second ordinary open
+            # must still avoid LingXing because the historical week is frozen.
+            _amazon_cache.clear()
+            second = asyncio.run(call())
+
+            refreshed = asyncio.run(call(force_refresh=True))
+            with history_db() as db:
+                stored = db.get(AmazonAdsChartWeeklyHistory, 1)
+
+        self.assertTrue(first["data_quality"]["complete"])
+        self.assertEqual(second["rows"], first["rows"])
+        self.assertTrue(refreshed["data_quality"]["complete"])
+        self.assertEqual([item.day for item in calls], [14, 14])
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.row_count, 0)
+        self.assertGreaterEqual(stored.fetched_at, first_fetched_at)
+
+    def test_ads_chart_recent_weeks_and_other_calls_do_not_write_history(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[AmazonAdsChartWeeklyHistory.__table__])
+        history_db = sessionmaker(bind=database, expire_on_commit=False)
+
+        async def fake_product_performance(*args):
+            _record_performance_quality(args[8], "mcp", True, None, [])
+            return []
+
+        with patch("app.fetch_product_performance", new=fake_product_performance), \
+             patch("app.session_factory", new=lambda: history_db):
+            asyncio.run(amazon_dashboard_periodic(
+                "周", date(2026, 9, 14), date(2026, 9, 20), "美国",
+                set(AMAZON_SERIES), set(AMAZON_PRODUCTS), {"US": {"sid": 101}},
+                history_cutoff=date(2026, 10, 1),
+            ))
+            _amazon_cache.clear()
+            recent = asyncio.run(amazon_dashboard_periodic(
+                "周", date(2026, 10, 5), date(2026, 10, 11), "美国",
+                set(AMAZON_SERIES), set(AMAZON_PRODUCTS), {"US": {"sid": 101}},
+                history_cutoff=date(2026, 10, 1),
+            ))
+            _amazon_cache.clear()
+            other_dashboard = asyncio.run(amazon_dashboard_periodic(
+                "周", date(2026, 9, 14), date(2026, 9, 20), "美国",
+                set(AMAZON_SERIES), set(AMAZON_PRODUCTS), {"US": {"sid": 101}},
+            ))
+
+        self.assertTrue(recent["data_quality"]["complete"])
+        self.assertTrue(other_dashboard["data_quality"]["complete"])
+        with history_db() as db:
+            self.assertEqual(db.query(AmazonAdsChartWeeklyHistory).count(), 1)
+
+    def test_ads_chart_does_not_freeze_degraded_history(self):
+        database = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(database, tables=[AmazonAdsChartWeeklyHistory.__table__])
+        history_db = sessionmaker(bind=database, expire_on_commit=False)
+        asin = next(iter(ASIN_MAPPING["US"]))
+
+        async def degraded_product_performance(*args):
+            _record_performance_quality(
+                args[8], "openapi_fallback", False, "mcp rate limited", [{"asin": asin}]
+            )
+            return [{"asin": asin, "volume": 1}]
+
+        with patch("app.fetch_product_performance", new=degraded_product_performance), \
+             patch("app.session_factory", new=lambda: history_db):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "周", date(2026, 9, 14), date(2026, 9, 20), "美国",
+                set(AMAZON_SERIES), set(AMAZON_PRODUCTS), {"US": {"sid": 101}},
+                history_cutoff=date(2026, 10, 1),
+            ))
+
+        self.assertFalse(result["data_quality"]["complete"])
+        with history_db() as db:
+            self.assertEqual(db.query(AmazonAdsChartWeeklyHistory).count(), 0)
+
+    def test_ads_chart_history_key_changes_with_mapping_and_filter(self):
+        base = {
+            "site_code": "US",
+            "sid": 101,
+            "week_start": date(2026, 9, 14),
+            "week_end": date(2026, 9, 20),
+            "asin_filter": ["B000B", "B000A"],
+            "currency": "USD",
+            "mapping_fingerprint": (("US", "B000A", "p1"),),
+        }
+        original = amazon_ads_chart_history_cache_key(**base)
+        changed_asins = amazon_ads_chart_history_cache_key(**{**base, "asin_filter": ["B000C"]})
+        changed_mapping = amazon_ads_chart_history_cache_key(**{
+            **base,
+            "mapping_fingerprint": (("US", "B000A", "p2"),),
+        })
+        self.assertNotEqual(original, changed_asins)
+        self.assertNotEqual(original, changed_mapping)
+
     def test_ads_charts_future_weeks_return_empty_without_upstream_request(self):
         env = {
             "LINGXING_APP_ID": "test-id",
@@ -2429,6 +2566,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(result["model"], AMAZON_SALES_ALL_MODEL)
         self.assertEqual(periodic_mock.call_args.args[5], set(AMAZON_PRODUCTS))
         self.assertEqual(periodic_mock.call_args.args[4], set(AMAZON_SERIES) | {AMAZON_SALES_TN20_SMALL_SERIES})
+        self.assertIsInstance(periodic_mock.call_args.kwargs["history_cutoff"], date)
         self.assertEqual(result["currency"], "USD")
         self.assertTrue(result["field_availability"]["sessions_present"])
         self.assertFalse(result["field_availability"]["page_views_present"])

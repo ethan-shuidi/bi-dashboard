@@ -821,6 +821,37 @@ class AmazonDataSourceMapping(Base):
     updated_by = Column(String(80), nullable=True)
 
 
+class AmazonAdsChartWeeklyHistory(Base):
+    """Frozen product-performance results used only by the weekly ads charts.
+
+    Rows older than the ads-chart cutoff are immutable unless the chart's own
+    refresh button explicitly asks LingXing for a replacement payload.
+    """
+
+    __tablename__ = "amazon_ads_chart_weekly_history"
+    __table_args__ = (
+        UniqueConstraint("cache_key", name="uq_amazon_ads_chart_weekly_history_key"),
+        Index(
+            "ix_amazon_ads_chart_weekly_history_scope",
+            "site_code",
+            "sid",
+            "week_start",
+            "week_end",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    cache_key = Column(String(64), nullable=False)
+    site_code = Column(String(12), nullable=False)
+    sid = Column(String(64), nullable=False)
+    week_start = Column(Date, nullable=False)
+    week_end = Column(Date, nullable=False)
+    currency = Column(String(12), nullable=False, default="")
+    payload = Column(Text, nullable=False)
+    row_count = Column(Integer, nullable=False, default=0)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AmazonMonthlyTarget(Base):
     __tablename__ = "amazon_monthly_targets"
     __table_args__ = (
@@ -3520,6 +3551,114 @@ def amazon_dashboard_periodic_cache_key(
     )
 
 
+def amazon_ads_chart_history_cache_key(
+    site_code: str,
+    sid: int | str,
+    week_start: date,
+    week_end: date,
+    asin_filter: list[str] | None,
+    currency: str | None,
+    mapping_fingerprint: tuple[tuple[str, str, str], ...],
+) -> str:
+    """Build a stable content key for one ads-chart product-performance week."""
+
+    canonical = json.dumps(
+        {
+            "version": "ads-chart-history-v1",
+            "site_code": site_code,
+            "sid": str(sid),
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "asins": None if asin_filter is None else sorted(str(asin).upper() for asin in asin_filter),
+            "currency": str(currency or "").upper(),
+            "mapping_fingerprint": mapping_fingerprint,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def amazon_ads_chart_history_read(cache_key: str) -> list[dict[str, Any]] | None:
+    """Return one frozen raw weekly payload, or None when it is not stored."""
+
+    try:
+        with session_factory()() as db:
+            row = db.execute(
+                select(AmazonAdsChartWeeklyHistory).where(
+                    AmazonAdsChartWeeklyHistory.cache_key == cache_key
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            payload = json.loads(row.payload)
+            return copy.deepcopy(payload) if isinstance(payload, list) else None
+    except Exception:
+        # Persistence is an optimization. If the store is temporarily unavailable,
+        # allow this chart to fall back to its normal upstream request.
+        return None
+
+
+def amazon_ads_chart_history_write(
+    cache_key: str,
+    *,
+    site_code: str,
+    sid: int | str,
+    week_start: date,
+    week_end: date,
+    currency: str,
+    rows: list[dict[str, Any]],
+) -> bool:
+    """Upsert a complete raw weekly response without touching other dashboards."""
+
+    try:
+        payload = json.dumps(rows, ensure_ascii=False, default=str)
+        with session_factory()() as db:
+            row = db.execute(
+                select(AmazonAdsChartWeeklyHistory).where(
+                    AmazonAdsChartWeeklyHistory.cache_key == cache_key
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                db.add(AmazonAdsChartWeeklyHistory(
+                    cache_key=cache_key,
+                    site_code=site_code,
+                    sid=str(sid),
+                    week_start=week_start,
+                    week_end=week_end,
+                    currency=str(currency or "").upper(),
+                    payload=payload,
+                    row_count=len(rows),
+                    fetched_at=utcnow(),
+                ))
+            else:
+                row.payload = payload
+                row.row_count = len(rows)
+                row.currency = str(currency or "").upper()
+                row.fetched_at = utcnow()
+            db.commit()
+        return True
+    except Exception:
+        # Never replace a good live result with a persistence-layer failure.
+        return False
+
+
+def merge_performance_quality(target: dict[str, Any], local: dict[str, Any]) -> None:
+    """Merge per-period quality into the dashboard-level quality object."""
+
+    sources = target.setdefault("sources", set())
+    sources.update(local.get("sources", set()))
+    target.setdefault("errors", [])
+    target["errors"].extend(local.get("errors", []))
+    target["raw_rows"] = int(target.get("raw_rows", 0) or 0) + int(local.get("raw_rows", 0) or 0)
+    target["typed_rows"] = int(target.get("typed_rows", 0) or 0) + int(local.get("typed_rows", 0) or 0)
+    target["mcp_ok"] = bool(target.get("mcp_ok", True)) and bool(local.get("mcp_ok", True))
+    if local.get("degraded"):
+        target["degraded"] = True
+        target["degraded_reason"] = local.get("degraded_reason") or target.get("degraded_reason")
+
+
 async def amazon_dashboard_periodic(
     comparison: str,
     start_date: date,
@@ -3532,6 +3671,7 @@ async def amazon_dashboard_periodic(
     display_currency: str = "original",
     asin_mapping: dict[str, dict[str, str]] | None = None,
     force_refresh: bool = False,
+    history_cutoff: date | None = None,
 ) -> dict[str, Any]:
     periods = amazon_periods(start_date, end_date, comparison)
     if site is None or site == "" or site == []:
@@ -3597,14 +3737,78 @@ async def amazon_dashboard_periodic(
                 sid_value = account["sid"]
                 performance_rows = []
                 try:
+                    async def fetch_history_period(
+                        cache_key: str,
+                        period_start: date,
+                        period_end: date,
+                    ) -> list[dict[str, Any]]:
+                        local_quality: dict[str, Any] = {}
+                        if asin_filter == []:
+                            # This is a deliberate empty ASIN scope, not an upstream
+                            # miss. Freeze it so the same mapped filter cannot
+                            # repeatedly consume an upstream request slot.
+                            rows = []
+                            _record_performance_quality(local_quality, "mcp", True, None, rows)
+                        else:
+                            rows = await fetch_product_performance(
+                                int(sid_value), period_start, period_end, comparison,
+                                client, semaphore, asin_filter, query_currency, local_quality,
+                            )
+                        merge_performance_quality(performance_quality, local_quality)
+                        if _performance_data_quality(local_quality).get("complete"):
+                            amazon_ads_chart_history_write(
+                                cache_key,
+                                site_code=site_code,
+                                sid=sid_value,
+                                week_start=period_start,
+                                week_end=period_end,
+                                currency=query_currency or "",
+                                rows=copy.deepcopy(rows),
+                            )
+                        return rows
+
                     # The product-performance endpoint has a token bucket of 1.
                     # Query each natural dashboard period separately so every
                     # day/week/month receives the metrics belonging to it.
                     for period_label, period_start, period_end in periods:
-                        period_rows = await fetch_product_performance(
-                            int(sid_value), period_start, period_end, comparison,
-                            client, semaphore, asin_filter, query_currency, performance_quality,
+                        history_key: str | None = None
+                        should_persist_history = bool(
+                            history_cutoff is not None
+                            and comparison == "周"
+                            and period_end <= history_cutoff
                         )
+                        if should_persist_history:
+                            history_key = amazon_ads_chart_history_cache_key(
+                                site_code,
+                                sid_value,
+                                period_start,
+                                period_end,
+                                asin_filter,
+                                query_currency,
+                                mapping_fingerprint,
+                            )
+                        if history_key is not None and not force_refresh:
+                            cached_history = amazon_ads_chart_history_read(history_key)
+                            if cached_history is not None:
+                                _record_performance_quality(
+                                    performance_quality,
+                                    "mcp",
+                                    True,
+                                    None,
+                                    cached_history,
+                                )
+                                period_rows = cached_history
+                            else:
+                                period_rows = await fetch_history_period(
+                                    history_key,
+                                    period_start,
+                                    period_end,
+                                )
+                        else:
+                            period_rows = await fetch_product_performance(
+                                int(sid_value), period_start, period_end, comparison,
+                                client, semaphore, asin_filter, query_currency, performance_quality,
+                            )
                         for period_row in period_rows:
                             if isinstance(period_row, dict):
                                 tagged = dict(period_row)
@@ -6145,6 +6349,7 @@ async def _amazon_ads_chart_job(
     display_currency: str,
     asin_mapping: dict[str, dict[str, str]],
     force_refresh: bool,
+    history_cutoff: date,
 ) -> None:
     background_token = _amazon_background_fetch.set(True)
     try:
@@ -6161,6 +6366,7 @@ async def _amazon_ads_chart_job(
                 display_currency,
                 asin_mapping,
                 force_refresh=force_refresh,
+                history_cutoff=history_cutoff,
             )
     except BaseException as exc:
         state["error"] = str(exc)
@@ -6223,6 +6429,7 @@ async def amazon_ads_charts(
         for site_name in selected_sites
     )
     fetch_end = min(end + timedelta(days=6), site_today)
+    history_cutoff = site_today - timedelta(days=14)
     display_currency = "USD" if len(selected_sites) > 1 else "original"
     periods = amazon_periods(start, fetch_end, "周") if start <= fetch_end else []
     estimated_requests = sum(
@@ -6275,6 +6482,7 @@ async def amazon_ads_charts(
                 display_currency,
                 asin_mapping,
                 force_refresh=refresh,
+                history_cutoff=history_cutoff,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
@@ -6353,6 +6561,7 @@ async def amazon_ads_charts(
         display_currency,
         asin_mapping,
         refresh,
+        history_cutoff,
     ))
     state["task"] = task
     _amazon_ads_chart_jobs[job_key] = state
