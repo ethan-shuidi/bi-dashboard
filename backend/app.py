@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -252,7 +252,6 @@ _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
-_lingxing_mcp_request_lock = PriorityAsyncLock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
 _lingxing_mcp_shop_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
@@ -276,9 +275,13 @@ _amazon_cache_scope: ContextVar[str] = ContextVar(
 )
 _lingxing_mcp_metadata_cache: dict[str, tuple[float, LingXingMCPMetadata]] = {}
 _lingxing_mcp_catalog_version = ""
-_lingxing_mcp_key_states: dict[str, dict[str, float]] = {}
+_lingxing_mcp_key_states: dict[str, dict[str, Any]] = {}
+_lingxing_mcp_key_locks: dict[str, PriorityAsyncLock] = {}
+_lingxing_mcp_key_selection_lock = asyncio.Lock()
 _amazon_ads_chart_jobs: dict[tuple[Any, ...], dict[str, Any]] = {}
 _amazon_ads_chart_job_gate = asyncio.Semaphore(1)
+_amazon_inflight_payloads: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
+_amazon_sales_dashboard_jobs: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
@@ -333,6 +336,43 @@ class ModuleScopedCache(dict[tuple[str, tuple[Any, ...]], tuple[float, Any]]):
 
 
 _amazon_cache = ModuleScopedCache()
+
+
+async def _amazon_shared_payload(
+    key: tuple[Any, ...],
+    factory: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Share one upstream payload task between identical dashboard requests.
+
+    Dashboard endpoints frequently enrich returned rows in place.  Returning a
+    deep copy to every waiter is therefore as important as sharing the initial
+    upstream fetch: it prevents one viewer's derived edits from mutating the
+    object observed by another viewer.
+    """
+
+    task = _amazon_inflight_payloads.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(factory())
+        _amazon_inflight_payloads[key] = task
+        task.add_done_callback(lambda _task, key=key: (
+            _amazon_inflight_payloads.pop(key, None)
+            if _amazon_inflight_payloads.get(key) is _task else None
+        ))
+    result = await task
+    return copy.deepcopy(result)
+
+
+def _amazon_parameter_fingerprint(value: Any) -> str:
+    """Fingerprint call parameters that affect upstream account selection."""
+
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @contextmanager
@@ -1817,6 +1857,7 @@ async def amazon_sales_actual_rows(
     products: set[str],
     refresh: bool,
     asin_mapping: dict[str, dict[str, str]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fetch sales-dashboard product rows through the existing LingXing path."""
     no_data = {"source": "not_requested", "complete": True, "errors": []}
@@ -1856,6 +1897,12 @@ async def amazon_sales_actual_rows(
     # marketplace currency first, then convert all rows once below. The public
     # original-currency mode intentionally rejects a multi-site rollup.
     performance_currency = "native" if len(selected_sites) > 1 else requested_currency
+    if progress_callback:
+        progress_callback({
+            "stage": "product_performance",
+            "message": "正在抓取领星产品表现数据",
+            "sites": len(selected_sites),
+        })
     periodic = await amazon_dashboard_periodic(
         comparison,
         period_start,
@@ -1871,6 +1918,12 @@ async def amazon_sales_actual_rows(
     periodic_rows = await amazon_convert_sales_money_rows(
         periodic["rows"], requested_currency, actual_end,
     )
+    if progress_callback:
+        progress_callback({
+            "stage": "campaign_report",
+            "message": "正在汇总完整广告活动（含 SP / SB / SBV / SD）",
+            "sites": len(selected_sites),
+        })
     campaign_costs, campaign_quality = await amazon_sales_campaign_cost_by_series(
         period_start,
         actual_end,
@@ -3659,7 +3712,7 @@ def merge_performance_quality(target: dict[str, Any], local: dict[str, Any]) -> 
         target["degraded_reason"] = local.get("degraded_reason") or target.get("degraded_reason")
 
 
-async def amazon_dashboard_periodic(
+async def _amazon_dashboard_periodic_fetch(
     comparison: str,
     start_date: date,
     end_date: date,
@@ -4013,6 +4066,73 @@ async def amazon_dashboard_periodic(
     return response
 
 
+async def amazon_dashboard_periodic(
+    comparison: str,
+    start_date: date,
+    end_date: date,
+    site: str | list[str] | None,
+    selected_series: set[str],
+    selected_products: set[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None = None,
+    display_currency: str = "original",
+    asin_mapping: dict[str, dict[str, str]] | None = None,
+    force_refresh: bool = False,
+    history_cutoff: date | None = None,
+) -> dict[str, Any]:
+    """Public periodic fetch with identical-request coalescing."""
+
+    selected_sites = (
+        list(AMAZON_SITE_CODES)
+        if site is None or site == "" or site == []
+        else amazon_dashboard_selected_sites(
+            [site] if isinstance(site, str) else [str(value) for value in site]
+        )
+    )
+    requested_currency = str(display_currency or "original").upper()
+    if requested_currency == "NATIVE":
+        requested_currency = "native"
+    elif requested_currency == "ORIGINAL":
+        requested_currency = "original"
+    effective_asin_mapping = ASIN_MAPPING if asin_mapping is None else asin_mapping
+    cache_key = amazon_dashboard_periodic_cache_key(
+        comparison,
+        start_date,
+        end_date,
+        selected_sites,
+        requested_currency,
+        selected_series,
+        selected_products,
+        amazon_data_source_mapping_fingerprint(effective_asin_mapping),
+    )
+    inflight_key = (
+        "product-performance-inflight-v1",
+        _amazon_cache_scope.get(),
+        *cache_key,
+        bool(force_refresh),
+        history_cutoff.isoformat() if history_cutoff is not None else "",
+        _amazon_parameter_fingerprint(sid_map),
+        _amazon_parameter_fingerprint(store_rows),
+    )
+    return await _amazon_shared_payload(
+        inflight_key,
+        lambda: _amazon_dashboard_periodic_fetch(
+            comparison,
+            start_date,
+            end_date,
+            site,
+            selected_series,
+            selected_products,
+            sid_map,
+            store_rows,
+            display_currency,
+            asin_mapping,
+            force_refresh,
+            history_cutoff,
+        ),
+    )
+
+
 def lingxing_mcp_key() -> str:
     return os.environ.get("LINGXING_MCP_KEY", "").strip()
 
@@ -4039,6 +4159,7 @@ def _reset_lingxing_mcp_metadata_cache() -> None:
     _lingxing_mcp_metadata_cache.clear()
     _lingxing_mcp_catalog_version = ""
     _lingxing_mcp_key_states.clear()
+    _lingxing_mcp_key_locks.clear()
 
 
 def _normalized_key(key: Any) -> str:
@@ -4206,57 +4327,78 @@ async def lingxing_mcp_raw(
         "params": {"name": operation, "arguments": arguments},
     }
     background = _amazon_background_fetch.get()
-    async with _lingxing_mcp_request_lock.scoped(priority=1 if background else 0):
-        attempt = 0
-        exhausted_keys: set[str] = set()
-        while True:
+    priority = 1 if background else 0
+    attempt = 0
+    exhausted_keys: set[str] = set()
+
+    async def reserve_key() -> tuple[str, str, PriorityAsyncLock]:
+        async with _lingxing_mcp_key_selection_lock:
             now = time.monotonic()
             available = [
-                (state["last_call"], index, digest, key)
+                (
+                    max(0.0, state["last_call"] + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - now),
+                    state.get("queued", 0),
+                    index,
+                    digest,
+                    key,
+                )
                 for index, (digest, key) in enumerate(keys)
-                if now >= (state := _lingxing_mcp_key_states.setdefault(
-                    digest, {"last_call": 0.0, "cooldown_until": 0.0}
+                if digest not in exhausted_keys
+                and now >= (state := _lingxing_mcp_key_states.setdefault(
+                    digest,
+                    {"last_call": 0.0, "cooldown_until": 0.0, "queued": 0},
                 ))["cooldown_until"]
             ]
             if not available:
                 raise RuntimeError("LingXing MCP request failed: 认证请求过于频繁，冷却中请稍后重试")
-            _, _, digest, key = min(available)
+            _, _, _, digest, key = min(available)
             state = _lingxing_mcp_key_states[digest]
-            wait_for = state["last_call"] + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - time.monotonic()
-            if wait_for > 0:
-                await asyncio.sleep(wait_for)
-            try:
-                response = await client.post(
-                    LINGXING_MCP_URL,
-                    json=payload,
-                    headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
-                )
-                state["last_call"] = time.monotonic()
-                response.raise_for_status()
-                result = _lingxing_mcp_result(_lingxing_mcp_json_body(response))
-                state["cooldown_until"] = 0.0
-                return result
-            except (RuntimeError, httpx.HTTPStatusError) as exc:
-                rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
-                state["last_call"] = time.monotonic()
-                if not rate_limited:
-                    raise
-                state["cooldown_until"] = time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
-                # With one key, preserve the historical retry schedule. With a
-                # pool, try each non-cooling key once before cooling the pool;
-                # this avoids amplifying requests when LingXing is globally busy.
-                if len(keys) == 1 and attempt < len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS):
-                    await asyncio.sleep(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt])
-                    attempt += 1
-                    # Earlier retries must not permanently block the final retry.
-                    state["cooldown_until"] = 0.0
+            state["queued"] = int(state.get("queued", 0)) + 1
+            lock = _lingxing_mcp_key_locks.setdefault(digest, PriorityAsyncLock())
+            return digest, key, lock
+
+    while True:
+        digest, key, lock = await reserve_key()
+        state = _lingxing_mcp_key_states[digest]
+        try:
+            async with lock.scoped(priority=priority):
+                now = time.monotonic()
+                if now < state["cooldown_until"]:
                     continue
-                exhausted_keys.add(digest)
-                if len(exhausted_keys) == len(keys):
-                    raise
-                # A pool request has not finished until every key has either
-                # succeeded or entered its own cooldown.
-                continue
+                wait_for = state["last_call"] + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - now
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+                try:
+                    response = await client.post(
+                        LINGXING_MCP_URL,
+                        json=payload,
+                        headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
+                    )
+                    state["last_call"] = time.monotonic()
+                    response.raise_for_status()
+                    result = _lingxing_mcp_result(_lingxing_mcp_json_body(response))
+                    state["cooldown_until"] = 0.0
+                    return result
+                except (RuntimeError, httpx.HTTPStatusError) as exc:
+                    rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
+                    state["last_call"] = time.monotonic()
+                    if not rate_limited:
+                        raise
+                    state["cooldown_until"] = time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
+                    # Preserve the historical bounded retry schedule for a
+                    # single-key deployment. A pool moves to its next channel;
+                    # after every channel is exhausted the final rate limit is
+                    # surfaced without amplifying calls.
+                    if len(keys) == 1 and attempt < len(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                        await asyncio.sleep(LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt])
+                        attempt += 1
+                        state["cooldown_until"] = 0.0
+                    else:
+                        exhausted_keys.add(digest)
+                        if len(exhausted_keys) == len(keys):
+                            raise
+        finally:
+            state["queued"] = max(0, int(state.get("queued", 1)) - 1)
 
 
 async def lingxing_mcp_metadata(
@@ -4685,7 +4827,7 @@ def _strategy_campaign_data_quality(
     }
 
 
-async def amazon_strategy_board_payload(
+async def _amazon_strategy_board_payload_fetch(
     start_date: date,
     end_date: date,
     selected_sites: list[str],
@@ -4959,6 +5101,52 @@ async def amazon_strategy_board_payload(
     if data_quality.get("cacheable"):
         _amazon_cache[cache_key] = (time.monotonic(), response)
     return response
+
+
+async def amazon_strategy_board_payload(
+    start_date: date,
+    end_date: date,
+    selected_sites: list[str],
+    sid_map: dict[str, Any],
+    store_rows: list[dict[str, Any]] | None = None,
+    selected_store_sids: set[str] | None = None,
+    selected_series: set[str] | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Public strategy fetch with identical-request coalescing."""
+
+    sites = amazon_dashboard_selected_sites([str(value) for value in selected_sites])
+    stores = {str(value) for value in (selected_store_sids or set()) if str(value).strip()}
+    series = None if selected_series is None else set(selected_series)
+    cache_key = (
+        "amazon-strategy-board-v5-currency-integrity",
+        start_date.isoformat(),
+        end_date.isoformat(),
+        tuple(sites),
+        tuple(sorted(stores)),
+        tuple(sorted(series or set())),
+    )
+    inflight_key = (
+        "amazon-strategy-board-inflight-v1",
+        _amazon_cache_scope.get(),
+        *cache_key,
+        bool(refresh),
+        _amazon_parameter_fingerprint(sid_map),
+        _amazon_parameter_fingerprint(store_rows),
+    )
+    return await _amazon_shared_payload(
+        inflight_key,
+        lambda: _amazon_strategy_board_payload_fetch(
+            start_date,
+            end_date,
+            sites,
+            sid_map,
+            store_rows,
+            stores,
+            series,
+            refresh,
+        ),
+    )
 
 
 @app.get("/api/amazon/strategy-board")
@@ -6778,6 +6966,97 @@ async def amazon_dashboard(
         raise HTTPException(status_code=502, detail=f"产品汇总数据获取失败：{type(exc).__name__}") from exc
 
 
+async def _amazon_sales_dashboard_job(
+    state: dict[str, Any],
+    payload_factory: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    try:
+        state["result"] = await payload_factory()
+    except HTTPException as exc:
+        detail = exc.detail
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("msg") or str(detail)
+        state["error"] = str(detail or "销售看板数据获取失败")
+        state["error_status"] = int(exc.status_code)
+    except BaseException as exc:
+        state["error"] = str(exc)
+        state["error_status"] = 502
+    finally:
+        state["finished_at"] = time.monotonic()
+
+
+def _amazon_sales_dashboard_job_response(
+    *,
+    dimension: str,
+    model: str,
+    site: str,
+    state: dict[str, Any],
+    status: str,
+) -> dict[str, Any]:
+    return {
+        "dimension": dimension,
+        "model": model,
+        "site": site,
+        "fetch_status": status,
+        "progress": state.get("progress") or {
+            "stage": "starting",
+            "message": "正在准备领星产品表现与完整广告活动抓取",
+        },
+        "metrics": [],
+        "targets": {},
+        "country_targets": [],
+        "data_quality": {"source": "not_requested", "complete": True, "errors": []},
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _amazon_sales_dashboard_start_job(
+    job_key: tuple[Any, ...],
+    payload_factory: Callable[[], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "started_at": time.monotonic(),
+        "finished_at": 0.0,
+        "result": None,
+        "error": "",
+        "error_status": 502,
+        "progress": None,
+    }
+    state["task"] = asyncio.create_task(_amazon_sales_dashboard_job(state, payload_factory))
+    _amazon_sales_dashboard_jobs[job_key] = state
+    return state
+
+
+def _amazon_sales_dashboard_ready_result(state: dict[str, Any]) -> dict[str, Any]:
+    """Return one private completed payload to each dashboard requester."""
+
+    result = copy.deepcopy(state.get("result"))
+    if isinstance(result, dict):
+        result["fetch_status"] = "ready"
+        result["fetch_progress"] = state.get("progress") or {
+            "stage": "complete",
+            "message": "领星产品表现与完整广告活动已汇总完成",
+        }
+    return result
+
+
+def _invalidate_amazon_sales_dashboard_jobs() -> None:
+    """Prevent a target save from being hidden by an in-flight old payload."""
+
+    _amazon_sales_dashboard_jobs.clear()
+
+
+def _prune_amazon_sales_dashboard_jobs() -> None:
+    """Drop completed job results that are no longer eligible for reuse."""
+
+    now = time.monotonic()
+    for job_key, state in list(_amazon_sales_dashboard_jobs.items()):
+        task = state.get("task")
+        finished_at = float(state.get("finished_at") or 0.0)
+        if task is not None and task.done() and finished_at and now - finished_at > AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS:
+            _amazon_sales_dashboard_jobs.pop(job_key, None)
+
+
 @app.get("/api/amazon/sales-dashboard")
 async def amazon_sales_dashboard(
     year: int = Query(default=datetime.now(timezone.utc).year),
@@ -6786,6 +7065,7 @@ async def amazon_sales_dashboard(
     site: str = Query(default=AMAZON_SALES_ALL_SITES),
     refresh: bool = Query(default=False),
     include_comparison: bool = Query(default=False),
+    client: str = Query(default="legacy"),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return monthly target completion for one merged product model."""
@@ -6845,9 +7125,123 @@ async def amazon_sales_dashboard(
             target_edit = edit_metadata(item)
 
     actual_end = min(month_end, site_today) if month_start <= site_today else None
+    asin_mapping = amazon_data_source_mapping_snapshot()
+    if client != "sales-background.v1":
+        return await _amazon_sales_monthly_dashboard_payload(
+            year,
+            month,
+            model,
+            site,
+            refresh,
+            include_comparison,
+            x_sync_key,
+        )
+
+    _prune_amazon_sales_dashboard_jobs()
+    job_key = (
+        _amazon_cache_scope.get(),
+        "month",
+        month_start.isoformat(),
+        actual_end.isoformat() if actual_end else "",
+        model,
+        site,
+        bool(refresh),
+        bool(include_comparison),
+        amazon_data_source_mapping_fingerprint(asin_mapping),
+    )
+    state = _amazon_sales_dashboard_jobs.get(job_key)
+    now = time.monotonic()
+    if state and state.get("task") and not state["task"].done():
+        return _amazon_sales_dashboard_job_response(
+            dimension="month", model=model, site=site, state=state,
+            status="refreshing" if refresh else "preparing",
+        )
+    if (
+        not refresh
+        and state
+        and state.get("finished_at")
+        and now - float(state["finished_at"]) <= AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS
+    ):
+        if state.get("error"):
+            raise HTTPException(status_code=int(state.get("error_status") or 502), detail=state["error"])
+        result = _amazon_sales_dashboard_ready_result(state)
+        if result is not None:
+            return result
+
+    def report_progress(value: dict[str, Any]) -> None:
+        state["progress"] = value
+
+    async def payload_factory() -> dict[str, Any]:
+        return await _amazon_sales_monthly_dashboard_payload(
+            year,
+            month,
+            model,
+            site,
+            refresh,
+            include_comparison,
+            x_sync_key,
+            report_progress,
+        )
+
+    state = _amazon_sales_dashboard_start_job(job_key, payload_factory)
+    return _amazon_sales_dashboard_job_response(
+        dimension="month", model=model, site=site, state=state,
+        status="refreshing" if refresh else "preparing",
+    )
+
+
+async def _amazon_sales_monthly_dashboard_payload(
+    year: int,
+    month: int,
+    model: str,
+    site: str,
+    refresh: bool = False,
+    include_comparison: bool = False,
+    x_sync_key: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    selected_sites = amazon_sales_selected_sites(site, include_regions=True)
+    products, selected_series = amazon_sales_scope(model)
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+    site_today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in selected_sites
+    )
+    timezone_basis = (
+        selected_sites[0]
+        if len(selected_sites) == 1
+        else ("欧洲站点日期的最小值" if site == AMAZON_SALES_EUROPE else "全部站点站点日期的最小值")
+    )
+    selected_month = (year, month)
+    current_month = (site_today.year, site_today.month)
+    if selected_month < current_month:
+        time_progress = 1.0
+    elif selected_month > current_month:
+        time_progress = 0.0
+    else:
+        time_progress = site_today.day / month_end.day
+    with session_factory()() as db:
+        country_items = list(db.scalars(
+            select(AmazonMonthlyTarget).where(
+                AmazonMonthlyTarget.year == year,
+                AmazonMonthlyTarget.month == month,
+                AmazonMonthlyTarget.model == model,
+                AmazonMonthlyTarget.site.in_([AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER]),
+            )
+        ))
+        country_target_payload = amazon_sales_country_target_payload(country_items)
+        if site == AMAZON_SALES_EUROPE:
+            targets = amazon_sales_europe_target_values(country_items)
+            target_edit = latest_edit_metadata([item for item in country_items if item.site in AMAZON_SITE_ORDER])
+        else:
+            item = next((entry for entry in country_items if entry.site == site), None)
+            targets = amazon_sales_target_values(item)
+            target_edit = edit_metadata(item)
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     asin_mapping = amazon_data_source_mapping_snapshot()
+    actual_end = min(month_end, site_today) if month_start <= site_today else None
     if month_start <= site_today:
         try:
             rows, data_quality = await amazon_sales_actual_rows(
@@ -6859,6 +7253,7 @@ async def amazon_sales_dashboard(
                 products,
                 refresh,
                 asin_mapping,
+                progress_callback,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
@@ -6885,6 +7280,7 @@ async def amazon_sales_dashboard(
                     products,
                     refresh,
                     asin_mapping,
+                    progress_callback,
                 )
             except httpx.HTTPError as exc:
                 raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
@@ -6953,6 +7349,7 @@ async def amazon_sales_weekly_dashboard(
     site: str = Query(default=AMAZON_SALES_ALL_SITES),
     refresh: bool = Query(default=False),
     include_comparison: bool = Query(default=False),
+    client: str = Query(default="legacy"),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return weekly target completion for one merged product model."""
@@ -7002,19 +7399,122 @@ async def amazon_sales_weekly_dashboard(
             targets = amazon_sales_target_values(item)
             target_edit = edit_metadata(item)
 
+    asin_mapping = amazon_data_source_mapping_snapshot()
+    if client != "sales-background.v1":
+        return await _amazon_sales_weekly_dashboard_payload(
+            week,
+            model,
+            site,
+            refresh,
+            include_comparison,
+            x_sync_key,
+        )
+
+    _prune_amazon_sales_dashboard_jobs()
+    job_key = (
+        _amazon_cache_scope.get(),
+        "week",
+        week.isoformat(),
+        min(week_end, site_today).isoformat() if week <= site_today else "",
+        model,
+        site,
+        bool(refresh),
+        bool(include_comparison),
+        amazon_data_source_mapping_fingerprint(asin_mapping),
+    )
+    state = _amazon_sales_dashboard_jobs.get(job_key)
+    now = time.monotonic()
+    if state and state.get("task") and not state["task"].done():
+        return _amazon_sales_dashboard_job_response(
+            dimension="week", model=model, site=site, state=state,
+            status="refreshing" if refresh else "preparing",
+        )
+    if (
+        not refresh
+        and state
+        and state.get("finished_at")
+        and now - float(state["finished_at"]) <= AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS
+    ):
+        if state.get("error"):
+            raise HTTPException(status_code=int(state.get("error_status") or 502), detail=state["error"])
+        result = _amazon_sales_dashboard_ready_result(state)
+        if result is not None:
+            return result
+
+    def report_progress(value: dict[str, Any]) -> None:
+        state["progress"] = value
+
+    async def payload_factory() -> dict[str, Any]:
+        return await _amazon_sales_weekly_dashboard_payload(
+            week,
+            model,
+            site,
+            refresh,
+            include_comparison,
+            x_sync_key,
+            report_progress,
+        )
+
+    state = _amazon_sales_dashboard_start_job(job_key, payload_factory)
+    return _amazon_sales_dashboard_job_response(
+        dimension="week", model=model, site=site, state=state,
+        status="refreshing" if refresh else "preparing",
+    )
+
+
+async def _amazon_sales_weekly_dashboard_payload(
+    week: date,
+    model: str,
+    site: str,
+    refresh: bool = False,
+    include_comparison: bool = False,
+    x_sync_key: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    selected_sites = amazon_sales_selected_sites(site, include_regions=True)
+    products, selected_series = amazon_sales_scope(model)
+    week_end = week + timedelta(days=6)
+    site_today = min(
+        datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
+        for site_name in selected_sites
+    )
+    timezone_basis = (
+        selected_sites[0]
+        if len(selected_sites) == 1
+        else ("欧洲站点日期的最小值" if site == AMAZON_SALES_EUROPE else "全部站点站点日期的最小值")
+    )
+    time_progress = amazon_sales_week_time_progress(week, week_end, site_today)
+    with session_factory()() as db:
+        country_items = list(db.scalars(
+            select(AmazonWeeklyTarget).where(
+                AmazonWeeklyTarget.week_start == week,
+                AmazonWeeklyTarget.model == model,
+                AmazonWeeklyTarget.site.in_([AMAZON_SALES_ALL_SITES, *AMAZON_SITE_ORDER]),
+            )
+        ))
+        country_target_payload = amazon_sales_country_target_payload(country_items)
+        if site == AMAZON_SALES_EUROPE:
+            targets = amazon_sales_europe_target_values(country_items)
+            target_edit = latest_edit_metadata([item for item in country_items if item.site in AMAZON_SITE_ORDER])
+        else:
+            item = next((entry for entry in country_items if entry.site == site), None)
+            targets = amazon_sales_target_values(item)
+            target_edit = edit_metadata(item)
     rows: list[dict[str, Any]] = []
     data_quality: dict[str, Any] = {"source": "not_requested", "complete": True, "errors": []}
     asin_mapping = amazon_data_source_mapping_snapshot()
+    actual_end = min(week_end, site_today) if week <= site_today else None
     try:
         rows, data_quality = await amazon_sales_actual_rows(
             week,
-            min(week_end, site_today),
+            actual_end,
             "周",
             selected_sites,
             selected_series,
             products,
             refresh,
             asin_mapping,
+            progress_callback,
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
@@ -7024,7 +7524,6 @@ async def amazon_sales_weekly_dashboard(
     actuals = amazon_sales_actuals(rows)
     previous_actuals: dict[str, float | None] = {}
     comparison_payload: dict[str, Any] | None = None
-    actual_end = min(week_end, site_today) if week <= site_today else None
     if include_comparison and actual_end is not None:
         previous_start = week - timedelta(days=7)
         previous_period_end = week_end - timedelta(days=7)
@@ -7039,6 +7538,7 @@ async def amazon_sales_weekly_dashboard(
                 products,
                 refresh,
                 asin_mapping,
+                progress_callback,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
@@ -7156,6 +7656,7 @@ def save_amazon_sales_weekly_targets(
         item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-sales-targets")
+    _invalidate_amazon_sales_dashboard_jobs()
 
     return {
         "ok": True,
@@ -7213,6 +7714,7 @@ def save_amazon_sales_weekly_targets_bulk(
             item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
         _amazon_cache.clear_namespaces("amazon-sales-targets")
+        _invalidate_amazon_sales_dashboard_jobs()
         saved_items = list(db.scalars(
             select(AmazonWeeklyTarget).where(
                 AmazonWeeklyTarget.week_start == week,
@@ -7283,6 +7785,7 @@ def save_amazon_sales_targets(
         item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
     _amazon_cache.clear_namespaces("amazon-sales-targets")
+    _invalidate_amazon_sales_dashboard_jobs()
 
     return {
         "ok": True,
@@ -7343,6 +7846,7 @@ def save_amazon_sales_targets_bulk(
             item.updated_by = dashboard_request_editor(x_dashboard_editor)
         db.commit()
         _amazon_cache.clear_namespaces("amazon-sales-targets")
+        _invalidate_amazon_sales_dashboard_jobs()
         saved_items = list(db.scalars(
             select(AmazonMonthlyTarget).where(
                 AmazonMonthlyTarget.year == year,

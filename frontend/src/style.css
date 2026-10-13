@@ -394,6 +394,7 @@
 .sales-progress-track i.over{background:linear-gradient(90deg,#dc2626,#f97316)}
 .sales-progress-meta{display:flex;justify-content:space-between;gap:18px;margin-top:8px;color:#6d7f94;font-size:12px;font-weight:650}
 .sales-loading{margin:0;padding:36px;border:0;border-radius:0;background:#fff;color:#71839a;text-align:center}
+.sales-background-status{color:#1d4ed8;border:1px solid #c7dcf4;background:#eff6ff}
 .sales-table-panel{position:relative;margin:0;border:0;border-top:1px solid var(--line);border-radius:0 0 18px 18px;background:#fff;box-shadow:none;overflow:hidden}
 .sales-target-module>.message{margin:14px 18px 0}
 .sales-table-panel>header{padding:18px 20px 14px;display:flex;align-items:flex-end;justify-content:space-between;gap:18px;border-bottom:1px solid var(--line)}

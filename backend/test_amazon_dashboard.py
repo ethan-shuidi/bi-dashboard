@@ -88,6 +88,9 @@ from app import (
     _lingxing_mcp_metadata_cache,
     _amazon_cache,
     _amazon_ads_chart_jobs,
+    _amazon_inflight_payloads,
+    _amazon_sales_dashboard_jobs,
+    _amazon_shared_payload,
     PriorityAsyncLock,
     _performance_data_quality,
     _record_performance_quality,
@@ -161,10 +164,14 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         reset_mcp_test_state()
         _amazon_cache.clear()
         _amazon_ads_chart_jobs.clear()
+        _amazon_inflight_payloads.clear()
+        _amazon_sales_dashboard_jobs.clear()
 
     def tearDown(self):
         reset_mcp_test_state()
         _amazon_ads_chart_jobs.clear()
+        _amazon_inflight_payloads.clear()
+        _amazon_sales_dashboard_jobs.clear()
 
     def test_dashboard_editor_header_is_decoded_after_safe_transport(self):
         encoded = "%E7%BC%96%E8%BE%91%E8%80%85-abc"
@@ -570,6 +577,45 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             ["primary-test-key", "secondary-test-key", "tertiary-test-key", "tertiary-test-key"],
         )
 
+    def test_mcp_three_key_pool_uses_three_channels_concurrently(self):
+        async def scenario():
+            success = mcp_response({"success": True, "data": {"value": 42}})
+            entered = 0
+            all_entered = asyncio.Event()
+            used_keys: list[str] = []
+
+            class BarrierClient:
+                async def post(self, _url, **kwargs):
+                    nonlocal entered
+                    entered += 1
+                    used_keys.append(kwargs["headers"]["X-Mcp-Key"])
+                    if entered < 3:
+                        await all_entered.wait()
+                    else:
+                        all_entered.set()
+                    return success
+
+            results = await asyncio.gather(*[
+                lingxing_mcp_raw("action", {"request": index}, BarrierClient())
+                for index in range(3)
+            ])
+            return results, used_keys
+
+        environment = {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+            "LINGXING_API_KEY3": "tertiary-test-key",
+        }
+        with patch.dict(os.environ, environment), \
+             patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                results, used_keys = asyncio.run(scenario())
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(results, [{"value": 42}] * 3)
+        self.assertEqual(set(used_keys), {"primary-test-key", "secondary-test-key", "tertiary-test-key"})
+
     def test_mcp_lock_lets_foreground_dashboard_overtake_background_chart_calls(self):
         success = mcp_response({"success": True, "data": {"value": 42}})
         order: list[str] = []
@@ -613,6 +659,60 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
 
         self.assertEqual(names, ["background-1", "background-2", "background-3", "foreground"])
         self.assertEqual(order, ["background-1", "background-2", "foreground", "background-3"])
+
+    def test_identical_inflight_payloads_share_one_fetch_and_return_private_copies(self):
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = 0
+
+            async def factory():
+                nonlocal calls
+                calls += 1
+                started.set()
+                await release.wait()
+                return {"rows": [{"value": 1}]}
+
+            first = asyncio.create_task(_amazon_shared_payload(("shared",), factory))
+            await started.wait()
+            second = asyncio.create_task(_amazon_shared_payload(("shared",), factory))
+            release.set()
+            first, second = await asyncio.gather(first, second)
+            return first, second, calls
+
+        first, second, calls = asyncio.run(scenario())
+        self.assertEqual(calls, 1)
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        first["rows"][0]["value"] = 999
+        self.assertEqual(second["rows"][0]["value"], 1)
+        self.assertFalse(_amazon_inflight_payloads)
+
+    def test_identical_inflight_payload_error_reaches_every_waiter(self):
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = 0
+
+            async def factory():
+                nonlocal calls
+                calls += 1
+                started.set()
+                await release.wait()
+                raise RuntimeError("upstream unavailable")
+
+            first = asyncio.create_task(_amazon_shared_payload(("error",), factory))
+            await started.wait()
+            second = asyncio.create_task(_amazon_shared_payload(("error",), factory))
+            release.set()
+            first, second = await asyncio.gather(first, second, return_exceptions=True)
+            return first, second, calls
+
+        first, second, calls = asyncio.run(scenario())
+        self.assertEqual(calls, 1)
+        self.assertIsInstance(first, RuntimeError)
+        self.assertIsInstance(second, RuntimeError)
+        self.assertFalse(_amazon_inflight_payloads)
 
     def test_mcp_pool_cooldowns_are_independent(self):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
@@ -1960,6 +2060,128 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(periodic_mock.await_count, 1)
         self.assertEqual(second["fetch_status"], "ready")
         self.assertEqual(second["rows"][0]["net_sales"], 100)
+
+    def test_sales_dashboard_background_job_preserves_legacy_client_protocol(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        async def payload(*_args, **_kwargs):
+            callback = _kwargs.get("progress_callback") or (
+                _args[-1] if _args and callable(_args[-1]) else None
+            )
+            if callback:
+                callback({"stage": "product_performance", "message": "正在抓取领星产品表现数据"})
+            return {
+                "dimension": "month",
+                "rows": [{"metric": "销量", "value": 12}],
+                "targets": {},
+                "data_quality": {"source": "mcp", "complete": True, "errors": []},
+            }
+
+        payload_mock = AsyncMock(side_effect=payload)
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_monthly_dashboard_payload", new=payload_mock):
+                first = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=False,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                second = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=False,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    x_sync_key=None,
+                )
+                app_module._invalidate_amazon_sales_dashboard_jobs()
+                legacy = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=False,
+                    include_comparison=False,
+                    client="legacy",
+                    x_sync_key=None,
+                )
+            return first, second, legacy
+
+        first, second, legacy = asyncio.run(scenario())
+        self.assertEqual(first["fetch_status"], "preparing")
+        self.assertEqual(second["fetch_status"], "ready")
+        self.assertIn("正在抓取领星产品表现数据", second["fetch_progress"]["message"])
+        self.assertEqual(second["rows"][0]["value"], 12)
+        second["rows"][0]["value"] = 999
+        self.assertEqual(payload_mock.await_count, 2)
+        self.assertEqual(legacy["rows"][0]["value"], 12)
+        self.assertNotIn("fetch_status", legacy)
+
+    def test_sales_dashboard_background_error_is_surfaced_on_next_poll(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        async def failing_payload(*_args, **_kwargs):
+            callback = _kwargs.get("progress_callback")
+            if callback:
+                callback({"stage": "campaign_report", "message": "正在汇总完整广告活动"})
+            raise app_module.HTTPException(status_code=502, detail="领星产品表现数据获取失败")
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_monthly_dashboard_payload", new=AsyncMock(side_effect=failing_payload)):
+                await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=False,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=False,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    x_sync_key=None,
+                )
+
+        with self.assertRaisesRegex(app_module.HTTPException, "领星产品表现数据获取失败"):
+            asyncio.run(scenario())
 
     def test_ads_charts_refresh_failure_keeps_last_good_rollup(self):
         periodic_mock = AsyncMock(side_effect=RuntimeError("认证请求过于频繁"))

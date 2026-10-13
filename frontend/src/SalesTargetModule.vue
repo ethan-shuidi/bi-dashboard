@@ -36,6 +36,8 @@ const siteOptions = ["全部站点", "欧洲", "美国", "日本", "德国", "�
 const months = Array.from({ length: 12 }, (_, index) => index + 1)
 const data = ref(null)
 const loading = ref(true)
+const loadingStage = ref("正在读取云端目标与领星产品表现…")
+const backgroundStatus = ref("")
 const saving = ref(false)
 const error = ref("")
 const notice = ref("")
@@ -49,6 +51,10 @@ const quickTargetSaving = ref(false)
 const quickTargetError = ref("")
 let dashboardRequestSeq = 0
 let columnResizeCleanup = null
+let loadingStageTimer = null
+let salesPollTimer = null
+let salesPollDelay = 1000
+let salesRefreshActive = false
 
 const salesColumnDefaults = {
   metric: 128,
@@ -120,17 +126,33 @@ function syncDraft(targets = {}) {
   savedTargets.value = { ...values }
 }
 
-async function loadDashboard({ refresh = false } = {}) {
+async function loadDashboard({ refresh = false, poll = false } = {}) {
+  clearSalesPollTimer()
+  if (!poll) salesPollDelay = 1000
+  salesRefreshActive = refresh
   const requestSeq = ++dashboardRequestSeq
-  loading.value = true
+  loading.value = data.value === null
   error.value = ""
+  if (!poll) {
+    backgroundStatus.value = ""
+    startLoadingStage()
+  }
   try {
     const query = new URLSearchParams({ model: model.value, site: site.value })
+    query.set("client", "sales-background.v1")
     if (isWeek.value) query.set("week_start", weekStart.value)
     else query.set("year", String(year.value)), query.set("month", String(month.value))
     if (refresh) query.set("refresh", "true")
     const body = await api(`/api/amazon/sales-dashboard${isWeek.value ? "/weekly" : ""}?${query}`)
     if (requestSeq !== dashboardRequestSeq) return
+    if (body.fetch_status === "preparing" || body.fetch_status === "refreshing") {
+      const message = formatBackgroundProgress(body.progress)
+      backgroundStatus.value = message
+      loadingStage.value = message
+      scheduleSalesPoll(refresh)
+      return
+    }
+    backgroundStatus.value = ""
     data.value = body
     targetEdit.value = body.target_edit || { updated_at: null, updated_by: null }
     baseUpdatedAt.value = targetEdit.value.updated_at || null
@@ -140,6 +162,63 @@ async function loadDashboard({ refresh = false } = {}) {
     error.value = exception.message
   } finally {
     if (requestSeq === dashboardRequestSeq) loading.value = false
+    if (requestSeq === dashboardRequestSeq) stopLoadingStage()
+  }
+}
+
+function formatBackgroundProgress(progress) {
+  const message = String(progress?.message || "正在读取云端目标与领星产品表现…")
+  const sites = Number(progress?.sites)
+  return Number.isFinite(sites) && sites > 0 ? `${message}（${sites} 个站点）` : message
+}
+
+function startLoadingStage() {
+  stopLoadingStage()
+  loadingStage.value = backgroundStatus.value || "正在读取云端目标与领星产品表现…"
+  let elapsed = 0
+  loadingStageTimer = window.setInterval(() => {
+    elapsed += 5
+    if (elapsed >= 30) {
+      loadingStage.value = "正在汇总全部站点的完整广告活动（含 SP / SB / SBV / SD），数据完整前不会返回…"
+    } else if (elapsed >= 10) {
+      loadingStage.value = "正在逐站抓取领星产品表现数据…"
+    }
+  }, 5000)
+}
+
+function scheduleSalesPoll(refresh = false) {
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+  if (salesPollTimer) window.clearTimeout(salesPollTimer)
+  salesPollTimer = window.setTimeout(() => {
+    salesPollTimer = null
+    void loadDashboard({ refresh, poll: true })
+  }, salesPollDelay)
+  salesPollDelay = Math.min(10000, Math.ceil(salesPollDelay * 1.6))
+}
+
+function clearSalesPollTimer() {
+  if (salesPollTimer) {
+    window.clearTimeout(salesPollTimer)
+    salesPollTimer = null
+  }
+}
+
+function handleSalesVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    clearSalesPollTimer()
+    return
+  }
+  if (backgroundStatus.value) {
+    clearSalesPollTimer()
+    salesPollDelay = 1000
+    void loadDashboard({ refresh: salesRefreshActive })
+  }
+}
+
+function stopLoadingStage() {
+  if (loadingStageTimer) {
+    window.clearInterval(loadingStageTimer)
+    loadingStageTimer = null
   }
 }
 
@@ -440,13 +519,17 @@ onMounted(() => {
   document.addEventListener("click", closeDatePicker)
   window.addEventListener("resize", updateDatePanelPosition)
   window.addEventListener("scroll", updateDatePanelPosition, true)
+  document.addEventListener("visibilitychange", handleSalesVisibilityChange)
   loadDashboard()
 })
 onBeforeUnmount(() => {
   columnResizeCleanup?.()
+  stopLoadingStage()
+  clearSalesPollTimer()
   document.removeEventListener("click", closeDatePicker)
   window.removeEventListener("resize", updateDatePanelPosition)
   window.removeEventListener("scroll", updateDatePanelPosition, true)
+  document.removeEventListener("visibilitychange", handleSalesVisibilityChange)
 })
 watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () => loadDashboard())
 </script>
@@ -503,7 +586,7 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
       </div>
     </section>
 
-    <section class="sales-progress-panel" aria-label="销量目标进度">
+    <section v-if="data" class="sales-progress-panel" aria-label="销量目标进度">
       <div class="sales-progress-copy">
         <div>
           <span>销量目标进度</span>
@@ -522,9 +605,10 @@ watch(isWeek.value ? [weekStart, model, site] : [year, month, model, site], () =
 
     <DashboardState v-if="error" state="error" title="数据加载或保存失败" :message="error" />
     <section v-if="notice" class="message success-message" role="status"><span>{{ notice }}</span></section>
-    <DashboardState v-else-if="loading" state="loading" title="领星产品表现" message="正在获取领星产品表现和云端目标…" />
+    <section v-if="backgroundStatus && data" class="message sales-background-status" role="status">{{ backgroundStatus }}</section>
+    <DashboardState v-if="loading" state="loading" title="领星产品表现" :message="loadingStage" />
 
-    <section v-else class="sales-table-panel">
+    <section v-if="data" class="sales-table-panel">
       <header>
         <div>
           <span class="section-label">{{ dimensionName }}目标完成度</span>

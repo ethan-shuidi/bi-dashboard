@@ -34,6 +34,7 @@ let trafficChart
 let resizeObserver
 let chartRequestSeq = 0
 let chartPollTimer
+let chartPollDelay = 3000
 let eChartsLoader
 let lastChartSignature = ""
 
@@ -159,13 +160,14 @@ function syncQuickRange() {
   quickRange.value = matched?.value ?? null
 }
 
-async function load({ refresh = false } = {}) {
+async function load({ refresh = false, poll = false } = {}) {
   if (!props.apiBase) return
   clearPollTimer()
+  if (!poll) chartPollDelay = 3000
   const requestSeq = ++chartRequestSeq
   loading.value = true
   error.value = ""
-  backgroundStatus.value = ""
+  if (!poll) backgroundStatus.value = ""
   try {
     const query = new URLSearchParams({ start_week: startWeek.value, end_week: endWeek.value, site: site.value, model: model.value })
     if (refresh) query.set("refresh", "true")
@@ -186,11 +188,7 @@ async function load({ refresh = false } = {}) {
     await nextTick()
     await renderCharts()
     if (backgroundStatus.value) {
-      if (chartPollTimer) clearTimeout(chartPollTimer)
-      chartPollTimer = setTimeout(() => {
-        chartPollTimer = null
-        void load()
-      }, 3000)
+      schedulePoll()
     }
   } catch (e) {
     if (requestSeq !== chartRequestSeq) return
@@ -204,6 +202,16 @@ async function load({ refresh = false } = {}) {
   } finally {
     if (requestSeq === chartRequestSeq) loading.value = false
   }
+}
+
+function schedulePoll() {
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+  if (chartPollTimer) clearTimeout(chartPollTimer)
+  chartPollTimer = setTimeout(() => {
+    chartPollTimer = null
+    void load({ poll: true })
+  }, chartPollDelay)
+  chartPollDelay = Math.min(10000, Math.ceil(chartPollDelay * 1.6))
 }
 
 function baseOption(ariaText) {
@@ -326,7 +334,20 @@ onMounted(async () => {
   await nextTick()
   ;[salesChartElement.value, conversionChartElement.value, trafficChartElement.value].filter(Boolean).forEach((element) => resizeObserver?.observe(element))
   await load()
+  document.addEventListener("visibilitychange", handleVisibilityChange)
 })
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    clearPollTimer()
+    return
+  }
+  if (backgroundStatus.value) {
+    clearPollTimer()
+    chartPollDelay = 3000
+    void load()
+  }
+}
 
 watch(startWeek, (value) => {
   if (value && endWeek.value && value > endWeek.value) endWeek.value = value
@@ -340,6 +361,7 @@ watch(() => [props.apiBase, startWeek.value, endWeek.value, site.value, model.va
 
 onBeforeUnmount(() => {
   clearPollTimer()
+  document.removeEventListener("visibilitychange", handleVisibilityChange)
   resizeObserver?.disconnect()
   salesChart?.dispose()
   conversionChart?.dispose()
