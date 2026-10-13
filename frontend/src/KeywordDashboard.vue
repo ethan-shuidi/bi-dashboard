@@ -950,8 +950,8 @@ watch(() => [tableRows.value, displayWeeks.value, rowGap.value, tableMinWidth.va
 .column-width-control{height:34px;display:inline-flex;align-items:center;padding:0 11px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font-size:12px;cursor:pointer;white-space:nowrap}
 .column-width-control:hover{background:#f2f8ff}
 .keyword-table-wrap{max-height:none;min-height:0}
-thead th.category{position:sticky;left:0;z-index:8;box-shadow:1px 0 0 #dce7f3}
-thead th.keyword{position:sticky;left:var(--keyword-category-width,150px);z-index:8;box-shadow:1px 0 0 #dce7f3}
+thead tr:nth-child(1) th.category{position:sticky;left:0;z-index:8;box-shadow:1px 0 0 #dce7f3}
+thead tr:nth-child(1) th.keyword{position:sticky;left:var(--keyword-category-width,150px);z-index:8;box-shadow:1px 0 0 #dce7f3}
 tbody td.category-cell{position:sticky;left:0;z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
 tbody th[scope=row]{position:sticky;left:var(--keyword-category-width,150px);z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
 tbody tr:hover td.category-cell,tbody tr:hover th[scope=row]{background:#f8fbff}
