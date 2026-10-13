@@ -4023,6 +4023,7 @@ def lingxing_mcp_keys() -> list[str]:
     values = [
         lingxing_mcp_key(),
         os.environ.get("LINGXING_API_KEY2", "").strip(),
+        os.environ.get("LINGXING_API_KEY3", "").strip(),
     ]
     return list(dict.fromkeys(value for value in values if value))
 

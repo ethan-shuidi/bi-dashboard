@@ -540,6 +540,35 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
         self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key", "secondary-test-key"])
 
+    def test_mcp_three_key_pool_rotates_and_third_key_takes_over(self):
+        rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [
+            rate_limited,
+            rate_limited,
+            success,
+            success,
+        ]
+        environment = {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+            "LINGXING_API_KEY3": "tertiary-test-key",
+        }
+        with patch.dict(os.environ, environment), \
+             patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
+             patch.object(app_module, "LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", 20.0):
+            try:
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+            finally:
+                reset_mcp_test_state()
+        used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
+        self.assertEqual(
+            used_keys,
+            ["primary-test-key", "secondary-test-key", "tertiary-test-key", "tertiary-test-key"],
+        )
+
     def test_mcp_pool_cooldowns_are_independent(self):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
         client = AsyncMock()
