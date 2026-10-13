@@ -17,7 +17,7 @@ const quickRangeOptions = [
   { label: "前10周", value: 10 },
   { label: "前15周", value: 15 },
 ]
-const site = ref("全部站点")
+const site = ref("美国")
 const model = ref("TN10")
 const quickRange = ref(5)
 const loading = ref(false)
@@ -35,6 +35,7 @@ let resizeObserver
 let chartRequestSeq = 0
 let chartPollTimer
 let eChartsLoader
+let lastChartSignature = ""
 
 function ensureECharts() {
   eChartsLoader ??= Promise.all([
@@ -105,6 +106,22 @@ function formatChartTooltipValue(seriesName, value) {
   if (seriesName === "销售额" || seriesName === "广告销售额") return fixedDecimal(value)
   if (seriesName === "费比" || seriesName === "广告转化率") return percent(value)
   return value
+}
+
+function chartSignature() {
+  return JSON.stringify([
+    currency.value,
+    weekLabels.value,
+    rows.value.map((row) => [
+      row.net_sales,
+      row.ad_sales,
+      row.fee_ratio,
+      row.clicks,
+      row.ad_cvr,
+      row.sessions,
+      row.page_views,
+    ]),
+  ])
 }
 
 function chartTooltipFormatter(params) {
@@ -253,7 +270,7 @@ function renderSalesChart(init) {
       { name: "广告销售额", type: "bar", barMaxWidth: 20, data: rows.value.map((row) => row.ad_sales), itemStyle: { borderRadius: [5, 5, 0, 0] } },
       { name: "费比", type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, data: rows.value.map((row) => row.fee_ratio), lineStyle: { width: 3 } },
     ],
-  }, true)
+  })
 }
 
 function renderConversionChart(init) {
@@ -270,7 +287,7 @@ function renderConversionChart(init) {
       { name: "点击数", type: "bar", barMaxWidth: 24, data: rows.value.map((row) => row.clicks), itemStyle: { borderRadius: [5, 5, 0, 0] } },
       { name: "广告转化率", type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, data: rows.value.map((row) => row.ad_cvr), lineStyle: { width: 3 } },
     ],
-  }, true)
+  })
 }
 
 function renderTrafficChart(init) {
@@ -284,15 +301,18 @@ function renderTrafficChart(init) {
       { name: "Sessions", type: "line", smooth: true, symbolSize: 6, data: rows.value.map((row) => row.sessions), lineStyle: { width: 3 }, areaStyle: { opacity: 0.08 } },
       { name: "PV", type: "line", smooth: true, symbolSize: 6, data: rows.value.map((row) => row.page_views), lineStyle: { width: 3 }, areaStyle: { opacity: 0.08 } },
     ],
-  }, true)
+  })
 }
 
 async function renderCharts() {
   if (!rows.value.length) return
+  const signature = chartSignature()
+  if (signature === lastChartSignature) return
   const init = await ensureECharts()
   renderSalesChart(init)
   renderConversionChart(init)
   renderTrafficChart(init)
+  lastChartSignature = signature
 }
 
 onMounted(async () => {
