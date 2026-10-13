@@ -114,6 +114,12 @@ async function api(path, options = {}) {
 }
 
 function syncDraft(targets = {}) {
+  const values = cloudTargetsForDraft(targets)
+  targetDraft.value = values
+  savedTargets.value = { ...values }
+}
+
+function cloudTargetsForDraft(targets = {}) {
   const values = {}
   for (const item of editableRows.value) {
     let value = targets[item.key]
@@ -122,8 +128,19 @@ function syncDraft(targets = {}) {
     }
     values[item.key] = value === null || value === undefined ? "" : String(value)
   }
-  targetDraft.value = values
-  savedTargets.value = { ...values }
+  return values
+}
+
+function syncDraftWhilePreservingLocalEdits(targets = {}) {
+  const values = cloudTargetsForDraft(targets)
+  const retainedDraft = {}
+  for (const key of Object.keys(values)) {
+    retainedDraft[key] = Object.hasOwn(targetDraft.value, key)
+      ? targetDraft.value[key]
+      : values[key]
+  }
+  targetDraft.value = retainedDraft
+  savedTargets.value = values
 }
 
 async function loadDashboard({ refresh = false, poll = false } = {}) {
@@ -140,6 +157,8 @@ async function loadDashboard({ refresh = false, poll = false } = {}) {
   try {
     const query = new URLSearchParams({ model: model.value, site: site.value })
     query.set("client", "sales-background.v1")
+    if (poll) query.set("poll", "true")
+    else query.set("poll", "false")
     if (isWeek.value) query.set("week_start", weekStart.value)
     else query.set("year", String(year.value)), query.set("month", String(month.value))
     if (refresh) query.set("refresh", "true")
@@ -153,10 +172,12 @@ async function loadDashboard({ refresh = false, poll = false } = {}) {
       return
     }
     backgroundStatus.value = ""
+    const preserveLocalDraft = dirty.value
     data.value = body
     targetEdit.value = body.target_edit || { updated_at: null, updated_by: null }
     baseUpdatedAt.value = targetEdit.value.updated_at || null
-    syncDraft(data.value.targets)
+    if (preserveLocalDraft) syncDraftWhilePreservingLocalEdits(data.value.targets)
+    else syncDraft(data.value.targets)
   } catch (exception) {
     if (requestSeq !== dashboardRequestSeq) return
     error.value = exception.message
@@ -211,7 +232,7 @@ function handleSalesVisibilityChange() {
   if (backgroundStatus.value) {
     clearSalesPollTimer()
     salesPollDelay = 1000
-    void loadDashboard({ refresh: salesRefreshActive })
+    void loadDashboard({ refresh: salesRefreshActive, poll: true })
   }
 }
 

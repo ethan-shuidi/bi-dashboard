@@ -530,6 +530,67 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
                 asyncio.run(lingxing_mcp_raw("action", {}, client))
         self.assertEqual(client.post.call_count, 2)
 
+    def test_mcp_transport_timeout_falls_back_to_next_key(self):
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [httpx.ReadTimeout("upstream read timeout"), success]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0), \
+             patch.object(app_module, "LINGXING_MCP_REQUEST_TIMEOUT_SECONDS", 81.5):
+            try:
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(client.post.call_count, 2)
+        used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
+        self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key"])
+        self.assertEqual(client.post.call_args.kwargs["timeout"], 81.5)
+
+    def test_mcp_server_error_falls_back_to_next_key(self):
+        server_error = httpx.Response(
+            503,
+            request=httpx.Request("POST", "https://example.test/mcp"),
+        )
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [server_error, success]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+            finally:
+                reset_mcp_test_state()
+
+        used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
+        self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key"])
+
+    def test_mcp_transport_error_after_all_channels_has_safe_summary(self):
+        client = AsyncMock()
+        client.post.side_effect = [httpx.ReadTimeout("upstream read timeout")] * 3
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+            "LINGXING_API_KEY3": "tertiary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"LingXing MCP transport error after 3 channel\(s\): ReadTimeout",
+                ) as caught:
+                    asyncio.run(lingxing_mcp_raw("action", {}, client))
+                self.assertNotIn("primary-test-key", str(caught.exception))
+                self.assertNotIn("secondary-test-key", str(caught.exception))
+                self.assertNotIn("tertiary-test-key", str(caught.exception))
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(client.post.call_count, 3)
+
     def test_mcp_secondary_key_takes_over_when_primary_is_rate_limited(self):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})
         success = mcp_response({"success": True, "data": {"value": 42}})
@@ -2182,6 +2243,220 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
 
         with self.assertRaisesRegex(app_module.HTTPException, "领星产品表现数据获取失败"):
             asyncio.run(scenario())
+
+    def test_sales_dashboard_refresh_poll_returns_result_without_restart(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        payload_mock = AsyncMock(return_value={
+            "dimension": "month",
+            "rows": [{"metric": "销量", "value": 12}],
+            "targets": {},
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+        })
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_monthly_dashboard_payload", new=payload_mock):
+                first = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=False,
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                polled = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=True,
+                    x_sync_key=None,
+                )
+                legacy_poll = await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=None,
+                    x_sync_key=None,
+                )
+            return first, polled, legacy_poll
+
+        first, polled, legacy_poll = asyncio.run(scenario())
+        self.assertEqual(first["fetch_status"], "refreshing")
+        self.assertEqual(polled["fetch_status"], "ready")
+        self.assertEqual(legacy_poll["fetch_status"], "ready")
+        self.assertEqual(polled["rows"][0]["value"], 12)
+        self.assertEqual(payload_mock.await_count, 1)
+
+    def test_sales_weekly_dashboard_refresh_poll_returns_result_without_restart(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        payload_mock = AsyncMock(return_value={
+            "dimension": "week",
+            "rows": [{"metric": "销量", "value": 8}],
+            "targets": {},
+            "data_quality": {"source": "mcp", "complete": True, "errors": []},
+        })
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_weekly_dashboard_payload", new=payload_mock):
+                first = await app_module.amazon_sales_weekly_dashboard(
+                    week_start=date(2026, 9, 7),
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=False,
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                polled = await app_module.amazon_sales_weekly_dashboard(
+                    week_start=date(2026, 9, 7),
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=True,
+                    x_sync_key=None,
+                )
+            return first, polled
+
+        first, polled = asyncio.run(scenario())
+        self.assertEqual(first["fetch_status"], "refreshing")
+        self.assertEqual(polled["fetch_status"], "ready")
+        self.assertEqual(polled["rows"][0]["value"], 8)
+        self.assertEqual(payload_mock.await_count, 1)
+
+    def test_sales_dashboard_refresh_failure_poll_does_not_restart_job(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        payload_mock = AsyncMock(side_effect=app_module.HTTPException(
+            status_code=502,
+            detail="领星产品表现数据获取失败（ReadTimeout）",
+        ))
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_monthly_dashboard_payload", new=payload_mock):
+                await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=False,
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                await app_module.amazon_sales_dashboard(
+                    year=2026,
+                    month=9,
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=True,
+                    x_sync_key=None,
+                )
+
+        with self.assertRaisesRegex(app_module.HTTPException, "ReadTimeout"):
+            asyncio.run(scenario())
+        self.assertEqual(payload_mock.await_count, 1)
+
+    def test_sales_weekly_dashboard_refresh_failure_poll_does_not_restart_job(self):
+        class FakeSession:
+            def scalars(self, _query):
+                return iter([])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        payload_mock = AsyncMock(side_effect=app_module.HTTPException(
+            status_code=502,
+            detail="领星产品表现数据获取失败（ReadTimeout）",
+        ))
+
+        async def scenario():
+            with patch.object(app_module, "session_factory", new=lambda: lambda: FakeSession()), \
+                    patch("app.amazon_data_source_mapping_snapshot", return_value=ASIN_MAPPING), \
+                    patch("app._amazon_sales_weekly_dashboard_payload", new=payload_mock):
+                await app_module.amazon_sales_weekly_dashboard(
+                    week_start=date(2026, 9, 7),
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=False,
+                    x_sync_key=None,
+                )
+                state = next(iter(_amazon_sales_dashboard_jobs.values()))
+                await state["task"]
+                await app_module.amazon_sales_weekly_dashboard(
+                    week_start=date(2026, 9, 7),
+                    model="TN10",
+                    site="美国",
+                    refresh=True,
+                    include_comparison=False,
+                    client="sales-background.v1",
+                    poll=True,
+                    x_sync_key=None,
+                )
+
+        with self.assertRaisesRegex(app_module.HTTPException, "ReadTimeout"):
+            asyncio.run(scenario())
+        self.assertEqual(payload_mock.await_count, 1)
 
     def test_ads_charts_refresh_failure_keeps_last_good_rollup(self):
         periodic_mock = AsyncMock(side_effect=RuntimeError("认证请求过于频繁"))

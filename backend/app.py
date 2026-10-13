@@ -463,6 +463,9 @@ LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS = tuple(
 LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS = float(
     os.environ.get("LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", "65")
 )
+LINGXING_MCP_REQUEST_TIMEOUT_SECONDS = float(
+    os.environ.get("LINGXING_MCP_REQUEST_TIMEOUT_SECONDS", "75")
+)
 AMAZON_UPSTREAM_CONCURRENCY = 5
 AMAZON_CURRENCY_CODES = {
     "美国": "USD", "日本": "JPY", "加拿大": "CAD", "澳洲": "AUD",
@@ -4306,6 +4309,30 @@ def _is_lingxing_mcp_rate_limit_message(message: Any) -> bool:
     return _is_lingxing_mcp_rate_limit_error(RuntimeError(str(message)))
 
 
+def _lingxing_mcp_error_summary(error: BaseException) -> str:
+    """Describe an upstream failure without embedding credentials."""
+
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"HTTP {error.response.status_code}"
+    return type(error).__name__
+
+
+def _is_lingxing_mcp_transport_error(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return 500 <= error.response.status_code < 600
+    # TransportError includes connect/read/write timeouts. Business and rate
+    # limit failures must keep their dedicated handling below.
+    return isinstance(error, httpx.TransportError)
+
+
+def _log_lingxing_mcp_transport_error(operation: str, digest: str, error: BaseException) -> None:
+    print(
+        "LingXing MCP transport error: "
+        f"operation={operation} key={digest[:8]} error={_lingxing_mcp_error_summary(error)}",
+        flush=True,
+    )
+
+
 async def lingxing_mcp_raw(
     operation: str,
     arguments: dict[str, Any],
@@ -4373,16 +4400,26 @@ async def lingxing_mcp_raw(
                         LINGXING_MCP_URL,
                         json=payload,
                         headers={"X-Mcp-Key": key, "Accept": "application/json, text/event-stream"},
+                        timeout=LINGXING_MCP_REQUEST_TIMEOUT_SECONDS,
                     )
                     state["last_call"] = time.monotonic()
                     response.raise_for_status()
                     result = _lingxing_mcp_result(_lingxing_mcp_json_body(response))
                     state["cooldown_until"] = 0.0
                     return result
-                except (RuntimeError, httpx.HTTPStatusError) as exc:
+                except (RuntimeError, httpx.HTTPStatusError, httpx.TransportError) as exc:
                     rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
                     state["last_call"] = time.monotonic()
                     if not rate_limited:
+                        if _is_lingxing_mcp_transport_error(exc):
+                            exhausted_keys.add(digest)
+                            _log_lingxing_mcp_transport_error(operation, digest, exc)
+                            if len(exhausted_keys) == len(keys):
+                                raise RuntimeError(
+                                    "LingXing MCP transport error after "
+                                    f"{len(keys)} channel(s): {_lingxing_mcp_error_summary(exc)}"
+                                ) from exc
+                            continue
                         raise
                     state["cooldown_until"] = time.monotonic() + LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS
                     # Preserve the historical bounded retry schedule for a
@@ -6675,7 +6712,10 @@ async def amazon_ads_charts(
                 history_cutoff=history_cutoff,
             )
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"领星产品表现数据获取失败（{_lingxing_mcp_error_summary(exc)}）",
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
         return amazon_ads_charts_payload(start, end, site, selected_sites, model, periodic)
@@ -7066,6 +7106,7 @@ async def amazon_sales_dashboard(
     refresh: bool = Query(default=False),
     include_comparison: bool = Query(default=False),
     client: str = Query(default="legacy"),
+    poll: bool | None = Query(default=None),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return monthly target completion for one merged product model."""
@@ -7157,16 +7198,20 @@ async def amazon_sales_dashboard(
             status="refreshing" if refresh else "preparing",
         )
     if (
-        not refresh
-        and state
+        state
         and state.get("finished_at")
         and now - float(state["finished_at"]) <= AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS
     ):
-        if state.get("error"):
+        # An explicit poll must observe the terminal result instead of
+        # starting another upstream fetch. ``poll=None`` also preserves the
+        # pre-poll frontend protocol, whose refresh request doubled as polling.
+        # A new manual refresh explicitly sends poll=false and may retry.
+        if state.get("error") and not (refresh and poll is False):
             raise HTTPException(status_code=int(state.get("error_status") or 502), detail=state["error"])
-        result = _amazon_sales_dashboard_ready_result(state)
-        if result is not None:
-            return result
+        if not refresh or poll is not False:
+            result = _amazon_sales_dashboard_ready_result(state)
+            if result is not None:
+                return result
 
     def report_progress(value: dict[str, Any]) -> None:
         state["progress"] = value
@@ -7256,7 +7301,10 @@ async def _amazon_sales_monthly_dashboard_payload(
                 progress_callback,
             )
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"领星产品表现数据获取失败（{_lingxing_mcp_error_summary(exc)}）",
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
 
@@ -7283,7 +7331,10 @@ async def _amazon_sales_monthly_dashboard_payload(
                     progress_callback,
                 )
             except httpx.HTTPError as exc:
-                raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"领星环比产品表现数据获取失败（{_lingxing_mcp_error_summary(exc)}）",
+                ) from exc
             except RuntimeError as exc:
                 raise HTTPException(status_code=502, detail=f"领星环比产品表现数据获取失败：{exc}") from exc
             previous_actuals = amazon_sales_actuals(previous_rows)
@@ -7350,6 +7401,7 @@ async def amazon_sales_weekly_dashboard(
     refresh: bool = Query(default=False),
     include_comparison: bool = Query(default=False),
     client: str = Query(default="legacy"),
+    poll: bool | None = Query(default=None),
     x_sync_key: str | None = Header(default=None, alias="X-Sync-Key"),
 ):
     """Return weekly target completion for one merged product model."""
@@ -7430,16 +7482,18 @@ async def amazon_sales_weekly_dashboard(
             status="refreshing" if refresh else "preparing",
         )
     if (
-        not refresh
-        and state
+        state
         and state.get("finished_at")
         and now - float(state["finished_at"]) <= AMAZON_ADS_CHART_JOB_RESULT_TTL_SECONDS
     ):
-        if state.get("error"):
+        # Monthly and weekly use the same terminal-state contract. See the
+        # monthly endpoint for the old/new frontend compatibility details.
+        if state.get("error") and not (refresh and poll is False):
             raise HTTPException(status_code=int(state.get("error_status") or 502), detail=state["error"])
-        result = _amazon_sales_dashboard_ready_result(state)
-        if result is not None:
-            return result
+        if not refresh or poll is not False:
+            result = _amazon_sales_dashboard_ready_result(state)
+            if result is not None:
+                return result
 
     def report_progress(value: dict[str, Any]) -> None:
         state["progress"] = value
@@ -7517,7 +7571,10 @@ async def _amazon_sales_weekly_dashboard_payload(
             progress_callback,
         )
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="领星产品表现数据获取失败") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"领星产品表现数据获取失败（{_lingxing_mcp_error_summary(exc)}）",
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"领星产品表现数据获取失败：{exc}") from exc
 
@@ -7541,7 +7598,10 @@ async def _amazon_sales_weekly_dashboard_payload(
                 progress_callback,
             )
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail="领星环比产品表现数据获取失败") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"领星环比产品表现数据获取失败（{_lingxing_mcp_error_summary(exc)}）",
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=f"领星环比产品表现数据获取失败：{exc}") from exc
         previous_actuals = amazon_sales_actuals(previous_rows)
