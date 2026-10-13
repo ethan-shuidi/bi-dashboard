@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import os
 import time
@@ -568,6 +569,50 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             used_keys,
             ["primary-test-key", "secondary-test-key", "tertiary-test-key", "tertiary-test-key"],
         )
+
+    def test_mcp_lock_lets_foreground_dashboard_overtake_background_chart_calls(self):
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        order: list[str] = []
+        current_request_name = contextvars.ContextVar("current_request_name")
+
+        class Client:
+            async def post(self, _url, **kwargs):
+                await asyncio.sleep(0)
+                order.append(current_request_name.get())
+                return success
+
+        async def request(name: str, *, background: bool):
+            name_token = current_request_name.set(name)
+            token = app_module._amazon_background_fetch.set(background)
+            try:
+                await lingxing_mcp_raw("action", {}, Client())
+            finally:
+                app_module._amazon_background_fetch.reset(token)
+                current_request_name.reset(name_token)
+            return name
+
+        async def scenario():
+            # Two background calls execute/queue first. The foreground board
+            # request must overtake any background call that is still queued.
+            tasks = [
+                asyncio.create_task(request("background-1", background=True)),
+                asyncio.create_task(request("background-2", background=True)),
+                asyncio.create_task(request("background-3", background=True)),
+            ]
+            await asyncio.sleep(0)
+            tasks.append(asyncio.create_task(request("foreground", background=False)))
+            await asyncio.sleep(0)
+            return await asyncio.gather(*tasks)
+
+        with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}), \
+                patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                names = asyncio.run(scenario())
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(names, ["background-1", "background-2", "background-3", "foreground"])
+        self.assertEqual(order, ["background-1", "background-2", "foreground", "background-3"])
 
     def test_mcp_pool_cooldowns_are_independent(self):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})

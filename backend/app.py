@@ -252,7 +252,7 @@ _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
 _lingxing_store_lock = asyncio.Lock()
-_lingxing_mcp_request_lock = asyncio.Lock()
+_lingxing_mcp_request_lock = PriorityAsyncLock()
 _lingxing_mcp_metadata_lock = asyncio.Lock()
 _lingxing_mcp_shop_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
@@ -4205,7 +4205,8 @@ async def lingxing_mcp_raw(
         "method": "tools/call",
         "params": {"name": operation, "arguments": arguments},
     }
-    async with _lingxing_mcp_request_lock:
+    background = _amazon_background_fetch.get()
+    async with _lingxing_mcp_request_lock.scoped(priority=1 if background else 0):
         attempt = 0
         exhausted_keys: set[str] = set()
         while True:
