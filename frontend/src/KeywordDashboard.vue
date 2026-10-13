@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessageBox } from "element-plus"
 import { apiWithDashboardAuth, chooseEditConflictAction, formatDashboardEditMetadata } from "./dashboardAuth"
 import DashboardState from "./DashboardState.vue"
@@ -42,6 +42,9 @@ const rowGap = ref(10)
 const columnWidths = ref({})
 const contextMenu = ref({ visible: false, sourceIndex: -1, x: 0, y: 0 })
 const trendTooltip = ref(null)
+const tableWrap = ref(null)
+const tableElement = ref(null)
+const headerShift = ref(0)
 const rowGapStorageKey = "ideadock.keyword-dashboard.row-gap.v1"
 const columnWidthStorageKey = "ideadock.keyword-dashboard.column-widths.v1"
 const columnWidthDefaults = {
@@ -62,6 +65,7 @@ let resizeCleanup = null
 let dashboardRequestSeq = 0
 let termsRequestSeq = 0
 let loadAllRequestSeq = 0
+let headerSyncFrame = 0
 
 function parseDate(value) {
   const parsed = new Date(`${value}T00:00:00`)
@@ -174,6 +178,33 @@ function weekColumnWidth(week, field) {
   const fallback = columnWidthDefaults.weeklyMetric
   if (!Number.isFinite(value)) return fallback
   return Math.round(Math.max(columnWidthBounds.weeklyMetric[0], Math.min(columnWidthBounds.weeklyMetric[1], value)))
+}
+
+function syncStickyHeader() {
+  const wrap = tableWrap.value
+  const table = tableElement.value
+  if (!wrap || !table) {
+    headerShift.value = 0
+    return
+  }
+  const wrapRect = wrap.getBoundingClientRect()
+  const firstHeader = table.querySelector("thead tr:first-child th")
+  const secondHeader = table.querySelector("thead tr:nth-child(2) th")
+  const firstHeight = firstHeader?.offsetHeight || 64
+  const secondHeight = secondHeader?.offsetHeight || 40
+  const headerHeight = firstHeight + secondHeight
+  const viewportTop = window.matchMedia("(max-width:760px)").matches ? 64 : 68
+  const requiredShift = viewportTop - wrapRect.top
+  const maximumShift = Math.max(0, table.offsetHeight - headerHeight)
+  headerShift.value = Math.round(Math.max(0, Math.min(requiredShift, maximumShift)))
+}
+
+function scheduleStickyHeaderSync() {
+  if (headerSyncFrame) return
+  headerSyncFrame = window.requestAnimationFrame(() => {
+    headerSyncFrame = 0
+    syncStickyHeader()
+  })
 }
 
 function saveColumnWidths() {
@@ -582,6 +613,8 @@ onMounted(() => {
   document.addEventListener("click", closeContextMenu)
   document.addEventListener("scroll", closeContextMenu, true)
   document.addEventListener("scroll", hideTrendTooltip, true)
+  document.addEventListener("scroll", scheduleStickyHeaderSync, { passive: true, capture: true })
+  window.addEventListener("resize", scheduleStickyHeaderSync)
   loadAll()
 })
 watch(rowGap, (value) => {
@@ -589,10 +622,17 @@ watch(rowGap, (value) => {
 })
 onBeforeUnmount(() => {
   resizeCleanup?.()
+  if (headerSyncFrame) window.cancelAnimationFrame(headerSyncFrame)
   document.removeEventListener("click", closeContextMenu)
   document.removeEventListener("scroll", closeContextMenu, true)
   document.removeEventListener("scroll", hideTrendTooltip, true)
+  document.removeEventListener("scroll", scheduleStickyHeaderSync, { capture: true })
+  window.removeEventListener("resize", scheduleStickyHeaderSync)
 })
+watch(() => [tableRows.value, displayWeeks.value, rowGap.value, tableMinWidth.value], async () => {
+  await nextTick()
+  scheduleStickyHeaderSync()
+}, { deep: false })
 </script>
 
 <template>
@@ -675,8 +715,17 @@ onBeforeUnmount(() => {
           <button class="column-width-control" type="button" @click="resetColumnWidths">恢复默认列宽</button>
         </div>
       </header>
-      <div class="keyword-table-wrap">
-        <table :style="{ width: `${tableMinWidth}px`, minWidth: `${tableMinWidth}px`, '--keyword-row-gap': `${rowGap}px`, '--keyword-category-width': `${columnWidth('category')}px` }">
+      <div ref="tableWrap" class="keyword-table-wrap">
+        <table
+          ref="tableElement"
+          :style="{
+            width: `${tableMinWidth}px`,
+            minWidth: `${tableMinWidth}px`,
+            '--keyword-row-gap': `${rowGap}px`,
+            '--keyword-category-width': `${columnWidth('category')}px`,
+            '--keyword-header-shift': `${headerShift}px`,
+          }"
+        >
           <colgroup>
             <col :style="{ width: `${columnWidth('category')}px` }">
             <col :style="{ width: `${columnWidth('keyword')}px` }">
@@ -741,7 +790,7 @@ onBeforeUnmount(() => {
             </tr>
             <tr>
               <template v-for="week in displayWeeks" :key="`${week.start}-metrics`">
-                <th v-if="showRank" class="metric-head rank">
+                <th v-if="showRank" class="metric-head rank group-start">
                   <span>周搜索排名</span>
                   <i
                     class="column-resize-handle"
@@ -751,7 +800,7 @@ onBeforeUnmount(() => {
                     @pointerdown="startColumnResize($event, weeklyColumnKey(week, 'rank'), () => weekColumnWidth(week, 'rank'))"
                   ></i>
                 </th>
-                <th v-if="showVolume" class="metric-head volume">
+                <th v-if="showVolume" :class="['metric-head', 'volume', { 'group-start': !showRank }]">
                   <span>周搜索量</span>
                   <i
                     class="column-resize-handle"
@@ -819,13 +868,13 @@ onBeforeUnmount(() => {
               <template v-for="week in displayWeeks" :key="week.start">
                 <td
                   v-if="showRank"
-                  :class="['metric', metricClass(row, weekIndex(week.start), 'search_rank')]"
+                  :class="['metric', 'group-start', metricClass(row, weekIndex(week.start), 'search_rank')]"
                 >
                   {{ formatNumber(row.weekly[weekIndex(week.start)]?.search_rank) }}
                 </td>
                 <td
                   v-if="showVolume"
-                  :class="['metric', metricClass(row, weekIndex(week.start), 'search_volume')]"
+                  :class="['metric', metricClass(row, weekIndex(week.start), 'search_volume'), { 'group-start': !showRank }]"
                 >
                   {{ formatNumber(row.weekly[weekIndex(week.start)]?.search_volume) }}
                 </td>
@@ -877,7 +926,7 @@ onBeforeUnmount(() => {
 .keyword-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:18px;padding:14px;border:1px solid #e2ebf6;border-radius:14px;background:#f8fbff}.keyword-filters label,.column-width-control{display:grid;gap:6px;min-width:0}.keyword-filters span{color:#5f7188;font-size:12px;font-weight:750}.keyword-filters select{width:100%;height:42px;padding:0 10px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit}.row-gap-control{align-content:center}.row-gap-control input{width:100%;height:24px;margin:5px 0;accent-color:#1e57c8}.row-gap-control small{color:#526b88;font-size:12px;font-weight:750;text-align:right}.column-width-control{align-content:end}.column-width-control button{height:42px;padding:0 12px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font:inherit;font-size:13px;font-weight:750;cursor:pointer}.column-width-control button:hover{background:#f2f8ff}
 .keyword-message{margin-top:16px;padding:12px 14px;border-radius:10px;font-size:13px}.keyword-message.error{background:#fff2f4;color:#ad2745}.keyword-message.success{background:#edfaf3;color:#17724c}.keyword-message.muted{background:#f7fafd;color:#6d7f95}
 .keyword-filters :deep(.el-select){width:100%}.keyword-filters :deep(.el-select__wrapper){min-height:42px;border-radius:9px;background:#fff;box-shadow:0 0 0 1px #d5e2f1 inset}.keyword-filters :deep(.el-select__wrapper:hover){box-shadow:0 0 0 1px #adc8e8 inset}
-.keyword-table-panel{position:relative;z-index:1;width:max-content;min-width:100%;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow:visible;border-radius:0 0 16px 16px}table{border-collapse:separate;border-spacing:0;table-layout:fixed}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle;overflow:hidden}thead tr:nth-child(1) th{position:sticky;top:var(--keyword-first-header-top,68px);z-index:4;height:64px;background:#f4f8fd;color:#455f7c;font-size:12px}thead tr:nth-child(2) th{position:sticky;top:var(--keyword-second-header-top,132px);z-index:4;height:40px;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750}thead th>span{display:inline-block;max-width:calc(100% - 12px);vertical-align:middle}.keyword input,.category-select,tbody th[scope="row"] input{width:100%;height:34px;padding:0 9px;text-align:center;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus,tbody th[scope="row"] input:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.category,.keyword,.category-cell{text-align:center}.week-group{text-align:center}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{text-align:center;padding-right:10px}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2;vector-effect:non-scaling-stroke}.trend circle{cursor:pointer;fill:#fff;stroke:#2f80ed;stroke-width:1;vector-effect:non-scaling-stroke}.trend circle.extreme{fill:#d93025;stroke:#d93025}.volume-trend path{stroke:#12a05f}.volume-trend circle{stroke:#12a05f}.no-trend{color:#93a2b4;font-size:12px}.column-resize-handle{position:absolute;top:0;right:0;bottom:0;z-index:6;width:9px;cursor:col-resize;touch-action:none;border-right:1px solid transparent}.column-resize-handle:hover,.column-resize-handle:active{border-right-color:#1e57c8;background:linear-gradient(90deg,transparent 3px,rgba(30,87,200,.08) 3px,rgba(30,87,200,.08) 6px,transparent 6px)}tbody th,tbody td{padding-top:var(--keyword-row-gap,10px);padding-bottom:var(--keyword-row-gap,10px)}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:center;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
+.keyword-table-panel{position:relative;z-index:1;width:100%;min-width:0;margin-top:16px;border:1px solid #e2ebf6;border-radius:16px;background:#fff;box-shadow:0 12px 28px rgba(28,63,111,.07)}.keyword-table-wrap{overflow-x:auto;overflow-y:hidden;border-radius:0 0 16px 16px}table{border-collapse:separate;border-spacing:0;table-layout:fixed}th,td{padding:10px;border-bottom:1px solid #e9f0f8;text-align:left;vertical-align:middle;overflow:hidden}thead tr:nth-child(1) th{position:sticky;top:0;z-index:5;height:64px;background:#f4f8fd;color:#455f7c;font-size:12px;transform:translateY(var(--keyword-header-shift,0px))}thead tr:nth-child(2) th{position:sticky;top:0;z-index:5;height:40px;background:#eaf1f9;color:#526b88;font-size:11px;font-weight:750;transform:translateY(var(--keyword-header-shift,0px))}thead th>span{display:inline-block;max-width:calc(100% - 12px);vertical-align:middle}.keyword input,.category-select,tbody th[scope="row"] input{width:100%;height:34px;padding:0 9px;text-align:center;border:1px solid #d5e2f1;border-radius:8px;background:#fff;color:#26466d;font:inherit;font-size:13px}.keyword input:focus,.category-select:focus,tbody th[scope="row"] input:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.category,.keyword,.category-cell{text-align:center}.week-group{text-align:center}.week-group small{display:block;margin-top:2px;color:#7f90a5;font-weight:500}.metric-head{text-align:center;padding-right:10px}.metric-head.rank{background:#eef4fb}.metric-head.volume{background:#f6f9fd}.trend svg{display:block;width:100%;height:36px}.trend path{fill:none;stroke:#2f80ed;stroke-width:2;vector-effect:non-scaling-stroke}.trend circle{cursor:pointer;fill:#fff;stroke:#2f80ed;stroke-width:1;vector-effect:non-scaling-stroke}.trend circle.extreme{fill:#d93025;stroke:#d93025}.volume-trend path{stroke:#12a05f}.volume-trend circle{stroke:#12a05f}.no-trend{color:#93a2b4;font-size:12px}.column-resize-handle{position:absolute;top:0;right:0;bottom:0;z-index:6;width:9px;cursor:col-resize;touch-action:none;border-right:1px solid transparent}.column-resize-handle:hover,.column-resize-handle:active{border-right-color:#1e57c8;background:linear-gradient(90deg,transparent 3px,rgba(30,87,200,.08) 3px,rgba(30,87,200,.08) 6px,transparent 6px)}tbody th,tbody td{padding-top:var(--keyword-row-gap,10px);padding-bottom:var(--keyword-row-gap,10px)}tbody td{color:#26466d;font-size:13px}tbody td.metric{text-align:center;font-variant-numeric:tabular-nums}tbody td.metric.up{color:#c62838;font-weight:800}tbody td.metric.down{color:#16845b;font-weight:800}tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
 .table-footer{position:sticky;left:0;display:flex;align-items:center;gap:10px;width:max-content;max-width:calc(100vw - 48px);padding:12px 14px;background:#fff}.add-row-control{display:flex;align-items:center;gap:8px}.add-row-control input{width:76px;height:34px;padding:0 9px;border:1px solid #d5e2f1;border-radius:9px;background:#fff;color:#26466d;font:inherit;font-size:13px}.add-row-control input:focus{border-color:#6ea8dd;outline:2px solid rgba(46,120,193,.14)}.add-row{width:34px;height:34px;border:1px dashed #9dbbe0;border-radius:50%;background:#f7fbff;color:#2567b7;font-size:20px;line-height:1;cursor:pointer}.add-row:hover{border-style:solid;background:#edf5ff}.table-footer span{color:#71819a;font-size:12px}
 .keyword-context-menu{position:fixed;z-index:3000;min-width:96px;padding:6px;border:1px solid #d8e3ef;border-radius:9px;background:#fff;box-shadow:0 14px 30px rgba(25,58,102,.18)}.keyword-context-menu button{width:100%;height:30px;border:0;border-radius:6px;background:transparent;color:#26466d;font:inherit;font-size:13px;cursor:pointer}.keyword-context-menu button:hover{background:#f2f7ff;color:#b32638}
 .trend-tooltip{position:fixed;z-index:4000;max-width:184px;padding:7px 9px;border:1px solid #d8e3ef;border-radius:8px;background:#fff;color:#26466d;font-size:12px;font-weight:700;line-height:1.35;box-shadow:0 12px 26px rgba(25,58,102,.18);pointer-events:none;white-space:nowrap}
@@ -901,19 +950,18 @@ onBeforeUnmount(() => {
 .column-width-control{height:34px;display:inline-flex;align-items:center;padding:0 11px;border:1px solid #bfd7f1;border-radius:9px;background:#fff;color:#24589d;font-size:12px;cursor:pointer;white-space:nowrap}
 .column-width-control:hover{background:#f2f8ff}
 .keyword-table-wrap{max-height:none;min-height:0}
-thead th.category{position:sticky;left:var(--dashboard-sidebar-sticky-width,232px);z-index:8;box-shadow:1px 0 0 #dce7f3}
-thead th.keyword{position:sticky;left:calc(var(--dashboard-sidebar-sticky-width,232px) + var(--keyword-category-width,150px));z-index:8;box-shadow:1px 0 0 #dce7f3}
-tbody td.category-cell{position:sticky;left:var(--dashboard-sidebar-sticky-width,232px);z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
-tbody th[scope=row]{position:sticky;left:calc(var(--dashboard-sidebar-sticky-width,232px) + var(--keyword-category-width,150px));z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
+thead th.category{position:sticky;left:0;z-index:8;box-shadow:1px 0 0 #dce7f3}
+thead th.keyword{position:sticky;left:var(--keyword-category-width,150px);z-index:8;box-shadow:1px 0 0 #dce7f3}
+tbody td.category-cell{position:sticky;left:0;z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
+tbody th[scope=row]{position:sticky;left:var(--keyword-category-width,150px);z-index:3;background:#fff;box-shadow:1px 0 0 #e3ebf5}
 tbody tr:hover td.category-cell,tbody tr:hover th[scope=row]{background:#f8fbff}
 thead th.trend,td.trend{border-left:1px solid #d7e4f2}
 thead th.trend{background:#eaf3ff}
 td.trend{background:#fbfdff}
 thead th.week-group{border-left:1px solid #d7e4f2;background:#e7f0fb}
 thead th.week-group.alt{background:#edf5fd}
-thead th.metric-head{border-left:1px solid #d7e4f2}
-td.metric{border-left:1px solid #e6eef8}
-.table-footer{position:sticky;left:var(--dashboard-sidebar-sticky-width,232px);z-index:5;max-width:calc(100vw - var(--dashboard-sidebar-sticky-width,232px) - 48px);border-top:1px solid #e5edf7;background:#fbfdff}
+thead th.metric-head.group-start,td.metric.group-start{border-left:1px solid #d7e4f2}
+.table-footer{position:sticky;left:0;z-index:5;width:max-content;max-width:100%;border-top:1px solid #e5edf7;background:#fbfdff}
 @media(max-width:900px){.keyword-table-toolbar{align-items:start;flex-direction:column}.keyword-table-toolbar-actions{justify-content:flex-start;flex-wrap:wrap}.row-gap-control.compact{width:100%}}
 @media(max-width:760px){.keyword-dashboard{--keyword-first-header-top:64px;--keyword-second-header-top:128px}}
 </style>
