@@ -108,6 +108,7 @@
 
 .amazon-table tr.period-total td{background:#e3edfb!important;color:#123f7a;font-weight:800;border-top:1px solid #c3d6ee}.amazon-table tr.period-total td.period-cell,.amazon-table tr.period-total td.series-cell{background:#e3edfb!important}
 .amazon-table tr.site-total td{background:#e8f2ff!important;color:#123f7a;font-weight:800;border-top:1px solid #c6d9f0}.amazon-table tr.site-total td.period-cell,.amazon-table tr.site-total td.series-cell{background:#e8f2ff!important}
+.amazon-table tr.range-total td{background:#d9e9fc!important;color:#0f3f78;border-top:2px solid #a7c8ee}.amazon-table tr.range-total td.period-cell,.amazon-table tr.range-total td.site-cell,.amazon-table tr.range-total td.series-cell{background:#d9e9fc!important}
 
 /* Final width overrides (must remain after the base table rules). */
 .amazon-table th:nth-child(2),.amazon-table td:nth-child(2),.amazon-table td.series-cell{width:165px!important;min-width:165px!important;max-width:165px!important}

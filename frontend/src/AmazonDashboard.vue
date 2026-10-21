@@ -482,6 +482,7 @@ const displayRows = computed(() => {
     }
   }
   const grouped = new Map()
+  const rangeDetails = []
   for (const row of rows.value) {
     // Older deployed backends do not return the new site field.  Preserve a
     // useful single-site local preview until that backend is redeployed.
@@ -508,6 +509,7 @@ const displayRows = computed(() => {
       if (showSiteSummary.value) {
         const siteDetails = [...seriesMap.values()].flat()
         if (!siteDetails.length) continue
+        rangeDetails.push(...siteDetails)
         const periodIndex = periodIndexByLabel.get(period)
         const previousSiteRows = previousSiteByKey.get(`${periodIndex}|${siteName}`) || []
         siteSummaryRows.push({
@@ -546,6 +548,7 @@ const displayRows = computed(() => {
             detail.indexOf(right),
           ))
         periodDetails.push(...orderedDetails)
+        rangeDetails.push(...orderedDetails)
         const key = `${period}|${siteName}|${series}`
         const periodIndex = periodIndexByLabel.get(period)
         const previousSeriesRows = previousSeriesByKey.get(`${periodIndex}|${siteName}|${series}`) || []
@@ -573,10 +576,25 @@ const displayRows = computed(() => {
     }
     result.push(...periodRows.filter((row) => rowHasMetricData(row.metrics)))
   }
+  if (comparison.value === "日") {
+    const previousRangeDetails = [...previousDetailsByIndex.values()].flat()
+    const rangeMetrics = aggregate(rangeDetails)
+    if (rowHasMetricData(rangeMetrics)) {
+      result.push({
+        type: "range-total",
+        key: "selected-days|total",
+        period: "",
+        site: "",
+        series: "上述日期汇总",
+        metrics: rangeMetrics,
+        previousMetrics: showComparison.value ? aggregate(previousRangeDetails) : null,
+      })
+    }
+  }
   const summaryRows = summaryOnly.value
-    ? result.filter((row) => row.type === "period-total")
+    ? result.filter((row) => row.type === "period-total" || row.type === "range-total")
     : siteSummaryOnly.value
-      ? result.filter((row) => row.type === "site-total")
+      ? result.filter((row) => row.type === "site-total" || row.type === "range-total")
       : result
   const displayedPeriods = new Set()
   for (const row of summaryRows) {
@@ -1014,7 +1032,7 @@ onBeforeUnmount(() => {
       </div>
       <DashboardState v-if="error" state="error" title="系列与产品汇总加载失败" :message="error" />
         <DashboardState v-else-if="loading" state="loading" title="正在从领星同步数据" message="正在读取产品表现、广告指标和环比数据，请稍候。" />
-        <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-name-button', { copied: copiedProductKey === row.key }]" @mouseenter="showProductTooltip(row, $event)" @mouseleave="hideProductTooltip" @focus="showProductTooltip(row, $event)" @blur="hideProductTooltip" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><div class="metric-cell-stack"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template><span v-if="showComparison" :class="['period-comparison-delta', periodComparison(row, column)?.status]">{{ periodComparison(row, column)?.text }}</span></div></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
+        <div v-else class="amazon-table-wrap" :style="tableHeight ? { height: `${tableHeight}px`, maxHeight: `${tableHeight}px` } : undefined"><table class="amazon-table" :class="{ 'comparison-enabled': showComparison }" :style="tableStyle"><thead><tr><th v-for="column in fixedColumns" :key="column.key" :class="`${column.key}-header`" :style="columnStyle(column)"><span>{{ column.label }}</span><i class="column-resize-handle" role="separator" aria-orientation="vertical" title="拖动调整列宽" @pointerdown="startResize($event, column)"></i></th><th v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)" @dragover.prevent @drop="dropColumn($event, column)"><span draggable="true" :class="{ 'column-dragging': draggedColumnKey === column.key }" @dragstart="startColumnDrag($event, column)" @dragend="endColumnDrag">{{ column.label }}</span><button type="button" class="column-sort-button" :class="{ 'is-desc': sortState.key === column.key && sortState.direction === 'desc', 'is-asc': sortState.key === column.key && sortState.direction === 'asc' }" :aria-label="`${column.label}排序：${sortState.key === column.key ? (sortState.direction === 'desc' ? '降序' : '升序') : '初始状态'}`" @click.stop="cycleSort(column)"><i aria-hidden="true"></i></button><i class="column-resize-handle" role="separator" aria-orientation="vertical" :title="`拖动调整${column.label}列宽`" @pointerdown="startResize($event, column)"></i></th></tr></thead><tbody><tr v-for="row in displayRows" :key="row.key" :class="row.type"><td class="period-cell" :class="{ 'period-blank': !row.periodFirst }" :style="columnStyle(fixedColumns[0])" :title="row.periodFirst ? row.period : ''">{{ row.periodFirst ? row.period : '' }}</td><td class="site-cell" :style="columnStyle(fixedColumns[1])">{{ row.type === 'period-total' || row.type === 'range-total' ? '' : (row.site || (site.length === 1 ? site[0] : '—')) }}</td><td class="series-cell" :style="columnStyle(fixedColumns[2])"><span class="series-content"><button v-if="row.type === 'group'" class="amazon-toggle" @click="toggle(row)" :aria-label="`${row.expanded ? '收起' : '展开'}${displaySeries(row.series)}`">{{ row.expanded ? '−' : '+' }}</button><span v-else-if="row.type === 'detail'" class="tree-branch">└</span><button v-if="row.type === 'detail'" type="button" :class="['product-name-button', { copied: copiedProductKey === row.key }]" @mouseenter="showProductTooltip(row, $event)" @mouseleave="hideProductTooltip" @focus="showProductTooltip(row, $event)" @blur="hideProductTooltip" @click.stop="copyProductLink(row)">{{ displayProduct(row.product) }}</button><span v-else>{{ displaySeries(row.series) }}</span></span></td><td v-for="column in visibleDataColumns" :key="column.key" :style="columnStyle(column)"><div class="metric-cell-stack"><span v-if="adBreakdownMetricKeys.has(column.key)" class="metric-with-breakdown"><span>{{ cellValue(row.metrics, column) }}</span><span class="ad-breakdown-control" :class="{ open: breakdownOpenKey === breakdownKey(row, column) }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><button type="button" class="ad-breakdown-button" :aria-label="`${column.label}的SP、SB、SBV、SD明细`" @click.stop="toggleBreakdown(row, column, $event)"><i aria-hidden="true"></i></button></span></span><template v-else>{{ cellValue(row.metrics, column) }}</template><span v-if="showComparison" :class="['period-comparison-delta', periodComparison(row, column)?.status]">{{ periodComparison(row, column)?.text }}</span></div></td></tr><tr v-if="!displayRows.length"><td :colspan="fixedColumns.length + visibleDataColumns.length" class="amazon-empty">当前筛选范围暂无匹配数据</td></tr></tbody></table></div><i class="table-height-resize-handle" role="separator" aria-orientation="horizontal" title="拖动调整表格高度" @pointerdown="startTableResize"></i>
       <Teleport to="body"><div v-if="productTooltip" class="product-asin-tooltip-floating" role="tooltip" :style="{ top: `${productTooltip.top}px`, left: `${productTooltip.left}px` }">ASIN：{{ productTooltip.asin || "暂无" }}</div></Teleport>
       <Teleport to="body"><div v-if="breakdownOpenKey && breakdownRow && breakdownColumn" class="ad-breakdown-popover ad-breakdown-popover-floating" role="tooltip" :style="{ top: `${breakdownPosition.top}px`, left: `${breakdownPosition.left}px` }" @mouseenter="keepBreakdownOpen" @mouseleave="scheduleCloseBreakdown"><strong>{{ breakdownColumn.label }}明细</strong><span v-for="adType in adBreakdownTypes" :key="adType.key"><b>{{ adType.label }}</b><em>{{ breakdownValue(breakdownRow.metrics, breakdownColumn.key, adType.key) }}</em></span><small v-if="!breakdownHasData(breakdownRow.metrics)">暂无四类广告明细</small></div></Teleport>
     </section>
