@@ -432,6 +432,25 @@ async def scope_dashboard_request(request: Request, call_next):
         if editor_token is not None:
             _dashboard_request_editor.reset(editor_token)
         _amazon_cache_scope.reset(cache_token)
+
+
+@app.exception_handler(RuntimeError)
+async def lingxing_or_runtime_failure_handler(_request: Request, exc: RuntimeError) -> JSONResponse:
+    """Keep API failures machine-readable for the dashboard front end."""
+
+    print(f"unhandled runtime error: {type(exc).__name__}: {exc}", flush=True)
+    return JSONResponse(status_code=502, content={"detail": f"看板服务执行失败：{type(exc).__name__}"})
+
+
+@app.exception_handler(Exception)
+async def unhandled_dashboard_failure_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """Return JSON even when an endpoint has an unforeseen server error."""
+
+    print(f"unhandled server error: {type(exc).__name__}: {exc}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "看板服务内部错误，请稍后重试；当前内容已保留。"},
+    )
 KEYWORD_CATEGORIES = (
     "comu品牌词",
     "AI核心词",
@@ -1104,15 +1123,49 @@ def decimal_value(value: Any) -> Decimal:
         return Decimal("0")
 
 
-async def lingxing_access_token() -> str:
+def _lingxing_credentials_fingerprint() -> str:
+    """Fingerprint the OpenAPI credentials so a rotated app cannot reuse a token."""
+
+    app_id = os.environ.get("LINGXING_APP_ID", "").strip()
+    app_secret = os.environ.get("LINGXING_APP_SECRET", "").strip()
+    return hashlib.sha256(f"{app_id}\0{app_secret}".encode("utf-8")).hexdigest()
+
+
+def _lingxing_token_rejected(body: dict[str, Any]) -> bool:
+    """Detect token/app binding failures reported by LingXing OpenAPI."""
+
+    message = str(body.get("message") or body.get("msg") or "").lower()
+    return (
+        "access token not match" in message
+        or "access token is invalid" in message
+        or "access token expired" in message
+        or "access_token not match" in message
+        or "token不匹配" in message
+        or "token已失效" in message
+        or "token无效" in message
+    )
+
+
+async def lingxing_access_token(invalid_token: str | None = None) -> str:
     """Obtain and cache a LingXing token without exposing credentials."""
     global _lingxing_token
     now = datetime.now(timezone.utc).timestamp()
-    if _lingxing_token.get("value") and now < float(_lingxing_token.get("expires_at", 0)) - 60:
+    credentials = _lingxing_credentials_fingerprint()
+    cached_is_valid = (
+        _lingxing_token.get("value")
+        and _lingxing_token.get("credentials") == credentials
+        and now < float(_lingxing_token.get("expires_at", 0)) - 60
+    )
+    if cached_is_valid and (invalid_token is None or invalid_token != _lingxing_token["value"]):
         return str(_lingxing_token["value"])
     async with _lingxing_token_lock:
         now = datetime.now(timezone.utc).timestamp()
-        if _lingxing_token.get("value") and now < float(_lingxing_token.get("expires_at", 0)) - 60:
+        cached_is_valid = (
+            _lingxing_token.get("value")
+            and _lingxing_token.get("credentials") == credentials
+            and now < float(_lingxing_token.get("expires_at", 0)) - 60
+        )
+        if cached_is_valid and (invalid_token is None or invalid_token != _lingxing_token["value"]):
             return str(_lingxing_token["value"])
         app_id = os.environ.get("LINGXING_APP_ID", "").strip()
         app_secret = os.environ.get("LINGXING_APP_SECRET", "").strip()
@@ -1129,7 +1182,11 @@ async def lingxing_access_token() -> str:
         token = data.get("access_token")
         if not token:
             raise RuntimeError(f"LingXing token request failed: {payload.get('msg', 'unknown error')}")
-        _lingxing_token = {"value": token, "expires_at": now + int(data.get("expires_in", 7199))}
+        _lingxing_token = {
+            "value": token,
+            "expires_at": now + int(data.get("expires_in", 7199)),
+            "credentials": credentials,
+        }
         return token
 
 
@@ -2533,43 +2590,56 @@ def finalize_strategy_metrics(total: dict[str, float]) -> dict[str, float | None
 
 
 async def lingxing_post(path: str, payload: dict[str, Any], client: httpx.AsyncClient | None = None) -> dict[str, Any]:
-    token = await lingxing_access_token()
-    params = lingxing_auth_params(token, payload)
-    request_params = {key: params[key] for key in ("access_token", "app_key", "timestamp", "sign")}
     owns_client = client is None
     request_client = client or httpx.AsyncClient(timeout=45)
     body: dict[str, Any] = {}
     try:
-        response = await request_client.post(
-            f"{LINGXING_API_BASE}{path}",
-            params=request_params,
-            headers={"X-API-VERSION": "2"},
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
+        token: str | None = None
+        for attempt in range(2):
+            token = await lingxing_access_token(invalid_token=token if attempt else None)
+            params = lingxing_auth_params(token, payload)
+            request_params = {
+                key: params[key] for key in ("access_token", "app_key", "timestamp", "sign")
+            }
+            response = await request_client.post(
+                f"{LINGXING_API_BASE}{path}",
+                params=request_params,
+                headers={"X-API-VERSION": "2"},
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if str(body.get("code", "200")) in {"200", "0"}:
+                return body
+            if attempt == 0 and _lingxing_token_rejected(body):
+                continue
+            break
     finally:
         if owns_client:
             await request_client.aclose()
-    if str(body.get("code", "200")) not in {"200", "0"}:
-        raise RuntimeError(f"LingXing API failed: {body.get('msg', 'unknown error')}")
-    return body
+    raise RuntimeError(f"LingXing API failed: {body.get('msg', 'unknown error')}")
 
 
 async def lingxing_get(path: str) -> dict[str, Any]:
-    token = await lingxing_access_token()
-    params = lingxing_auth_params(token, {})
+    body: dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.get(
-            f"{LINGXING_API_BASE}{path}",
-            params=params,
-            headers={"X-API-VERSION": "2"},
-        )
-        response.raise_for_status()
-        body = response.json()
-    if str(body.get("code", "200")) not in {"200", "0"}:
-        raise RuntimeError(f"LingXing API failed: {body.get('message') or body.get('msg', 'unknown error')}")
-    return body
+        token: str | None = None
+        for attempt in range(2):
+            token = await lingxing_access_token(invalid_token=token if attempt else None)
+            params = lingxing_auth_params(token, {})
+            response = await client.get(
+                f"{LINGXING_API_BASE}{path}",
+                params=params,
+                headers={"X-API-VERSION": "2"},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if str(body.get("code", "200")) in {"200", "0"}:
+                return body
+            if attempt == 0 and _lingxing_token_rejected(body):
+                continue
+            break
+    raise RuntimeError(f"LingXing API failed: {body.get('message') or body.get('msg', 'unknown error')}")
 
 
 def lingxing_auth_params(token: str, business: dict[str, Any]) -> dict[str, Any]:
@@ -5208,11 +5278,10 @@ async def amazon_strategy_board(
         raise HTTPException(status_code=503, detail="领星 API 尚未配置")
     try:
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+        store_rows = await lingxing_store_rows()
+        return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, set(store_sid), set(series) if series else None, refresh)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-    store_rows = await lingxing_store_rows()
-    try:
-        return await amazon_strategy_board_payload(start_date, end_date, selected_sites, sid_map, store_rows, set(store_sid), set(series) if series else None, refresh)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"广告报表请求失败：HTTP {exc.response.status_code}") from exc
     except RuntimeError as exc:
@@ -6640,17 +6709,29 @@ async def amazon_ads_charts(
     asin_mapping = amazon_data_source_mapping_snapshot()
     try:
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+        if not sid_map:
+            for store_item in await lingxing_store_rows():
+                country = str(store_item.get("country") or "")
+                sid = store_item.get("sid")
+                if country and sid and int(store_item.get("status") or 0) == 1:
+                    sid_map.setdefault(country, {"sid": sid})
+        store_rows = []
+        if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
+            store_rows = await lingxing_store_rows()
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-    if not sid_map:
-        for store_item in await lingxing_store_rows():
-            country = str(store_item.get("country") or "")
-            sid = store_item.get("sid")
-            if country and sid and int(store_item.get("status") or 0) == 1:
-                sid_map.setdefault(country, {"sid": sid})
-    store_rows = []
-    if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
-        store_rows = await lingxing_store_rows()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}",
+        ) from exc
+    except RuntimeError as exc:
+        if _is_lingxing_mcp_rate_limit_error(exc):
+            raise HTTPException(status_code=429, detail="领星店铺列表接口限流，请稍后重试") from exc
+        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{exc}") from exc
+    except Exception as exc:
+        print(f"ads-charts store-list error: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{type(exc).__name__}") from exc
     site_today = min(
         datetime.now(ZoneInfo(AMAZON_SITE_TIMEZONES.get(site_name, DEFAULT_TIMEZONE))).date()
         for site_name in selected_sites
@@ -6967,17 +7048,29 @@ async def amazon_dashboard(
         raise HTTPException(status_code=422, detail="产品表现看板产品参数无效")
     try:
         sid_map = json.loads(os.environ.get("LINGXING_SIDS_JSON", "{}"))
+        if not sid_map:
+            for store_item in await lingxing_store_rows():
+                country = str(store_item.get("country") or "")
+                sid = store_item.get("sid")
+                if country and sid and int(store_item.get("status") or 0) == 1:
+                    sid_map.setdefault(country, {"sid": sid})
+        store_rows = []
+        if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
+            store_rows = await lingxing_store_rows()
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=503, detail="LINGXING_SIDS_JSON 配置格式错误") from exc
-    if not sid_map:
-        for store_item in await lingxing_store_rows():
-            country = str(store_item.get("country") or "")
-            sid = store_item.get("sid")
-            if country and sid and int(store_item.get("status") or 0) == 1:
-                sid_map.setdefault(country, {"sid": sid})
-    store_rows = []
-    if any(site_name == "日本" for site_name in selected_sites) or not sid_map:
-        store_rows = await lingxing_store_rows()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"领星店铺列表请求失败：HTTP {exc.response.status_code}",
+        ) from exc
+    except RuntimeError as exc:
+        if _is_lingxing_mcp_rate_limit_error(exc):
+            raise HTTPException(status_code=429, detail="领星店铺列表接口限流，请稍后重试") from exc
+        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{exc}") from exc
+    except Exception as exc:
+        print(f"amazon-dashboard store-list error: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"领星店铺列表获取失败：{type(exc).__name__}") from exc
     if refresh:
         _amazon_cache.clear_current_namespace()
     asin_mapping = amazon_data_source_mapping_snapshot()

@@ -394,6 +394,99 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         }
         self.assertEqual(_lingxing_mcp_result(payload), [{"clicks": 3239}])
 
+    def test_lingxing_rejected_access_token_is_replaced_and_retried(self):
+        original_token = dict(app_module._lingxing_token)
+        app_module._lingxing_token.clear()
+        token_requests = 0
+
+        class TokenClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def post(self, _url, **_kwargs):
+                nonlocal token_requests
+                token_requests += 1
+                token = "rejected-token" if token_requests == 1 else "replacement-token"
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", "https://example.test/token"),
+                    json={"data": {"access_token": token, "expires_in": 3600}},
+                )
+
+        try:
+            with patch.dict(os.environ, {
+                "LINGXING_APP_ID": "test-app-id",
+                "LINGXING_APP_SECRET": "test-app-secret",
+            }), patch.object(app_module.httpx, "AsyncClient", return_value=TokenClient()):
+                first = asyncio.run(app_module.lingxing_access_token())
+                second = asyncio.run(app_module.lingxing_access_token(invalid_token=first))
+
+            self.assertEqual(first, "rejected-token")
+            self.assertEqual(second, "replacement-token")
+        finally:
+            app_module._lingxing_token.clear()
+            app_module._lingxing_token.update(original_token)
+
+        api_responses = [
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://example.test/stores"),
+                json={"code": 400, "msg": "access token not match"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://example.test/stores"),
+                json={"code": 200, "data": [{"sid": 101}]},
+            ),
+        ]
+        used_tokens = []
+
+        class ApiClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, _url, **kwargs):
+                used_tokens.append(kwargs["params"]["access_token"])
+                return api_responses.pop(0)
+
+        token_mock = AsyncMock(side_effect=["rejected-token", "replacement-token"])
+        with patch.object(app_module, "lingxing_access_token", new=token_mock), \
+             patch.object(app_module.httpx, "AsyncClient", return_value=ApiClient()):
+            body = asyncio.run(app_module.lingxing_get("/stores"))
+
+        self.assertEqual(body, {"code": 200, "data": [{"sid": 101}]})
+        self.assertEqual(used_tokens, ["rejected-token", "replacement-token"])
+        self.assertEqual(token_mock.await_count, 2)
+
+    def test_amazon_read_endpoints_return_json_when_store_list_fails(self):
+        failing_stores = AsyncMock(side_effect=RuntimeError("LingXing API failed: access token not match"))
+        environment = {
+            "LINGXING_APP_ID": "test-app-id",
+            "LINGXING_APP_SECRET": "test-app-secret",
+            "LINGXING_SIDS_JSON": "{}",
+        }
+        requests = (
+            "/api/amazon/strategy-board?start_date=2026-10-05&end_date=2026-10-11",
+            "/api/amazon/ads-charts?start_week=2026-10-05&end_week=2026-10-11&site=%E7%BE%8E%E5%9B%BD&model=TN10",
+            "/api/amazon/dashboard?comparison=%E5%91%A8&start_date=2026-10-05&end_date=2026-10-11&site=%E7%BE%8E%E5%9B%BD",
+        )
+        with patch.dict(os.environ, environment), \
+             patch.object(app_module, "lingxing_store_rows", new=failing_stores), \
+             patch.object(app_module, "amazon_data_source_mapping_snapshot", new=dict), \
+             TestClient(app_module.app, raise_server_exceptions=False) as client:
+            for path in requests:
+                with self.subTest(path=path):
+                    response = client.get(path)
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(response.headers["content-type"].split(";")[0], "application/json")
+                    self.assertIn("access token not match", response.json()["detail"])
+
     def test_mcp_product_performance_preserves_ad_type_clicks(self):
         action_response = mcp_response({
             "success": True,
