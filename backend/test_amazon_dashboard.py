@@ -569,23 +569,24 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertTrue(result.complete)
         self.assertEqual(client.post.call_count, 2)
 
-    def test_mcp_catalog_update_refreshes_metadata_and_retries_once(self):
-        error_response = mcp_response({"success": False, "msg": "Catalog已更新，请重新查询工具版本"})
-        success_response = mcp_response({"success": True, "data": {"value": 42}})
+    def test_mcp_catalog_update_error_is_not_retried_with_legacy_arguments(self):
+        error_response = mcp_response({
+            "success": False,
+            "code": 102,
+            "msg": "工具参数定义已更新，请刷新工具列表后重新调用。",
+        })
         client = AsyncMock()
         client.post.side_effect = [
             error_response,
-            *mcp_metadata_responses("ad_campaign_report", "20260915"),
-            success_response,
         ]
         with patch.dict(os.environ, {"LINGXING_MCP_KEY": "test-key"}):
             reset_mcp_test_state()
-            result = asyncio.run(lingxing_mcp_call("ad_campaign_report", {"page": 1}, client))
+            with self.assertRaisesRegex(RuntimeError, "工具参数定义已更新"):
+                asyncio.run(lingxing_mcp_call("ad_campaign_report", {"page": 1}, client))
             reset_mcp_test_state()
-        self.assertEqual(result, {"value": 42})
-        self.assertEqual(client.post.call_count, 4)
-        retry_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
-        self.assertEqual(retry_arguments["catalogVersion"], "20260915")
+        self.assertEqual(client.post.call_count, 1)
+        action_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
+        self.assertEqual(action_arguments, {"toolId": "ad_campaign_report", "params": {"page": 1}})
 
     def test_mcp_known_metadata_avoids_discovery_requests(self):
         action_response = mcp_response({"success": True, "data": {"value": 42}})
@@ -600,9 +601,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(result, {"value": 42})
         self.assertEqual(client.post.call_count, 1)
         action_arguments = client.post.call_args_list[-1].kwargs["json"]["params"]["arguments"]
-        self.assertEqual(action_arguments["catalogVersion"], "lingxing-mcp-20260915-v1")
-        self.assertEqual(action_arguments["schemaVersion"], "ad_auth_shops-v1-c500-20260907")
-        self.assertEqual(action_arguments["toolVersionId"], 199)
+        self.assertEqual(action_arguments, {"toolId": "ad_auth_shops", "params": {}})
 
     def test_mcp_rate_limit_retries_then_enters_cooldown(self):
         rate_limited = mcp_response({"success": False, "msg": "认证请求过于频繁，请稍后重试"})

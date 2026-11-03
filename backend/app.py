@@ -4627,37 +4627,10 @@ async def lingxing_mcp_call(
     params: dict[str, Any],
     client: httpx.AsyncClient,
 ) -> Any:
-    metadata = await lingxing_mcp_metadata(tool_id, client)
-    try:
-        return await lingxing_mcp_raw(
-            "action",
-            {
-                "catalogVersion": metadata.catalog_version,
-                "schemaVersion": metadata.schema_version,
-                "toolId": metadata.tool_id,
-                "toolVersionId": metadata.tool_version_id,
-                "params": params,
-            },
-            client,
-        )
-    except RuntimeError as exc:
-        if not _is_lingxing_catalog_update_error(exc):
-            raise
-
-    # Catalog changes invalidate every cached tool version together, then the
-    # failed action receives exactly one refreshed retry.
-    metadata = await lingxing_mcp_metadata(tool_id, client, force_refresh=True)
-    return await lingxing_mcp_raw(
-        "action",
-        {
-            "catalogVersion": metadata.catalog_version,
-            "schemaVersion": metadata.schema_version,
-            "toolId": metadata.tool_id,
-            "toolVersionId": metadata.tool_version_id,
-            "params": params,
-        },
-        client,
-    )
+    # LingXing MCP now exposes a stateless action contract. Version fields
+    # belong to the MCP tool catalog, must not be sent as business arguments,
+    # and stale values cause HTTP 422 "tool parameter definition has changed".
+    return await lingxing_mcp_raw("action", {"toolId": tool_id, "params": params}, client)
 
 
 async def fetch_mcp_product_performance(
