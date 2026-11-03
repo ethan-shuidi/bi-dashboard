@@ -4641,35 +4641,59 @@ async def fetch_mcp_product_performance(
     asin_list: list[str] | None = None,
     currency_code: str | None = None,
 ) -> list[dict[str, Any]]:
-    params: dict[str, Any] = {
-        "offset": 0,
-        "length": 10000,
-        "sort_field": "volume",
-        "sort_type": "desc",
-        "sids": str(sid),
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "summary_field": "asin",
-        "date_type": "purchase",
-        "turn_on_summary": 1,
-        "query_order_profit": True,
-    }
-    if currency_code:
-        # Omitting this parameter silently requests LingXing's default CNY.
-        params["currency_code"] = currency_code
-    if asin_list is not None:
-        params["search_field"] = "asin"
-        params["search_value"] = asin_list
-    data = await lingxing_mcp_call(
-        LINGXING_MCP_PRODUCT_TOOL,
-        params,
-        client,
-    )
-    if isinstance(data, dict):
-        rows = data.get("list") or data.get("rows") or data.get("records") or data.get("items") or []
+    # LingXing's current product-performance schema caps page size at 500.
+    # Fetching one oversized page used to work, but now returns HTTP 422 with
+    # "tool parameter definition has changed". Keep the request inside the
+    # published schema and paginate when an unfiltered store result fills a page.
+    page_size = 500
+    all_rows: list[dict[str, Any]] = []
+    offset = 0
+    expected: int | None = None
+    for _page in range(20):
+        params: dict[str, Any] = {
+            "offset": offset,
+            "length": page_size,
+            "sort_field": "volume",
+            "sort_type": "desc",
+            "sids": str(sid),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "summary_field": "asin",
+            "date_type": "purchase",
+            "turn_on_summary": 1,
+            "query_order_profit": True,
+        }
+        if currency_code:
+            # Omitting this parameter silently requests LingXing's default CNY.
+            params["currency_code"] = currency_code
+        if asin_list is not None:
+            params["search_field"] = "asin"
+            params["search_value"] = asin_list
+        data = await lingxing_mcp_call(
+            LINGXING_MCP_PRODUCT_TOOL,
+            params,
+            client,
+        )
+        if isinstance(data, dict):
+            rows = data.get("list") or data.get("rows") or data.get("records") or data.get("items") or []
+            total = _mcp_scalar(data, ("total", "totalCount", "total_count", "recordsTotal", "records_total"))
+            try:
+                expected = int(total) if total is not None else expected
+            except (TypeError, ValueError):
+                expected = expected
+        else:
+            rows = data or []
+        typed_rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        all_rows.extend(typed_rows)
+        page_is_complete = expected is not None and len(all_rows) >= expected
+        if len(typed_rows) < page_size:
+            break
+        if page_is_complete:
+            break
+        offset += page_size
     else:
-        rows = data or []
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        raise RuntimeError("LingXing MCP product performance pagination limit exceeded")
+    return all_rows
 
 
 async def lingxing_mcp_shop_rows(client: httpx.AsyncClient) -> list[dict[str, Any]]:

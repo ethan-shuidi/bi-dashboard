@@ -540,6 +540,32 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0]["currency_code"], "USD")
+        self.assertEqual(captured[0]["offset"], 0)
+        self.assertEqual(captured[0]["length"], 500)
+
+    def test_mcp_product_performance_paginates_current_schema_page_limit(self):
+        captured: list[dict] = []
+
+        async def fake_call(tool_id, params, client):
+            self.assertEqual(tool_id, "query_product_performance_asin_lists")
+            captured.append(params)
+            page = params["offset"] // params["length"]
+            row_count = params["length"] if page == 0 else 1
+            return {
+                "total": 501,
+                "list": [{"asin": f"B0TEST-{index}", "page": page} for index in range(row_count)],
+            }
+
+        with patch("app.lingxing_mcp_call", new=fake_call):
+            rows = asyncio.run(fetch_mcp_product_performance(
+                101, date(2026, 9, 4), date(2026, 9, 10), AsyncMock(),
+            ))
+
+        self.assertEqual(len(rows), 501)
+        self.assertEqual([item["offset"] for item in captured], [0, 500])
+        self.assertTrue(all(item["length"] == 500 for item in captured))
+        self.assertEqual(rows[0]["page"], 0)
+        self.assertEqual(rows[-1]["page"], 1)
 
     def test_mcp_campaign_report_resolves_profile_and_keeps_real_name(self):
         shops_response = mcp_response({
