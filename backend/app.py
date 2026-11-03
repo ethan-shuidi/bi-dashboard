@@ -482,6 +482,9 @@ LINGXING_MCP_RATE_LIMIT_RETRY_DELAYS_SECONDS = tuple(
 LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS = float(
     os.environ.get("LINGXING_MCP_RATE_LIMIT_COOLDOWN_SECONDS", "65")
 )
+LINGXING_MCP_INVALID_KEY_COOLDOWN_SECONDS = float(
+    os.environ.get("LINGXING_MCP_INVALID_KEY_COOLDOWN_SECONDS", "300")
+)
 LINGXING_MCP_REQUEST_TIMEOUT_SECONDS = float(
     os.environ.get("LINGXING_MCP_REQUEST_TIMEOUT_SECONDS", "75")
 )
@@ -4375,6 +4378,16 @@ def _is_lingxing_mcp_rate_limit_error(error: BaseException) -> bool:
     )
 
 
+def _is_lingxing_mcp_invalid_key_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return (
+        "mcp key无效" in message
+        or "key无效或已失效" in message
+        or "x-mcp-key配置" in message
+        or "invalid mcp key" in message
+    )
+
+
 def _is_lingxing_mcp_rate_limit_message(message: Any) -> bool:
     return _is_lingxing_mcp_rate_limit_error(RuntimeError(str(message)))
 
@@ -4431,21 +4444,25 @@ async def lingxing_mcp_raw(
     async def reserve_key() -> tuple[str, str, PriorityAsyncLock]:
         async with _lingxing_mcp_key_selection_lock:
             now = time.monotonic()
-            available = [
-                (
-                    max(0.0, state["last_call"] + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - now),
-                    state.get("queued", 0),
-                    index,
+            available = []
+            for index, (digest, key) in enumerate(keys):
+                if digest in exhausted_keys:
+                    continue
+                state = _lingxing_mcp_key_states.setdefault(
                     digest,
-                    key,
+                    {"last_call": 0.0, "cooldown_until": 0.0, "invalid_until": 0.0, "queued": 0},
                 )
-                for index, (digest, key) in enumerate(keys)
-                if digest not in exhausted_keys
-                and now >= (state := _lingxing_mcp_key_states.setdefault(
-                    digest,
-                    {"last_call": 0.0, "cooldown_until": 0.0, "queued": 0},
-                ))["cooldown_until"]
-            ]
+                if now < float(state.get("invalid_until", 0.0)) or now < float(state.get("cooldown_until", 0.0)):
+                    continue
+                available.append(
+                    (
+                        max(0.0, float(state["last_call"]) + LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS - now),
+                        int(state.get("queued", 0)),
+                        index,
+                        digest,
+                        key,
+                    )
+                )
             if not available:
                 raise RuntimeError("LingXing MCP request failed: 认证请求过于频繁，冷却中请稍后重试")
             _, _, _, digest, key = min(available)
@@ -4479,7 +4496,16 @@ async def lingxing_mcp_raw(
                     return result
                 except (RuntimeError, httpx.HTTPStatusError, httpx.TransportError) as exc:
                     rate_limited = _is_lingxing_mcp_rate_limit_error(exc)
+                    invalid_key = _is_lingxing_mcp_invalid_key_error(exc)
                     state["last_call"] = time.monotonic()
+                    if invalid_key:
+                        state["invalid_until"] = (
+                            time.monotonic() + LINGXING_MCP_INVALID_KEY_COOLDOWN_SECONDS
+                        )
+                        exhausted_keys.add(digest)
+                        if len(exhausted_keys) == len(keys):
+                            raise
+                        continue
                     if not rate_limited:
                         if _is_lingxing_mcp_transport_error(exc):
                             exhausted_keys.add(digest)

@@ -667,6 +667,51 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key"])
         self.assertEqual(client.post.call_args.kwargs["timeout"], 81.5)
 
+    def test_mcp_invalid_key_falls_back_and_enters_cooldown(self):
+        invalid_key = mcp_response({
+            "success": False,
+            "msg": "MCP Key无效或已失效，请检查x-mcp-key配置",
+        })
+        success = mcp_response({"success": True, "data": {"value": 42}})
+        client = AsyncMock()
+        client.post.side_effect = [invalid_key, success, success]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+                primary_digest = app_module._lingxing_mcp_state_key("primary-test-key")
+                primary_state = app_module._lingxing_mcp_key_states[primary_digest]
+                self.assertGreater(primary_state["invalid_until"], time.monotonic())
+                self.assertEqual(asyncio.run(lingxing_mcp_raw("action", {}, client)), {"value": 42})
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(client.post.call_count, 3)
+        used_keys = [call.kwargs["headers"]["X-Mcp-Key"] for call in client.post.call_args_list]
+        self.assertEqual(used_keys, ["primary-test-key", "secondary-test-key", "secondary-test-key"])
+
+    def test_mcp_invalid_key_after_all_channels_raises_original_error(self):
+        invalid_key = mcp_response({
+            "success": False,
+            "msg": "MCP Key无效或已失效，请检查x-mcp-key配置",
+        })
+        client = AsyncMock()
+        client.post.side_effect = [invalid_key, invalid_key]
+        with patch.dict(os.environ, {
+            "LINGXING_MCP_KEY": "primary-test-key",
+            "LINGXING_API_KEY2": "secondary-test-key",
+        }), patch.object(app_module, "LINGXING_MCP_MIN_REQUEST_INTERVAL_SECONDS", 0.0):
+            try:
+                with self.assertRaisesRegex(RuntimeError, "MCP Key无效或已失效") as caught:
+                    asyncio.run(lingxing_mcp_raw("action", {}, client))
+                self.assertNotIn("认证请求过于频繁", str(caught.exception))
+            finally:
+                reset_mcp_test_state()
+
+        self.assertEqual(client.post.call_count, 2)
+
     def test_mcp_server_error_falls_back_to_next_key(self):
         server_error = httpx.Response(
             503,
