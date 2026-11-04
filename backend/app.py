@@ -248,6 +248,11 @@ _amazon_background_fetch: ContextVar[bool] = ContextVar(
     "amazon_background_fetch",
     default=False,
 )
+_amazon_upstream_priority: ContextVar[int] = ContextVar(
+    "amazon_upstream_priority",
+    default=0,
+)
+_amazon_fx_failure_cache: dict[tuple[date, tuple[str, ...]], tuple[float, str]] = {}
 _lingxing_performance_last_call = 0.0
 _lingxing_ad_report_lock = asyncio.Lock()
 _lingxing_ad_report_last_call = 0.0
@@ -257,6 +262,18 @@ _lingxing_mcp_shop_lock = asyncio.Lock()
 _keyword_dashboard_fetch_lock = asyncio.Lock()
 _keyword_unavailable_weeks_lock = threading.RLock()
 _keyword_unavailable_weeks: dict[tuple[str, date], datetime] = {}
+
+def _lingxing_upstream_priority() -> int:
+    """Schedule dashboard traffic explicitly instead of relying only on FIFO.
+
+    Zero is the default foreground priority. Existing generic background work
+    remains at one. Ads charts use two so the product-summary board can always
+    overtake them when both boards contend for LingXing.
+    """
+    priority = _amazon_upstream_priority.get()
+    if priority == 0 and _amazon_background_fetch.get():
+        return 1
+    return priority
 _xiyou_keyword_dashboard_scope: ContextVar[bool] = ContextVar(
     "xiyou_keyword_dashboard_scope",
     default=False,
@@ -917,6 +934,22 @@ class AmazonAdsChartWeeklyHistory(Base):
     fetched_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AmazonExchangeRate(Base):
+    """Persist daily reference rates so a service restart does not refetch."""
+
+    __tablename__ = "amazon_exchange_rates"
+    __table_args__ = (
+        UniqueConstraint("rate_date", "currency", name="uq_amazon_exchange_rate_scope"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    rate_date = Column(Date, nullable=False)
+    currency = Column(String(12), nullable=False)
+    rate = Column(Numeric(24, 12), nullable=False)
+    source = Column(String(40), nullable=False, default="")
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class AmazonMonthlyTarget(Base):
     __tablename__ = "amazon_monthly_targets"
     __table_args__ = (
@@ -1546,32 +1579,135 @@ async def amazon_usd_exchange_rates(
     cached = _amazon_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < 12 * 60 * 60:
         return cached[1]
-    url = f"https://api.frankfurter.dev/v1/{rate_date.isoformat()}"
 
-    async def fetch(client_value: httpx.AsyncClient) -> dict[str, float]:
-        # httpx replaces an existing query string when ``params`` is supplied.
-        # Keep ``base`` in the same params mapping so USD cannot be dropped.
+    failure_key = (rate_date, tuple(sorted(currencies)))
+    failed = _amazon_fx_failure_cache.get(failure_key)
+    if failed and time.monotonic() - failed[0] < 5 * 60:
+        raise RuntimeError(f"汇率服务最近获取失败：{failed[1]}")
+
+    def read_persisted() -> dict[str, float]:
+        # Tests and local utilities can run without DATABASE_URL. Production
+        # always has it configured, where these few rows avoid a cold outbound
+        # request after every deployment.
+        if not os.environ.get("DATABASE_URL", "").strip():
+            return {}
+        try:
+            with session_factory()() as db:
+                rows = db.scalars(
+                    select(AmazonExchangeRate).where(
+                        AmazonExchangeRate.rate_date == rate_date,
+                        AmazonExchangeRate.currency.in_(sorted(currencies)),
+                    )
+                ).all()
+                return {
+                    str(row.currency): float(row.rate)
+                    for row in rows
+                    if row.rate is not None and float(row.rate) > 0
+                }
+        except Exception as exc:
+            print(f"amazon exchange-rate cache read failed: {type(exc).__name__}: {exc}", flush=True)
+            return {}
+
+    persisted = read_persisted()
+    missing = sorted(currencies - persisted.keys())
+    if not missing:
+        result = {"USD": 1.0, **persisted}
+        _amazon_cache[cache_key] = (time.monotonic(), result)
+        return result
+
+    request_timeout = httpx.Timeout(4.0, connect=2.0)
+
+    async def currency_api_fetch(client_value: httpx.AsyncClient, candidate: date) -> dict[str, float]:
         response = await client_value.get(
-            url,
-            params={"base": "USD", "symbols": ",".join(sorted(currencies))},
+            f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@"
+            f"{candidate.isoformat()}/v1/currencies/usd.min.json",
+            timeout=request_timeout,
         )
         response.raise_for_status()
-        payload = response.json()
-        rates = payload.get("rates", {})
+        rates = (response.json().get("usd") or {})
         result = {"USD": 1.0}
-        for code in currencies:
-            value = rates.get(code)
+        for code in missing:
+            value = rates.get(code.lower())
             if value is None or not float(value):
-                raise RuntimeError(f"汇率服务缺少 {rate_date} 的 {code} 汇率")
+                raise RuntimeError(f"汇率服务缺少 {candidate} 的 {code} 汇率")
+            # This provider quotes units of a currency per USD; conversion to
+            # USD therefore uses the reciprocal.
             result[code] = 1.0 / float(value)
         return result
 
-    if client is not None:
-        result = await fetch(client)
-    else:
-        async with httpx.AsyncClient(timeout=15) as owned_client:
-            result = await fetch(owned_client)
+    async def frankfurter_fetch(client_value: httpx.AsyncClient, candidate: date) -> dict[str, float]:
+        # httpx replaces an existing query string when ``params`` is supplied.
+        # Keep ``base`` in the same params mapping so USD cannot be dropped.
+        response = await client_value.get(
+            f"https://api.frankfurter.dev/v1/{candidate.isoformat()}",
+            params={"base": "USD", "symbols": ",".join(sorted(missing))},
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        rates = response.json().get("rates", {})
+        result = {"USD": 1.0}
+        for code in missing:
+            value = rates.get(code)
+            if value is None or not float(value):
+                raise RuntimeError(f"汇率服务缺少 {candidate} 的 {code} 汇率")
+            result[code] = 1.0 / float(value)
+        return result
+
+    errors: list[str] = []
+
+    async def fetch(client_value: httpx.AsyncClient) -> dict[str, float]:
+        # Weekend requests can publish the preceding business day. Try a short
+        # date backtrack only when a provider has no quotation for the exact
+        # date; never substitute a live rate for a historical one.
+        for provider in (currency_api_fetch, frankfurter_fetch):
+            for candidate in (rate_date, rate_date - timedelta(days=1), rate_date - timedelta(days=2)):
+                try:
+                    return await provider(client_value, candidate)
+                except Exception as exc:
+                    errors.append(f"{provider.__name__}@{candidate}:{_lingxing_mcp_error_summary(exc)}")
+        raise RuntimeError(f"汇率服务获取失败：{'; '.join(errors)}")
+
+    try:
+        if client is not None:
+            result = await fetch(client)
+        else:
+            async with httpx.AsyncClient(timeout=request_timeout) as owned_client:
+                result = await fetch(owned_client)
+    except Exception as exc:
+        summary = str(exc) or type(exc).__name__
+        _amazon_fx_failure_cache[failure_key] = (time.monotonic(), summary)
+        raise
+    result.update({code: persisted[code] for code in persisted if code not in result})
+
+    if os.environ.get("DATABASE_URL", "").strip():
+        try:
+            with session_factory()() as db:
+                now = utcnow()
+                for code in missing:
+                    item = db.scalar(
+                        select(AmazonExchangeRate).where(
+                            AmazonExchangeRate.rate_date == rate_date,
+                            AmazonExchangeRate.currency == code,
+                        )
+                    )
+                    if item is None:
+                        db.add(AmazonExchangeRate(
+                            rate_date=rate_date,
+                            currency=code,
+                            rate=result[code],
+                            source="currency-api/frankfurter",
+                            fetched_at=now,
+                        ))
+                    else:
+                        item.rate = result[code]
+                        item.fetched_at = now
+                db.commit()
+        except Exception as exc:
+            # An immutable reference-rate cache is an optimization only.
+            print(f"amazon exchange-rate cache write failed: {type(exc).__name__}: {exc}", flush=True)
+
     _amazon_cache[cache_key] = (time.monotonic(), result)
+    _amazon_fx_failure_cache.pop(failure_key, None)
     return result
 
 
@@ -3362,8 +3498,9 @@ async def fetch_product_performance(
                     # Serialize product-performance calls across periods so a
                     # week/month query cannot self-rate-limit its own requests.
                     global _lingxing_performance_last_call
-                    background = _amazon_background_fetch.get()
-                    async with _lingxing_performance_lock.scoped(priority=1 if background else 0):
+                    async with _lingxing_performance_lock.scoped(
+                        priority=_lingxing_upstream_priority()
+                    ):
                         # LingXing documents a one-request token bucket for
                         # this endpoint when querying a single shop. Keep a
                         # small spacing between period requests so later
@@ -4076,34 +4213,47 @@ async def _amazon_dashboard_periodic_fetch(
     # Product performance can label all marketplace money as CNY regardless of
     # the requested currency. Normalize from that settlement currency to the
     # requested/native currency before any endpoint aggregates rows.
-    row_rates: dict[str, float] | None = None
     if requested_currency == "native":
         by_site: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             by_site.setdefault(str(row.get("site") or ""), []).append(row)
-        needed = {
-            str(row.get("currency") or "").strip().upper()
-            for row in rows
-            if str(row.get("currency") or "").strip()
-        } | {AMAZON_CURRENCY_CODES.get(site, "USD") for site in by_site}
-        row_rates = await amazon_usd_exchange_rates(end_date, needed) if needed else None
+        sites_requiring_conversion: list[tuple[str, list[dict[str, Any]]]] = []
+        needed: set[str] = set()
         for site, site_rows in by_site.items():
-            rows_for_site = site_rows
+            target = AMAZON_CURRENCY_CODES.get(site, "USD")
+            source_currencies = {
+                str(row.get("currency") or "").strip().upper()
+                for row in site_rows
+                if str(row.get("currency") or "").strip()
+            }
+            if not source_currencies or source_currencies == {target}:
+                continue
+            sites_requiring_conversion.append((site, site_rows))
+            needed.update(source_currencies | {target})
+        # Calling an FX provider when every row already carries its site's
+        # requested currency is unnecessary. A slow FX provider must never be
+        # able to invalidate LingXing rows that are already display-ready.
+        row_rates = await amazon_usd_exchange_rates(end_date, needed) if needed else None
+        for site, site_rows in sites_requiring_conversion:
             await amazon_convert_sales_money_rows(
-                rows_for_site,
+                site_rows,
                 AMAZON_CURRENCY_CODES.get(site, "USD"),
                 end_date,
                 row_rates,
             )
     else:
         target_currency = requested_currency if requested_currency != "original" else AMAZON_CURRENCY_CODES.get(selected_sites[0], "USD")
-        needed = {
+        source_currencies = {
             str(row.get("currency") or "").strip().upper()
             for row in rows
             if str(row.get("currency") or "").strip()
-        } | ({target_currency} if rows else set())
-        row_rates = await amazon_usd_exchange_rates(end_date, needed) if needed else None
-        await amazon_convert_sales_money_rows(rows, target_currency, end_date, row_rates)
+        }
+        if source_currencies - {target_currency}:
+            row_rates = await amazon_usd_exchange_rates(
+                end_date,
+                source_currencies | {target_currency},
+            )
+            await amazon_convert_sales_money_rows(rows, target_currency, end_date, row_rates)
 
     output_currency = (
         "native"
@@ -4155,6 +4305,7 @@ async def amazon_dashboard_periodic(
     asin_mapping: dict[str, dict[str, str]] | None = None,
     force_refresh: bool = False,
     history_cutoff: date | None = None,
+    upstream_priority: int = 0,
 ) -> dict[str, Any]:
     """Public periodic fetch with identical-request coalescing."""
 
@@ -4190,23 +4341,27 @@ async def amazon_dashboard_periodic(
         _amazon_parameter_fingerprint(sid_map),
         _amazon_parameter_fingerprint(store_rows),
     )
-    return await _amazon_shared_payload(
-        inflight_key,
-        lambda: _amazon_dashboard_periodic_fetch(
-            comparison,
-            start_date,
-            end_date,
-            site,
-            selected_series,
-            selected_products,
-            sid_map,
-            store_rows,
-            display_currency,
-            asin_mapping,
-            force_refresh,
-            history_cutoff,
-        ),
-    )
+    priority_token = _amazon_upstream_priority.set(upstream_priority)
+    try:
+        return await _amazon_shared_payload(
+            inflight_key,
+            lambda: _amazon_dashboard_periodic_fetch(
+                comparison,
+                start_date,
+                end_date,
+                site,
+                selected_series,
+                selected_products,
+                sid_map,
+                store_rows,
+                display_currency,
+                asin_mapping,
+                force_refresh,
+                history_cutoff,
+            ),
+        )
+    finally:
+        _amazon_upstream_priority.reset(priority_token)
 
 
 def lingxing_mcp_key() -> str:
@@ -4436,8 +4591,7 @@ async def lingxing_mcp_raw(
         "method": "tools/call",
         "params": {"name": operation, "arguments": arguments},
     }
-    background = _amazon_background_fetch.get()
-    priority = 1 if background else 0
+    priority = _lingxing_upstream_priority()
     attempt = 0
     exhausted_keys: set[str] = set()
 
@@ -6686,6 +6840,7 @@ async def _amazon_ads_chart_job(
                 asin_mapping,
                 force_refresh=force_refresh,
                 history_cutoff=history_cutoff,
+                upstream_priority=2,
             )
     except BaseException as exc:
         state["error"] = str(exc)
@@ -6814,6 +6969,7 @@ async def amazon_ads_charts(
                 asin_mapping,
                 force_refresh=refresh,
                 history_cutoff=history_cutoff,
+                upstream_priority=2,
             )
         except httpx.HTTPError as exc:
             raise HTTPException(

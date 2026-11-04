@@ -88,13 +88,18 @@ from app import (
     _lingxing_mcp_metadata_cache,
     _amazon_cache,
     _amazon_ads_chart_jobs,
+    _amazon_background_fetch,
+    _amazon_fx_failure_cache,
     _amazon_inflight_payloads,
+    _amazon_ads_chart_job,
     _amazon_sales_dashboard_jobs,
     _amazon_shared_payload,
+    _amazon_upstream_priority,
     PriorityAsyncLock,
     _performance_data_quality,
     _record_performance_quality,
     _reset_lingxing_mcp_metadata_cache,
+    _lingxing_upstream_priority,
     _strategy_campaign_data_quality,
     ad_report_type,
     fetch_mcp_product_performance,
@@ -163,6 +168,7 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
     def setUp(self):
         reset_mcp_test_state()
         _amazon_cache.clear()
+        _amazon_fx_failure_cache.clear()
         _amazon_ads_chart_jobs.clear()
         _amazon_inflight_payloads.clear()
         _amazon_sales_dashboard_jobs.clear()
@@ -207,6 +213,45 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             order,
             ["foreground-first", "foreground-second", "background-one", "background-two"],
         )
+
+    def test_lingxing_upstream_priority_is_explicit_for_dashboard_sections(self):
+        self.assertEqual(_lingxing_upstream_priority(), 0)
+
+        background_token = _amazon_background_fetch.set(True)
+        try:
+            self.assertEqual(_lingxing_upstream_priority(), 1)
+        finally:
+            _amazon_background_fetch.reset(background_token)
+
+        chart_token = _amazon_upstream_priority.set(2)
+        try:
+            self.assertEqual(_lingxing_upstream_priority(), 2)
+        finally:
+            _amazon_upstream_priority.reset(chart_token)
+
+    def test_ads_chart_job_uses_lowest_lingxing_priority(self):
+        periodic = AsyncMock(return_value={"rows": []})
+        state: dict[str, object] = {}
+
+        with patch("app.amazon_dashboard_periodic", new=periodic):
+            asyncio.run(_amazon_ads_chart_job(
+                state,
+                date(2026, 9, 7),
+                date(2026, 9, 20),
+                ["美国"],
+                {AMAZON_SERIES[0]},
+                {"TN10-主链接-黑色"},
+                {"US": {"sid": 1}},
+                [],
+                "USD",
+                {"US": {}},
+                False,
+                date(2026, 10, 21),
+            ))
+
+        self.assertEqual(state["result"], {"rows": []})
+        self.assertNotIn("error", state)
+        self.assertEqual(periodic.await_args.kwargs["upstream_priority"], 2)
 
     def test_data_source_initialization_builds_the_complete_site_product_matrix(self):
         database = create_engine(
@@ -1882,10 +1927,50 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
         self.assertAlmostEqual(result[0]["ad_cost"], 11.5)
         self.assertAlmostEqual(result[0]["cpc"], 2.3)
 
-    def test_all_site_fx_request_keeps_usd_base(self):
+    def test_fx_prefers_fast_currency_api_and_keeps_usd_base(self):
         captured = {}
 
         class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"usd": {"eur": 0.8}}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, params=None, timeout=None):
+                captured["url"] = url
+                captured["timeout"] = timeout
+                return FakeResponse()
+
+        _amazon_cache.pop(
+            ("amazon-usd-fx", "2026-09-17", ("EUR",)), None
+        )
+        with patch("app.httpx.AsyncClient", return_value=FakeClient()):
+            rates = asyncio.run(amazon_usd_exchange_rates(
+                date(2026, 9, 17), {"USD", "EUR"}
+            ))
+        self.assertEqual(rates, {"USD": 1.0, "EUR": 1.25})
+        self.assertIn("@fawazahmed0/currency-api@2026-09-17", captured["url"])
+
+    def test_fx_falls_back_to_frankfurter_when_currency_api_fails(self):
+        captured = {}
+
+        class CurrencyApiResponse:
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError(
+                    "unavailable",
+                    request=httpx.Request("GET", "https://currency.test"),
+                    response=httpx.Response(503),
+                )
+
+        class FrankfurterResponse:
             def raise_for_status(self):
                 return None
 
@@ -1899,23 +1984,16 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             async def __aexit__(self, *args):
                 return False
 
-            async def get(self, url, params=None):
-                captured["url"] = url
-                captured["params"] = params
-                return FakeResponse()
+            async def get(self, url, params=None, timeout=None):
+                captured["urls"] = captured.get("urls", []) + [url]
+                return CurrencyApiResponse() if "fawazahmed0" in url else FrankfurterResponse()
 
-        _amazon_cache.pop(
-            ("amazon-usd-fx", "2026-09-17", ("EUR",)), None
-        )
         with patch("app.httpx.AsyncClient", return_value=FakeClient()):
             rates = asyncio.run(amazon_usd_exchange_rates(
                 date(2026, 9, 17), {"USD", "EUR"}
             ))
         self.assertEqual(rates, {"USD": 1.0, "EUR": 1.25})
-        self.assertNotIn("?", captured["url"])
-        self.assertEqual(
-            captured["params"], {"base": "USD", "symbols": "EUR"}
-        )
+        self.assertTrue(any("api.frankfurter.dev" in url for url in captured["urls"]))
 
     def test_sales_actuals_reject_mixed_currency_rows(self):
         rows = [
@@ -3525,6 +3603,64 @@ class AmazonDashboardPeriodTests(unittest.TestCase):
             {(row["site"], row["currency"], row["net_sales"], row["ad_cost"]) for row in result["rows"]},
             {("美国", "USD", 100, 10), ("加拿大", "CAD", 100, 10)},
         )
+
+    def test_dashboard_single_site_native_rows_do_not_fetch_fx(self):
+        site_name = "德国"
+        asin = next(iter(ASIN_MAPPING["DE"]))
+        product = ASIN_MAPPING["DE"][asin]
+        series = amazon_series(product)
+        performance = [{
+            "asin": asin,
+            "currency_code": "EUR",
+            "net_amount": 100,
+            "spend": 20,
+            "ad_sales_amount": 40,
+            "clicks": 10,
+        }]
+        exchange_rates = AsyncMock()
+
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)), \
+             patch("app.amazon_usd_exchange_rates", new=exchange_rates):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日", date(2026, 9, 4), date(2026, 9, 4), [site_name],
+                {series}, {product},
+                {AMAZON_SITE_CODES[site_name]: {"sid": 101}},
+                [], "native",
+            ))
+
+        exchange_rates.assert_not_awaited()
+        self.assertEqual(result["currency"], "native")
+        self.assertEqual({row["currency"] for row in result["rows"]}, {"EUR"})
+        self.assertEqual({row["net_sales"] for row in result["rows"]}, {100})
+
+    def test_dashboard_single_site_original_rows_do_not_fetch_fx(self):
+        site_name = "日本"
+        asin = next(iter(ASIN_MAPPING["JP"]))
+        product = ASIN_MAPPING["JP"][asin]
+        series = amazon_series(product)
+        performance = [{
+            "asin": asin,
+            "currency_code": "JPY",
+            "net_amount": 10000,
+            "spend": 2000,
+            "ad_sales_amount": 4000,
+            "clicks": 10,
+        }]
+        exchange_rates = AsyncMock()
+
+        with patch("app.fetch_product_performance", new=AsyncMock(return_value=performance)), \
+             patch("app.amazon_usd_exchange_rates", new=exchange_rates):
+            result = asyncio.run(amazon_dashboard_periodic(
+                "日", date(2026, 9, 4), date(2026, 9, 4), [site_name],
+                {series}, {product},
+                {AMAZON_SITE_CODES[site_name]: {"sid": 101}},
+                [], "original",
+            ))
+
+        exchange_rates.assert_not_awaited()
+        self.assertEqual(result["currency"], "JPY")
+        self.assertEqual({row["currency"] for row in result["rows"]}, {"JPY"})
+        self.assertEqual({row["net_sales"] for row in result["rows"]}, {10000})
 
 
 if __name__ == "__main__":
